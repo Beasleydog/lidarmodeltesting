@@ -660,20 +660,24 @@ def run_epoch(
             class_loss_per_ray = criterion(logits_flat, y_flat)
         class_loss_per_ray = class_loss_per_ray.reshape_as(y)
 
-        obstacle_targets = (y == 1).float()
-        obstacle_mask = obstacle_targets > 0.5
+        obstacle_mask = y == 1
         mean_class_loss = class_loss_per_ray.mean()
         if obstacle_mask.any():
             obstacle_class_focus_loss = _topk_mean(class_loss_per_ray[obstacle_mask], hard_example_fraction)
         else:
             obstacle_class_focus_loss = mean_class_loss.new_zeros(())
 
-        obstacle_loss = balanced_hard_obstacle_bce_loss(
-            obstacle_logits,
-            obstacle_targets,
-            pos_weight=obstacle_pos_weight_t,
-            hard_fraction=hard_example_fraction,
-        )
+        hit_mask = y != 2
+        if hit_mask.any():
+            obstacle_ground_targets = (y[hit_mask] == 1).float()
+            obstacle_loss = balanced_hard_obstacle_bce_loss(
+                obstacle_logits[hit_mask],
+                obstacle_ground_targets,
+                pos_weight=obstacle_pos_weight_t,
+                hard_fraction=hard_example_fraction,
+            )
+        else:
+            obstacle_loss = mean_class_loss.new_zeros(())
         loss = (
             mean_class_loss
             + float(max(obstacle_class_focus_weight, 0.0)) * obstacle_class_focus_loss
@@ -776,11 +780,11 @@ def compute_class_weights(class_counts: np.ndarray) -> np.ndarray:
     return weights.astype(np.float32)
 
 
-def compute_obstacle_pos_weight(class_counts: np.ndarray, max_weight: float = 12.0) -> float:
+def compute_obstacle_ground_pos_weight(class_counts: np.ndarray, max_weight: float = 12.0) -> float:
     counts = np.asarray(class_counts, dtype=np.float64)
     obstacle = max(float(counts[1]), 1.0)
-    non_obstacle = max(float(counts[0] + counts[2]), 1.0)
-    weight = non_obstacle / obstacle
+    ground = max(float(counts[0]), 1.0)
+    weight = ground / obstacle
     return float(np.clip(weight, 1.0, max_weight))
 
 
@@ -1175,13 +1179,13 @@ def main() -> None:
     )
     class_weights_np = compute_class_weights(np.asarray(meta["train_class_counts"], dtype=np.float32))
     class_weights_t = torch.tensor(class_weights_np, dtype=torch.float32, device=device)
-    obstacle_pos_weight = compute_obstacle_pos_weight(
+    obstacle_pos_weight = compute_obstacle_ground_pos_weight(
         np.asarray(meta["train_class_counts"], dtype=np.float32),
         max_weight=args.obstacle_pos_weight_cap,
     )
     log(f"Using tempered sqrt-inverse class weights (capped) : {class_weights_np.tolist()}")
     log(
-        "Using obstacle auxiliary loss "
+        "Using obstacle-vs-ground auxiliary loss on hit rays "
         f"class_focus_weight={args.obstacle_class_focus_weight:.3f} "
         f"aux_weight={args.obstacle_aux_weight:.3f} "
         f"pos_weight={obstacle_pos_weight:.3f} "
