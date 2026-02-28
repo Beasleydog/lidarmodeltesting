@@ -611,6 +611,7 @@ def run_epoch(
     label_smoothing: float = 0.0,
     grad_clip_norm: float = 0.0,
     focal_gamma: float = 2.0,
+    obstacle_class_focus_weight: float = 1.0,
     obstacle_aux_weight: float = 1.0,
     obstacle_pos_weight: float = 1.0,
     hard_example_fraction: float = 0.25,
@@ -660,20 +661,24 @@ def run_epoch(
         class_loss_per_ray = class_loss_per_ray.reshape_as(y)
 
         obstacle_targets = (y == 1).float()
-        obstacle_loss_per_ray = F.binary_cross_entropy_with_logits(
+        obstacle_mask = obstacle_targets > 0.5
+        mean_class_loss = class_loss_per_ray.mean()
+        if obstacle_mask.any():
+            obstacle_class_focus_loss = _topk_mean(class_loss_per_ray[obstacle_mask], hard_example_fraction)
+        else:
+            obstacle_class_focus_loss = mean_class_loss.new_zeros(())
+
+        obstacle_loss = balanced_hard_obstacle_bce_loss(
             obstacle_logits,
             obstacle_targets,
             pos_weight=obstacle_pos_weight_t,
-            reduction="none",
+            hard_fraction=hard_example_fraction,
         )
-        total_loss_per_ray = class_loss_per_ray + float(max(obstacle_aux_weight, 0.0)) * obstacle_loss_per_ray
-        mean_loss = total_loss_per_ray.mean()
-        if 0.0 < hard_example_fraction < 1.0:
-            hard_k = max(1, int(np.ceil(total_loss_per_ray.numel() * hard_example_fraction)))
-            hard_loss = torch.topk(total_loss_per_ray.reshape(-1), k=hard_k).values.mean()
-            loss = 0.5 * mean_loss + 0.5 * hard_loss
-        else:
-            loss = mean_loss
+        loss = (
+            mean_class_loss
+            + float(max(obstacle_class_focus_weight, 0.0)) * obstacle_class_focus_loss
+            + float(max(obstacle_aux_weight, 0.0)) * obstacle_loss
+        )
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -777,6 +782,45 @@ def compute_obstacle_pos_weight(class_counts: np.ndarray, max_weight: float = 12
     non_obstacle = max(float(counts[0] + counts[2]), 1.0)
     weight = non_obstacle / obstacle
     return float(np.clip(weight, 1.0, max_weight))
+
+
+def _topk_mean(values: torch.Tensor, fraction: float) -> torch.Tensor:
+    if values.numel() == 0:
+        return values.new_zeros(())
+    frac = float(np.clip(fraction, 0.0, 1.0))
+    if frac <= 0.0 or frac >= 1.0:
+        return values.mean()
+    k = max(1, int(np.ceil(values.numel() * frac)))
+    return torch.topk(values.reshape(-1), k=k).values.mean()
+
+
+def balanced_hard_obstacle_bce_loss(
+    obstacle_logits: torch.Tensor,
+    obstacle_targets: torch.Tensor,
+    pos_weight: torch.Tensor,
+    hard_fraction: float,
+) -> torch.Tensor:
+    per_ray = F.binary_cross_entropy_with_logits(
+        obstacle_logits,
+        obstacle_targets,
+        pos_weight=pos_weight,
+        reduction="none",
+    )
+    pos_mask = obstacle_targets > 0.5
+    neg_mask = ~pos_mask
+    pos_losses = per_ray[pos_mask]
+    neg_losses = per_ray[neg_mask]
+    if pos_losses.numel() == 0:
+        return _topk_mean(neg_losses, hard_fraction)
+
+    pos_term = _topk_mean(pos_losses, hard_fraction)
+    if neg_losses.numel() == 0:
+        return pos_term
+
+    pos_k = max(1, int(np.ceil(pos_losses.numel() * max(float(hard_fraction), 1e-6))))
+    neg_k = min(neg_losses.numel(), pos_k)
+    neg_term = torch.topk(neg_losses.reshape(-1), k=neg_k).values.mean()
+    return 0.5 * (pos_term + neg_term)
 
 
 def compute_obstacle_oversample_weights(
@@ -1022,14 +1066,15 @@ def main() -> None:
     parser.add_argument("--max-history", type=int, default=32)
     parser.add_argument("--histories-per-target", type=int, default=3)
     parser.add_argument("--exclude-after-teleport-steps", type=int, default=1)
-    parser.add_argument("--obstacle-oversample-target-frac", type=float, default=0.5)
+    parser.add_argument("--obstacle-oversample-target-frac", type=float, default=0.35)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--log-every-batches", type=int, default=25)
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
-    parser.add_argument("--obstacle-aux-weight", type=float, default=1.5)
-    parser.add_argument("--obstacle-pos-weight-cap", type=float, default=12.0)
-    parser.add_argument("--hard-example-fraction", type=float, default=0.25)
+    parser.add_argument("--obstacle-class-focus-weight", type=float, default=0.75)
+    parser.add_argument("--obstacle-aux-weight", type=float, default=0.35)
+    parser.add_argument("--obstacle-pos-weight-cap", type=float, default=4.0)
+    parser.add_argument("--hard-example-fraction", type=float, default=0.5)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--plateau-factor", type=float, default=0.5)
     parser.add_argument("--plateau-patience", type=int, default=1)
@@ -1137,7 +1182,8 @@ def main() -> None:
     log(f"Using tempered sqrt-inverse class weights (capped) : {class_weights_np.tolist()}")
     log(
         "Using obstacle auxiliary loss "
-        f"weight={args.obstacle_aux_weight:.3f} "
+        f"class_focus_weight={args.obstacle_class_focus_weight:.3f} "
+        f"aux_weight={args.obstacle_aux_weight:.3f} "
         f"pos_weight={obstacle_pos_weight:.3f} "
         f"hard_example_fraction={args.hard_example_fraction:.3f}"
     )
@@ -1173,6 +1219,7 @@ def main() -> None:
                 "train_class_counts": meta["train_class_counts"],
                 "val_class_counts": meta["val_class_counts"],
                 "obstacle_aux_weight": args.obstacle_aux_weight,
+                "obstacle_class_focus_weight": args.obstacle_class_focus_weight,
                 "obstacle_pos_weight": obstacle_pos_weight,
                 "obstacle_pos_weight_cap": args.obstacle_pos_weight_cap,
                 "hard_example_fraction": args.hard_example_fraction,
@@ -1205,6 +1252,7 @@ def main() -> None:
             label_smoothing=args.label_smoothing,
             grad_clip_norm=args.grad_clip_norm,
             focal_gamma=args.focal_gamma,
+            obstacle_class_focus_weight=args.obstacle_class_focus_weight,
             obstacle_aux_weight=args.obstacle_aux_weight,
             obstacle_pos_weight=obstacle_pos_weight,
             hard_example_fraction=args.hard_example_fraction,
@@ -1223,9 +1271,10 @@ def main() -> None:
             class_weights=class_weights_t,
             label_smoothing=args.label_smoothing,
             focal_gamma=args.focal_gamma,
+            obstacle_class_focus_weight=args.obstacle_class_focus_weight,
             obstacle_aux_weight=args.obstacle_aux_weight,
             obstacle_pos_weight=obstacle_pos_weight,
-            hard_example_fraction=0.0,
+            hard_example_fraction=args.hard_example_fraction,
         )
         scheduler.step(val_loss)
         current_lr = float(optimizer.param_groups[0]["lr"])
@@ -1264,6 +1313,7 @@ def main() -> None:
                         "sequence_sampling": meta["sequence_sampling"],
                         "class_weighting": "sqrt_inverse_capped",
                         "class_weights": class_weights_np.tolist(),
+                        "obstacle_class_focus_weight": args.obstacle_class_focus_weight,
                         "obstacle_aux_weight": args.obstacle_aux_weight,
                         "obstacle_pos_weight": obstacle_pos_weight,
                         "obstacle_pos_weight_cap": args.obstacle_pos_weight_cap,
