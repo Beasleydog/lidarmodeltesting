@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 import csv
 import json
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -55,6 +57,28 @@ def log(message: str) -> None:
 
 def log_plain(message: str) -> None:
     _emit_log_line(message)
+
+
+def resolve_data_loader_workers(requested: int) -> int:
+    req = int(requested)
+    if req >= 0:
+        return req
+    cpu_count = max(int(os.cpu_count() or 1), 1)
+    return max(1, min(8, cpu_count - 1))
+
+
+def configure_runtime_for_device(device_kind: str) -> None:
+    if device_kind != "cuda":
+        return
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+    cuda_backend = getattr(torch.backends, "cuda", None)
+    if cuda_backend is not None and hasattr(cuda_backend, "matmul"):
+        cuda_backend.matmul.allow_tf32 = True
+    cudnn_backend = getattr(torch.backends, "cudnn", None)
+    if cudnn_backend is not None:
+        cudnn_backend.allow_tf32 = True
+        cudnn_backend.benchmark = True
 
 
 def select_runtime_device(preferred: str | None = None) -> tuple[torch.device, str]:
@@ -714,6 +738,8 @@ def run_epoch(
     obstacle_aux_weight: float = 1.0,
     obstacle_pos_weight: float = 1.0,
     hard_example_fraction: float = 0.25,
+    use_amp: bool = False,
+    grad_scaler=None,
 ) -> tuple[float, float]:
     def fmt_acc(correct: int, total: int) -> str:
         if total <= 0:
@@ -733,32 +759,49 @@ def run_epoch(
 
     batch_count = len(loader)
     phase_t0 = perf_counter()
+    non_blocking = device_kind == "cuda"
+    amp_enabled = bool(use_amp and device_kind == "cuda")
     for batch_idx, (x, lengths, y) in enumerate(loader, start=1):
-        x = x.to(device)
-        y = y.to(device)
+        x = x.to(device, non_blocking=non_blocking)
+        y = y.to(device, non_blocking=non_blocking)
 
-        logits, hit_logits, obstacle_ground_logits = model.forward_with_aux(x, lengths)
-        hit_targets = (y != 2).float()
-        hit_loss = F.binary_cross_entropy_with_logits(hit_logits, hit_targets, reduction="mean")
-        hit_mask = y != 2
-        if hit_mask.any():
-            obstacle_ground_targets = (y[hit_mask] == 1).float()
-            obstacle_loss = balanced_hard_obstacle_bce_loss(
-                obstacle_ground_logits[hit_mask],
-                obstacle_ground_targets,
-                pos_weight=None,
-                hard_fraction=hard_example_fraction,
-            )
-        else:
-            obstacle_loss = hit_loss.new_zeros(())
-        loss = hit_loss + obstacle_loss
+        amp_context = (
+            torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+            if amp_enabled
+            else nullcontext()
+        )
+        with amp_context:
+            logits, hit_logits, obstacle_ground_logits = model.forward_with_aux(x, lengths)
+            hit_targets = (y != 2).float()
+            hit_loss = F.binary_cross_entropy_with_logits(hit_logits, hit_targets, reduction="mean")
+            hit_mask = y != 2
+            if hit_mask.any():
+                obstacle_ground_targets = (y[hit_mask] == 1).float()
+                obstacle_loss = balanced_hard_obstacle_bce_loss(
+                    obstacle_ground_logits[hit_mask],
+                    obstacle_ground_targets,
+                    pos_weight=None,
+                    hard_fraction=hard_example_fraction,
+                )
+            else:
+                obstacle_loss = hit_loss.new_zeros(())
+            loss = hit_loss + obstacle_loss
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            if grad_clip_norm > 0.0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-            optimizer_step_for_device(optimizer, device_kind)
+            scaler_enabled = bool(grad_scaler is not None and getattr(grad_scaler, "is_enabled", lambda: False)())
+            if scaler_enabled:
+                grad_scaler.scale(loss).backward()
+                if grad_clip_norm > 0.0:
+                    grad_scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+            else:
+                loss.backward()
+                if grad_clip_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                optimizer_step_for_device(optimizer, device_kind)
 
         preds = torch.argmax(logits, dim=-1)
         total_correct += int((preds == y).sum().item())
@@ -943,6 +986,9 @@ def build_loaders(
     data_dir: Path,
     val_fraction: float,
     batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    prefetch_factor: int,
     max_history: int,
     histories_per_target: int,
     exclude_after_teleport_steps: int,
@@ -1066,21 +1112,31 @@ def build_loaders(
             f"non_obstacle_samples={oversample_meta['non_obstacle_samples']})"
         )
 
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": int(max(num_workers, 0)),
+        "pin_memory": bool(pin_memory),
+        "collate_fn": collate_padded,
+    }
+    if int(max(num_workers, 0)) > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = int(max(prefetch_factor, 2))
+
     train_loader = DataLoader(
         train_ds,
-        batch_size=batch_size,
         shuffle=train_sampler is None,
         sampler=train_sampler,
-        num_workers=0,
-        collate_fn=collate_padded,
+        **loader_kwargs,
     )
-    log(f"DataLoaders ready -> batch_size={batch_size}")
+    log(
+        "DataLoaders ready -> "
+        f"batch_size={batch_size} num_workers={int(max(num_workers, 0))} "
+        f"pin_memory={bool(pin_memory)}"
+    )
     val_loader = DataLoader(
         val_ds,
-        batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
-        collate_fn=collate_padded,
+        **loader_kwargs,
     )
 
     meta = {
@@ -1133,6 +1189,10 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--num-workers", type=int, default=-1)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--disable-pin-memory", action="store_true")
+    parser.add_argument("--amp", type=str, choices=("auto", "on", "off"), default="auto")
     parser.add_argument("--val-fraction", type=float, default=0.25)
     parser.add_argument("--max-history", type=int, default=32)
     parser.add_argument("--histories-per-target", type=int, default=3)
@@ -1167,10 +1227,26 @@ def main() -> None:
     np.random.seed(args.seed)
     log(f"Seeds set -> numpy={args.seed} torch={args.seed}")
 
+    device, device_kind = select_runtime_device(args.device)
+    configure_runtime_for_device(device_kind)
+    loader_num_workers = resolve_data_loader_workers(args.num_workers)
+    loader_pin_memory = bool(device_kind == "cuda" and not args.disable_pin_memory)
+    amp_enabled = bool(device_kind == "cuda" and args.amp != "off")
+    if args.amp == "on" and device_kind != "cuda":
+        log("AMP requested, but mixed precision is only enabled for CUDA in this script; continuing without AMP.")
+    log(
+        "Runtime tuning: "
+        f"device={device_kind} num_workers={loader_num_workers} "
+        f"pin_memory={loader_pin_memory} amp={amp_enabled}"
+    )
+
     train_loader, val_loader, meta = build_loaders(
         data_dir=args.data_dir,
         val_fraction=args.val_fraction,
         batch_size=args.batch_size,
+        num_workers=loader_num_workers,
+        pin_memory=loader_pin_memory,
+        prefetch_factor=args.prefetch_factor,
         max_history=args.max_history,
         histories_per_target=args.histories_per_target,
         exclude_after_teleport_steps=args.exclude_after_teleport_steps,
@@ -1200,7 +1276,6 @@ def main() -> None:
         f"train={meta['train_class_counts']} val={meta['val_class_counts']}"
     )
 
-    device, device_kind = select_runtime_device(args.device)
     log(f"Using device: {device} ({device_kind})")
     model = GRULidarClassifier(
         input_dim=meta["input_dim"],
@@ -1238,6 +1313,7 @@ def main() -> None:
     )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    grad_scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
     log(f"Optimizer initialized: AdamW lr={args.lr} weight_decay={args.weight_decay}")
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -1328,6 +1404,8 @@ def main() -> None:
             obstacle_aux_weight=args.obstacle_aux_weight,
             obstacle_pos_weight=obstacle_pos_weight,
             hard_example_fraction=args.hard_example_fraction,
+            use_amp=amp_enabled,
+            grad_scaler=grad_scaler,
         )
         val_loss, val_acc = run_epoch(
             model,
@@ -1347,6 +1425,7 @@ def main() -> None:
             obstacle_aux_weight=args.obstacle_aux_weight,
             obstacle_pos_weight=obstacle_pos_weight,
             hard_example_fraction=args.hard_example_fraction,
+            use_amp=amp_enabled,
         )
         scheduler.step(val_loss)
         current_lr = float(optimizer.param_groups[0]["lr"])
