@@ -535,7 +535,7 @@ class GRULidarClassifier(nn.Module):
         delta_dist = current_dist - prev_dist
         delta_hit = current_hit - prev_hit
 
-        region_context = x.new_zeros((batch_size, self.num_sensors, self.region_context_dim))
+        region_context = fused.new_zeros((batch_size, self.num_sensors, self.region_context_dim))
         for name in self.region_names:
             proj = self.region_context_projs[name](region_state_map[name])
             region_context[:, self.region_sensor_groups[name], :] = proj.unsqueeze(1)
