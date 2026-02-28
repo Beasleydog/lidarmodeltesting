@@ -424,8 +424,8 @@ class GRULidarClassifier(nn.Module):
 
         self.fusion_dropout = nn.Dropout(dropout)
         self.fusion = nn.Linear(total_region_dim, self.fusion_hidden_dim)
-        self.class_head = nn.Linear(self.fusion_hidden_dim, self.num_sensors * self.num_classes)
-        self.obstacle_head = nn.Linear(self.fusion_hidden_dim, self.num_sensors)
+        self.hit_head = nn.Linear(self.fusion_hidden_dim, self.num_sensors)
+        self.obstacle_ground_head = nn.Linear(self.fusion_hidden_dim, self.num_sensors)
 
     def _encode(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         pose = x[:, :, :4]
@@ -444,16 +444,30 @@ class GRULidarClassifier(nn.Module):
         fused = self.fusion_dropout(fused)
         return F.gelu(self.fusion(fused))
 
-    def forward_with_aux(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward_with_aux(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         fused = self._encode(x, lengths)
         fused = self.fusion_dropout(fused)
-        class_logits = self.class_head(fused).view(-1, self.num_sensors, self.num_classes)
-        obstacle_logits = self.obstacle_head(fused).view(-1, self.num_sensors)
-        return class_logits, obstacle_logits
+        hit_logits = self.hit_head(fused).view(-1, self.num_sensors)
+        obstacle_ground_logits = self.obstacle_ground_head(fused).view(-1, self.num_sensors)
+        class_logits = factorized_binary_logits_to_class_logits(hit_logits, obstacle_ground_logits)
+        return class_logits, hit_logits, obstacle_ground_logits
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        class_logits, _ = self.forward_with_aux(x, lengths)
+        class_logits, _, _ = self.forward_with_aux(x, lengths)
         return class_logits
+
+
+def factorized_binary_logits_to_class_logits(
+    hit_logits: torch.Tensor,
+    obstacle_ground_logits: torch.Tensor,
+) -> torch.Tensor:
+    log_p_hit = F.logsigmoid(hit_logits)
+    log_p_none = F.logsigmoid(-hit_logits)
+    log_p_obstacle_given_hit = F.logsigmoid(obstacle_ground_logits)
+    log_p_ground_given_hit = F.logsigmoid(-obstacle_ground_logits)
+    log_p_ground = log_p_hit + log_p_ground_given_hit
+    log_p_obstacle = log_p_hit + log_p_obstacle_given_hit
+    return torch.stack([log_p_ground, log_p_obstacle, log_p_none], dim=-1)
 class GRULidarInferencer:
     def __init__(
         self,
@@ -623,13 +637,6 @@ def run_epoch(
 
     is_train = optimizer is not None
     model.train(is_train)
-    use_focal = float(focal_gamma) > 0.0
-    criterion = nn.CrossEntropyLoss(
-        weight=class_weights,
-        label_smoothing=float(max(label_smoothing, 0.0)),
-        reduction="none",
-    )
-    obstacle_pos_weight_t = torch.tensor(float(max(obstacle_pos_weight, 1.0)), dtype=torch.float32, device=device)
     hard_example_fraction = float(np.clip(hard_example_fraction, 0.0, 1.0))
 
     total_loss = 0.0
@@ -645,44 +652,21 @@ def run_epoch(
         x = x.to(device)
         y = y.to(device)
 
-        logits, obstacle_logits = model.forward_with_aux(x, lengths)
-        logits_flat = logits.reshape(-1, num_classes)
-        y_flat = y.reshape(-1)
-        if use_focal:
-            class_loss_per_ray = focal_cross_entropy_loss(
-                logits_flat,
-                y_flat,
-                gamma=focal_gamma,
-                class_weights=class_weights,
-                reduction="none",
-            )
-        else:
-            class_loss_per_ray = criterion(logits_flat, y_flat)
-        class_loss_per_ray = class_loss_per_ray.reshape_as(y)
-
-        obstacle_mask = y == 1
-        mean_class_loss = class_loss_per_ray.mean()
-        if obstacle_mask.any():
-            obstacle_class_focus_loss = _topk_mean(class_loss_per_ray[obstacle_mask], hard_example_fraction)
-        else:
-            obstacle_class_focus_loss = mean_class_loss.new_zeros(())
-
+        logits, hit_logits, obstacle_ground_logits = model.forward_with_aux(x, lengths)
+        hit_targets = (y != 2).float()
+        hit_loss = F.binary_cross_entropy_with_logits(hit_logits, hit_targets, reduction="mean")
         hit_mask = y != 2
         if hit_mask.any():
             obstacle_ground_targets = (y[hit_mask] == 1).float()
             obstacle_loss = balanced_hard_obstacle_bce_loss(
-                obstacle_logits[hit_mask],
+                obstacle_ground_logits[hit_mask],
                 obstacle_ground_targets,
-                pos_weight=obstacle_pos_weight_t,
+                pos_weight=None,
                 hard_fraction=hard_example_fraction,
             )
         else:
-            obstacle_loss = mean_class_loss.new_zeros(())
-        loss = (
-            mean_class_loss
-            + float(max(obstacle_class_focus_weight, 0.0)) * obstacle_class_focus_loss
-            + float(max(obstacle_aux_weight, 0.0)) * obstacle_loss
-        )
+            obstacle_loss = hit_loss.new_zeros(())
+        loss = hit_loss + obstacle_loss
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -801,15 +785,13 @@ def _topk_mean(values: torch.Tensor, fraction: float) -> torch.Tensor:
 def balanced_hard_obstacle_bce_loss(
     obstacle_logits: torch.Tensor,
     obstacle_targets: torch.Tensor,
-    pos_weight: torch.Tensor,
+    pos_weight: torch.Tensor | None,
     hard_fraction: float,
 ) -> torch.Tensor:
-    per_ray = F.binary_cross_entropy_with_logits(
-        obstacle_logits,
-        obstacle_targets,
-        pos_weight=pos_weight,
-        reduction="none",
-    )
+    bce_kwargs = {"reduction": "none"}
+    if pos_weight is not None:
+        bce_kwargs["pos_weight"] = pos_weight
+    per_ray = F.binary_cross_entropy_with_logits(obstacle_logits, obstacle_targets, **bce_kwargs)
     pos_mask = obstacle_targets > 0.5
     neg_mask = ~pos_mask
     pos_losses = per_ray[pos_mask]
@@ -1078,7 +1060,7 @@ def main() -> None:
     parser.add_argument("--obstacle-class-focus-weight", type=float, default=0.75)
     parser.add_argument("--obstacle-aux-weight", type=float, default=0.35)
     parser.add_argument("--obstacle-pos-weight-cap", type=float, default=4.0)
-    parser.add_argument("--hard-example-fraction", type=float, default=0.5)
+    parser.add_argument("--hard-example-fraction", type=float, default=1.0)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--plateau-factor", type=float, default=0.5)
     parser.add_argument("--plateau-patience", type=int, default=1)
@@ -1178,23 +1160,18 @@ def main() -> None:
         f"factor={args.plateau_factor} patience={args.plateau_patience} min_lr={args.min_lr}"
     )
     class_weights_np = compute_class_weights(np.asarray(meta["train_class_counts"], dtype=np.float32))
-    class_weights_t = torch.tensor(class_weights_np, dtype=torch.float32, device=device)
     obstacle_pos_weight = compute_obstacle_ground_pos_weight(
         np.asarray(meta["train_class_counts"], dtype=np.float32),
         max_weight=args.obstacle_pos_weight_cap,
     )
-    log(f"Using tempered sqrt-inverse class weights (capped) : {class_weights_np.tolist()}")
     log(
-        "Using obstacle-vs-ground auxiliary loss on hit rays "
-        f"class_focus_weight={args.obstacle_class_focus_weight:.3f} "
-        f"aux_weight={args.obstacle_aux_weight:.3f} "
-        f"pos_weight={obstacle_pos_weight:.3f} "
+        "Using factorized training heads: hit-vs-none plus balanced obstacle-vs-ground on hit rays "
         f"hard_example_fraction={args.hard_example_fraction:.3f}"
     )
-    if args.focal_gamma > 0.0:
-        log(f"Using focal loss with gamma={args.focal_gamma}")
-    else:
-        log(f"Using cross-entropy loss with label_smoothing={args.label_smoothing}")
+    log(
+        "Legacy class-weight/focal settings are ignored by the factorized loss; "
+        "the model now learns the easy and hard boundaries separately."
+    )
     best = {"val_loss": float("inf"), "epoch": -1}
     history: list[dict] = []
     metrics_csv_path = args.output.with_suffix(".metrics.csv")
@@ -1224,7 +1201,7 @@ def main() -> None:
                 "val_class_counts": meta["val_class_counts"],
                 "obstacle_aux_weight": args.obstacle_aux_weight,
                 "obstacle_class_focus_weight": args.obstacle_class_focus_weight,
-                "obstacle_pos_weight": obstacle_pos_weight,
+                "obstacle_pos_weight_reference": obstacle_pos_weight,
                 "obstacle_pos_weight_cap": args.obstacle_pos_weight_cap,
                 "hard_example_fraction": args.hard_example_fraction,
             },
@@ -1252,7 +1229,7 @@ def main() -> None:
             total_epochs=args.epochs,
             phase_name="train",
             log_every_batches=args.log_every_batches,
-            class_weights=class_weights_t,
+            class_weights=None,
             label_smoothing=args.label_smoothing,
             grad_clip_norm=args.grad_clip_norm,
             focal_gamma=args.focal_gamma,
@@ -1272,7 +1249,7 @@ def main() -> None:
             total_epochs=args.epochs,
             phase_name="val",
             log_every_batches=args.log_every_batches,
-            class_weights=class_weights_t,
+            class_weights=None,
             label_smoothing=args.label_smoothing,
             focal_gamma=args.focal_gamma,
             obstacle_class_focus_weight=args.obstacle_class_focus_weight,
@@ -1315,14 +1292,14 @@ def main() -> None:
                         "exclude_after_teleport_steps": args.exclude_after_teleport_steps,
                         "obstacle_oversample_target_frac": args.obstacle_oversample_target_frac,
                         "sequence_sampling": meta["sequence_sampling"],
-                        "class_weighting": "sqrt_inverse_capped",
-                        "class_weights": class_weights_np.tolist(),
+                        "class_weighting": "inactive_factorized_reference_only",
+                        "class_weights_reference": class_weights_np.tolist(),
                         "obstacle_class_focus_weight": args.obstacle_class_focus_weight,
                         "obstacle_aux_weight": args.obstacle_aux_weight,
-                        "obstacle_pos_weight": obstacle_pos_weight,
+                        "obstacle_pos_weight_reference": obstacle_pos_weight,
                         "obstacle_pos_weight_cap": args.obstacle_pos_weight_cap,
                         "hard_example_fraction": args.hard_example_fraction,
-                        "loss_type": "focal" if args.focal_gamma > 0.0 else "cross_entropy",
+                        "loss_type": "factorized_binary",
                         "prediction_target": "current_step_lidar_class",
                         "focal_gamma": args.focal_gamma,
                         "label_smoothing": args.label_smoothing,
