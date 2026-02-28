@@ -424,9 +424,10 @@ class GRULidarClassifier(nn.Module):
 
         self.fusion_dropout = nn.Dropout(dropout)
         self.fusion = nn.Linear(total_region_dim, self.fusion_hidden_dim)
-        self.head = nn.Linear(self.fusion_hidden_dim, self.num_sensors * self.num_classes)
+        self.class_head = nn.Linear(self.fusion_hidden_dim, self.num_sensors * self.num_classes)
+        self.obstacle_head = nn.Linear(self.fusion_hidden_dim, self.num_sensors)
 
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    def _encode(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         pose = x[:, :, :4]
         dist = x[:, :, 4 : 4 + self.num_sensors]
         hit = x[:, :, 4 + self.num_sensors : 4 + 2 * self.num_sensors]
@@ -441,9 +442,18 @@ class GRULidarClassifier(nn.Module):
 
         fused = torch.cat(region_states, dim=-1)
         fused = self.fusion_dropout(fused)
-        fused = F.gelu(self.fusion(fused))
-        logits = self.head(self.fusion_dropout(fused))
-        return logits.view(-1, self.num_sensors, self.num_classes)
+        return F.gelu(self.fusion(fused))
+
+    def forward_with_aux(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        fused = self._encode(x, lengths)
+        fused = self.fusion_dropout(fused)
+        class_logits = self.class_head(fused).view(-1, self.num_sensors, self.num_classes)
+        obstacle_logits = self.obstacle_head(fused).view(-1, self.num_sensors)
+        return class_logits, obstacle_logits
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        class_logits, _ = self.forward_with_aux(x, lengths)
+        return class_logits
 class GRULidarInferencer:
     def __init__(
         self,
@@ -566,6 +576,7 @@ def focal_cross_entropy_loss(
     targets: torch.Tensor,
     gamma: float,
     class_weights: torch.Tensor | None = None,
+    reduction: str = "mean",
 ) -> torch.Tensor:
     # Standard multi-class focal loss applied per lidar ray.
     log_probs = F.log_softmax(logits, dim=-1)
@@ -577,7 +588,12 @@ def focal_cross_entropy_loss(
     if class_weights is not None:
         sample_w = class_weights.to(logits.device).gather(0, targets.reshape(-1)).reshape_as(targets)
         nll = nll * sample_w
-    return (focal * nll).mean()
+    loss = focal * nll
+    if reduction == "none":
+        return loss
+    if reduction == "mean":
+        return loss.mean()
+    raise ValueError(f"Unsupported focal loss reduction: {reduction}")
 
 
 def run_epoch(
@@ -595,6 +611,9 @@ def run_epoch(
     label_smoothing: float = 0.0,
     grad_clip_norm: float = 0.0,
     focal_gamma: float = 2.0,
+    obstacle_aux_weight: float = 1.0,
+    obstacle_pos_weight: float = 1.0,
+    hard_example_fraction: float = 0.25,
 ) -> tuple[float, float]:
     def fmt_acc(correct: int, total: int) -> str:
         if total <= 0:
@@ -604,7 +623,13 @@ def run_epoch(
     is_train = optimizer is not None
     model.train(is_train)
     use_focal = float(focal_gamma) > 0.0
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=float(max(label_smoothing, 0.0)))
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights,
+        label_smoothing=float(max(label_smoothing, 0.0)),
+        reduction="none",
+    )
+    obstacle_pos_weight_t = torch.tensor(float(max(obstacle_pos_weight, 1.0)), dtype=torch.float32, device=device)
+    hard_example_fraction = float(np.clip(hard_example_fraction, 0.0, 1.0))
 
     total_loss = 0.0
     total_correct = 0
@@ -619,18 +644,36 @@ def run_epoch(
         x = x.to(device)
         y = y.to(device)
 
-        logits = model(x, lengths)
+        logits, obstacle_logits = model.forward_with_aux(x, lengths)
         logits_flat = logits.reshape(-1, num_classes)
         y_flat = y.reshape(-1)
         if use_focal:
-            loss = focal_cross_entropy_loss(
+            class_loss_per_ray = focal_cross_entropy_loss(
                 logits_flat,
                 y_flat,
                 gamma=focal_gamma,
                 class_weights=class_weights,
+                reduction="none",
             )
         else:
-            loss = criterion(logits_flat, y_flat)
+            class_loss_per_ray = criterion(logits_flat, y_flat)
+        class_loss_per_ray = class_loss_per_ray.reshape_as(y)
+
+        obstacle_targets = (y == 1).float()
+        obstacle_loss_per_ray = F.binary_cross_entropy_with_logits(
+            obstacle_logits,
+            obstacle_targets,
+            pos_weight=obstacle_pos_weight_t,
+            reduction="none",
+        )
+        total_loss_per_ray = class_loss_per_ray + float(max(obstacle_aux_weight, 0.0)) * obstacle_loss_per_ray
+        mean_loss = total_loss_per_ray.mean()
+        if 0.0 < hard_example_fraction < 1.0:
+            hard_k = max(1, int(np.ceil(total_loss_per_ray.numel() * hard_example_fraction)))
+            hard_loss = torch.topk(total_loss_per_ray.reshape(-1), k=hard_k).values.mean()
+            loss = 0.5 * mean_loss + 0.5 * hard_loss
+        else:
+            loss = mean_loss
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -726,6 +769,14 @@ def compute_class_weights(class_counts: np.ndarray) -> np.ndarray:
     weights = np.clip(weights, 1e-8, max_weight)
     weights /= np.mean(weights)
     return weights.astype(np.float32)
+
+
+def compute_obstacle_pos_weight(class_counts: np.ndarray, max_weight: float = 12.0) -> float:
+    counts = np.asarray(class_counts, dtype=np.float64)
+    obstacle = max(float(counts[1]), 1.0)
+    non_obstacle = max(float(counts[0] + counts[2]), 1.0)
+    weight = non_obstacle / obstacle
+    return float(np.clip(weight, 1.0, max_weight))
 
 
 def compute_obstacle_oversample_weights(
@@ -976,6 +1027,9 @@ def main() -> None:
     parser.add_argument("--log-every-batches", type=int, default=25)
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument("--obstacle-aux-weight", type=float, default=1.5)
+    parser.add_argument("--obstacle-pos-weight-cap", type=float, default=12.0)
+    parser.add_argument("--hard-example-fraction", type=float, default=0.25)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--plateau-factor", type=float, default=0.5)
     parser.add_argument("--plateau-patience", type=int, default=1)
@@ -1076,7 +1130,17 @@ def main() -> None:
     )
     class_weights_np = compute_class_weights(np.asarray(meta["train_class_counts"], dtype=np.float32))
     class_weights_t = torch.tensor(class_weights_np, dtype=torch.float32, device=device)
+    obstacle_pos_weight = compute_obstacle_pos_weight(
+        np.asarray(meta["train_class_counts"], dtype=np.float32),
+        max_weight=args.obstacle_pos_weight_cap,
+    )
     log(f"Using tempered sqrt-inverse class weights (capped) : {class_weights_np.tolist()}")
+    log(
+        "Using obstacle auxiliary loss "
+        f"weight={args.obstacle_aux_weight:.3f} "
+        f"pos_weight={obstacle_pos_weight:.3f} "
+        f"hard_example_fraction={args.hard_example_fraction:.3f}"
+    )
     if args.focal_gamma > 0.0:
         log(f"Using focal loss with gamma={args.focal_gamma}")
     else:
@@ -1108,6 +1172,10 @@ def main() -> None:
                 "train_sampled_obstacle_target_fraction": meta["train_sampled_obstacle_target_fraction"],
                 "train_class_counts": meta["train_class_counts"],
                 "val_class_counts": meta["val_class_counts"],
+                "obstacle_aux_weight": args.obstacle_aux_weight,
+                "obstacle_pos_weight": obstacle_pos_weight,
+                "obstacle_pos_weight_cap": args.obstacle_pos_weight_cap,
+                "hard_example_fraction": args.hard_example_fraction,
             },
             fh,
             indent=2,
@@ -1137,6 +1205,9 @@ def main() -> None:
             label_smoothing=args.label_smoothing,
             grad_clip_norm=args.grad_clip_norm,
             focal_gamma=args.focal_gamma,
+            obstacle_aux_weight=args.obstacle_aux_weight,
+            obstacle_pos_weight=obstacle_pos_weight,
+            hard_example_fraction=args.hard_example_fraction,
         )
         val_loss, val_acc = run_epoch(
             model,
@@ -1152,6 +1223,9 @@ def main() -> None:
             class_weights=class_weights_t,
             label_smoothing=args.label_smoothing,
             focal_gamma=args.focal_gamma,
+            obstacle_aux_weight=args.obstacle_aux_weight,
+            obstacle_pos_weight=obstacle_pos_weight,
+            hard_example_fraction=0.0,
         )
         scheduler.step(val_loss)
         current_lr = float(optimizer.param_groups[0]["lr"])
@@ -1190,6 +1264,10 @@ def main() -> None:
                         "sequence_sampling": meta["sequence_sampling"],
                         "class_weighting": "sqrt_inverse_capped",
                         "class_weights": class_weights_np.tolist(),
+                        "obstacle_aux_weight": args.obstacle_aux_weight,
+                        "obstacle_pos_weight": obstacle_pos_weight,
+                        "obstacle_pos_weight_cap": args.obstacle_pos_weight_cap,
+                        "hard_example_fraction": args.hard_example_fraction,
                         "loss_type": "focal" if args.focal_gamma > 0.0 else "cross_entropy",
                         "prediction_target": "current_step_lidar_class",
                         "focal_gamma": args.focal_gamma,
