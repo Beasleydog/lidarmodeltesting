@@ -378,6 +378,9 @@ class GRULidarClassifier(nn.Module):
         region_sensor_groups: dict[str, list[int]] | None = None,
         region_hidden_dims: dict[str, int] | None = None,
         fusion_hidden_dim: int | None = None,
+        region_context_dim: int | None = None,
+        sensor_embed_dim: int | None = None,
+        decoder_hidden_dim: int | None = None,
     ):
         super().__init__()
         self.model_type = "regional_gru"
@@ -405,9 +408,26 @@ class GRULidarClassifier(nn.Module):
             if fusion_hidden_dim is None
             else max(8, int(fusion_hidden_dim))
         )
+        self.region_context_dim = (
+            max(8, int(round(self.fusion_hidden_dim * 0.5)))
+            if region_context_dim is None
+            else max(4, int(region_context_dim))
+        )
+        self.sensor_embed_dim = (
+            max(4, min(16, int(round(self.hidden_dim * 0.25))))
+            if sensor_embed_dim is None
+            else max(2, int(sensor_embed_dim))
+        )
+        self.decoder_hidden_dim = (
+            max(32, self.fusion_hidden_dim)
+            if decoder_hidden_dim is None
+            else max(8, int(decoder_hidden_dim))
+        )
         self.region_names = list(self.region_sensor_groups.keys())
+        self.sensor_to_region_name: list[str] = [""] * self.num_sensors
 
         self.region_grus = nn.ModuleDict()
+        self.region_context_projs = nn.ModuleDict()
         total_region_dim = 0
         for name in self.region_names:
             sensor_ids = self.region_sensor_groups[name]
@@ -420,35 +440,97 @@ class GRULidarClassifier(nn.Module):
                 batch_first=True,
                 dropout=dropout if self.num_layers > 1 else 0.0,
             )
+            self.region_context_projs[name] = nn.Linear(region_hidden, self.region_context_dim)
             total_region_dim += region_hidden
+            for sensor_id in sensor_ids:
+                self.sensor_to_region_name[sensor_id] = name
 
         self.fusion_dropout = nn.Dropout(dropout)
         self.fusion = nn.Linear(total_region_dim, self.fusion_hidden_dim)
-        self.hit_head = nn.Linear(self.fusion_hidden_dim, self.num_sensors)
-        self.obstacle_ground_head = nn.Linear(self.fusion_hidden_dim, self.num_sensors)
+        self.sensor_embedding = nn.Embedding(self.num_sensors, self.sensor_embed_dim)
+        decoder_in_dim = (
+            self.fusion_hidden_dim
+            + self.region_context_dim
+            + self.sensor_embed_dim
+            + 4  # current pose
+            + 4  # current/previous local ray features
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(decoder_in_dim, self.decoder_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.decoder_hidden_dim, self.decoder_hidden_dim),
+            nn.GELU(),
+        )
+        self.hit_head = nn.Linear(self.decoder_hidden_dim, 1)
+        self.obstacle_ground_head = nn.Linear(self.decoder_hidden_dim, 1)
 
-    def _encode(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    def _encode(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         pose = x[:, :, :4]
         dist = x[:, :, 4 : 4 + self.num_sensors]
         hit = x[:, :, 4 + self.num_sensors : 4 + 2 * self.num_sensors]
 
         region_states: list[torch.Tensor] = []
+        region_state_map: dict[str, torch.Tensor] = {}
         for name in self.region_names:
             sensor_ids = self.region_sensor_groups[name]
             x_region = torch.cat([pose, dist[:, :, sensor_ids], hit[:, :, sensor_ids]], dim=-1)
             packed = pack_padded_sequence(x_region, lengths.cpu(), batch_first=True, enforce_sorted=False)
             _, h_n = self.region_grus[name](packed)
-            region_states.append(h_n[-1])
+            final_state = h_n[-1]
+            region_states.append(final_state)
+            region_state_map[name] = final_state
 
         fused = torch.cat(region_states, dim=-1)
         fused = self.fusion_dropout(fused)
-        return F.gelu(self.fusion(fused))
+        return F.gelu(self.fusion(fused)), region_state_map
+
+    def _build_sensor_decoder_inputs(
+        self,
+        x: torch.Tensor,
+        lengths: torch.Tensor,
+        fused: torch.Tensor,
+        region_state_map: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        batch_size = x.shape[0]
+        device = x.device
+        lengths_dev = lengths.to(device=device)
+        batch_idx = torch.arange(batch_size, device=device)
+        last_idx = torch.clamp(lengths_dev - 1, min=0)
+        prev_idx = torch.clamp(lengths_dev - 2, min=0)
+
+        current_step = x[batch_idx, last_idx]
+        prev_step = x[batch_idx, prev_idx]
+
+        current_pose = current_step[:, :4]
+        current_dist = current_step[:, 4 : 4 + self.num_sensors]
+        current_hit = current_step[:, 4 + self.num_sensors : 4 + 2 * self.num_sensors]
+        prev_dist = prev_step[:, 4 : 4 + self.num_sensors]
+        prev_hit = prev_step[:, 4 + self.num_sensors : 4 + 2 * self.num_sensors]
+
+        delta_dist = current_dist - prev_dist
+        delta_hit = current_hit - prev_hit
+
+        region_context = x.new_zeros((batch_size, self.num_sensors, self.region_context_dim))
+        for name in self.region_names:
+            proj = self.region_context_projs[name](region_state_map[name])
+            region_context[:, self.region_sensor_groups[name], :] = proj.unsqueeze(1)
+
+        fused_expand = fused.unsqueeze(1).expand(-1, self.num_sensors, -1)
+        pose_expand = current_pose.unsqueeze(1).expand(-1, self.num_sensors, -1)
+        local_features = torch.stack([current_dist, current_hit, delta_dist, delta_hit], dim=-1)
+        sensor_ids = torch.arange(self.num_sensors, device=device)
+        sensor_embed = self.sensor_embedding(sensor_ids).unsqueeze(0).expand(batch_size, -1, -1)
+
+        return torch.cat([fused_expand, region_context, sensor_embed, pose_expand, local_features], dim=-1)
 
     def forward_with_aux(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        fused = self._encode(x, lengths)
+        fused, region_state_map = self._encode(x, lengths)
         fused = self.fusion_dropout(fused)
-        hit_logits = self.hit_head(fused).view(-1, self.num_sensors)
-        obstacle_ground_logits = self.obstacle_ground_head(fused).view(-1, self.num_sensors)
+        decoder_in = self._build_sensor_decoder_inputs(x, lengths, fused, region_state_map)
+        decoder_out = self.decoder(decoder_in)
+        hit_logits = self.hit_head(decoder_out).squeeze(-1)
+        obstacle_ground_logits = self.obstacle_ground_head(decoder_out).squeeze(-1)
         class_logits = factorized_binary_logits_to_class_logits(hit_logits, obstacle_ground_logits)
         return class_logits, hit_logits, obstacle_ground_logits
 
@@ -562,6 +644,9 @@ def load_gru_lidar_inferencer(
         region_sensor_groups=cfg.get("region_sensor_groups"),
         region_hidden_dims=cfg.get("region_hidden_dims"),
         fusion_hidden_dim=cfg.get("fusion_hidden_dim"),
+        region_context_dim=cfg.get("region_context_dim"),
+        sensor_embed_dim=cfg.get("sensor_embed_dim"),
+        decoder_hidden_dim=cfg.get("decoder_hidden_dim"),
     ).to(device_t)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
@@ -1136,6 +1221,9 @@ def main() -> None:
         "region_sensor_groups": model.region_sensor_groups,
         "region_hidden_dims": model.region_hidden_dims,
         "fusion_hidden_dim": int(model.fusion_hidden_dim),
+        "region_context_dim": int(model.region_context_dim),
+        "sensor_embed_dim": int(model.sensor_embed_dim),
+        "decoder_hidden_dim": int(model.decoder_hidden_dim),
     }
     param_count = sum(p.numel() for p in model.parameters())
     log(f"Model initialized: type={model_config['model_type']} params={param_count}")
@@ -1143,7 +1231,10 @@ def main() -> None:
         "Regional layout: "
         f"groups={model_config['region_sensor_groups']} "
         f"region_hidden={model_config['region_hidden_dims']} "
-        f"fusion_hidden={model_config['fusion_hidden_dim']}"
+        f"fusion_hidden={model_config['fusion_hidden_dim']} "
+        f"region_context={model_config['region_context_dim']} "
+        f"sensor_embed={model_config['sensor_embed_dim']} "
+        f"decoder_hidden={model_config['decoder_hidden_dim']}"
     )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
