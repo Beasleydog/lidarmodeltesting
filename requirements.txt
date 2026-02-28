@@ -1,0 +1,7 @@
+# Core / training
+numpy>=1.24
+torch>=2.2
+
+# Visualization / environment viewer
+open3d
+pyvista>=0.43
