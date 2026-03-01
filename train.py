@@ -1458,7 +1458,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("runs/gru_lidar_classifier.pt"))
     parser.add_argument("--eval-checkpoint", type=Path, default=None)
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=2048)
     parser.add_argument("--hidden-dim", type=int, default=48)
     parser.add_argument("--num-layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.35)
