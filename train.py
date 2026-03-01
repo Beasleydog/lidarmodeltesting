@@ -486,7 +486,7 @@ class GRULidarClassifier(nn.Module):
         for ordered_idx, sensor_id in enumerate(self.sensor_order_list):
             self.sensor_restore_list[int(sensor_id)] = int(ordered_idx)
         self.fusion_hidden_dim = (
-            max(48, int(round(self.hidden_dim * 0.75)))
+            max(48, self.hidden_dim)
             if fusion_hidden_dim is None
             else max(8, int(fusion_hidden_dim))
         )
@@ -497,12 +497,12 @@ class GRULidarClassifier(nn.Module):
         )
         ff_ref = attention_ff_dim if attention_ff_dim is not None else region_context_dim
         self.attention_ff_dim = (
-            max(32, int(round(max(self.hidden_dim, self.fusion_hidden_dim) * 0.75)))
+            max(48, max(self.hidden_dim, self.fusion_hidden_dim))
             if ff_ref is None
             else max(8, int(ff_ref))
         )
         self.decoder_hidden_dim = (
-            max(32, self.fusion_hidden_dim)
+            max(48, max(self.hidden_dim, self.fusion_hidden_dim))
             if decoder_hidden_dim is None
             else max(8, int(decoder_hidden_dim))
         )
@@ -1475,7 +1475,7 @@ def main() -> None:
     parser.add_argument("--max-history", type=int, default=64)
     parser.add_argument("--histories-per-target", type=int, default=3)
     parser.add_argument("--exclude-after-teleport-steps", type=int, default=1)
-    parser.add_argument("--obstacle-oversample-target-frac", type=float, default=0.35)
+    parser.add_argument("--obstacle-oversample-target-frac", type=float, default=0.60)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--log-every-batches", type=int, default=25)
     parser.add_argument("--label-smoothing", type=float, default=0.05)
@@ -1483,7 +1483,7 @@ def main() -> None:
     parser.add_argument("--obstacle-class-focus-weight", type=float, default=0.75)
     parser.add_argument("--obstacle-aux-weight", type=float, default=0.35)
     parser.add_argument("--obstacle-pos-weight-cap", type=float, default=4.0)
-    parser.add_argument("--hard-example-fraction", type=float, default=1.0)
+    parser.add_argument("--hard-example-fraction", type=float, default=0.5)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--plateau-factor", type=float, default=0.5)
     parser.add_argument("--plateau-patience", type=int, default=1)
