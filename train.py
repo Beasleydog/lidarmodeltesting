@@ -781,7 +781,7 @@ class GRULidarInferencer:
         device: torch.device,
         num_sensors: int,
         input_dim: int,
-        max_history: int = 32,
+        max_history: int = 64,
     ):
         self.model = model.eval()
         self.stats = stats
@@ -887,7 +887,7 @@ def load_gru_lidar_inferencer(
         dist_std=float(norm["dist_std"]),
     )
     if max_history is None:
-        max_history = int(ckpt.get("meta", {}).get("max_history", 32))
+        max_history = int(ckpt.get("meta", {}).get("max_history", 64))
     return GRULidarInferencer(
         model=model,
         stats=stats,
@@ -1470,7 +1470,7 @@ def main() -> None:
     parser.add_argument("--disable-pin-memory", action="store_true")
     parser.add_argument("--amp", type=str, choices=("auto", "on", "off"), default="auto")
     parser.add_argument("--val-fraction", type=float, default=0.25)
-    parser.add_argument("--max-history", type=int, default=32)
+    parser.add_argument("--max-history", type=int, default=64)
     parser.add_argument("--histories-per-target", type=int, default=3)
     parser.add_argument("--exclude-after-teleport-steps", type=int, default=1)
     parser.add_argument("--obstacle-oversample-target-frac", type=float, default=0.35)
