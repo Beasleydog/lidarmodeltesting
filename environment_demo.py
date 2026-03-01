@@ -58,6 +58,8 @@ NOISE_BASE_CELLS = 2
 NOISE_PERSISTENCE = 0.62
 TERRAIN_HEIGHT_SCALE_CM = 520.0
 TERRAIN_VERTICAL_EXAGGERATION = 3.4
+TERRAIN_SMOOTHING_PASSES = 2
+TERRAIN_SMOOTHING_BLEND = 0.65
 LIDAR_RANGE_CM = 1000.0
 OBSTACLE_RADIUS_MIN_FRAC = 0.015
 OBSTACLE_RADIUS_MAX_FRAC = 0.022
@@ -74,7 +76,7 @@ OBSTACLE_SIDE_EXPONENT = 0.22
 WORLDGEN_OBSTACLE_COUNT_RANGE = (70, 140)
 WORLDGEN_TERRAIN_HEIGHT_SCALE_RANGE_CM = (300.0, 900.0)
 WORLDGEN_NOISE_OCTAVES_RANGE = (3, 6)
-WORLDGEN_NOISE_BASE_CELLS_RANGE = (2, 6)
+WORLDGEN_NOISE_BASE_CELLS_RANGE = (1, 5)
 WORLDGEN_NOISE_PERSISTENCE_RANGE = (0.35, 0.72)
 WORLDGEN_OBSTACLE_RADIUS_MIN_FRAC_RANGE = (0.009, 0.020)
 WORLDGEN_OBSTACLE_RADIUS_MAX_FRAC_RANGE = (0.018, 0.040)
@@ -92,8 +94,10 @@ OCCUPANCY_OCCUPIED_OPACITY = 0.45
 OCCUPANCY_MAP_CLEARANCE_CM = 900.0
 DEFORMATION_EPS_CM = 1e-6
 OCCUPIED_MARKER_SIZE = 5.0
-ROVER_MOVE_STEP_CM = 140.0
-ROVER_TURN_STEP_DEG = 9.0
+ROVER_MOVE_STEP_CM = 60.0
+ROVER_TURN_STEP_DEG = 2.0
+ROVER_COARSE_MOVE_STEP_CM = 140.0
+ROVER_COARSE_TURN_STEP_DEG = 6.0
 LIDAR_SAMPLE_STEP_CM = 25.0
 LIDAR_OBSTACLE_COLOR = "#ff2b2b"
 LIDAR_GROUND_COLOR = "#2b7bff"
@@ -219,7 +223,24 @@ def generate_smooth_heightmap(
 
     z /= max(amplitude_sum, 1e-8)
     z = (z - z.min()) / (z.max() - z.min() + 1e-8)
+    for _ in range(TERRAIN_SMOOTHING_PASSES):
+        z = (1.0 - TERRAIN_SMOOTHING_BLEND) * z + TERRAIN_SMOOTHING_BLEND * _blur_heightmap(z)
     return (z - 0.5) * 2.0 * height_scale
+
+
+def _blur_heightmap(grid: np.ndarray) -> np.ndarray:
+    padded = np.pad(grid, 1, mode="edge")
+    return (
+        padded[:-2, :-2]
+        + 2.0 * padded[:-2, 1:-1]
+        + padded[:-2, 2:]
+        + 2.0 * padded[1:-1, :-2]
+        + 4.0 * padded[1:-1, 1:-1]
+        + 2.0 * padded[1:-1, 2:]
+        + padded[2:, :-2]
+        + 2.0 * padded[2:, 1:-1]
+        + padded[2:, 2:]
+    ) / 16.0
 
 
 def random_polygon(
@@ -273,7 +294,7 @@ def generate_environment(
     rng = np.random.default_rng(seed)
     obstacle_count = int(max(obstacle_count, 0))
     noise_octaves = int(max(noise_octaves, 1))
-    noise_base_cells = int(max(noise_base_cells, 2))
+    noise_base_cells = int(max(noise_base_cells, 1))
     noise_persistence = float(np.clip(noise_persistence, 0.05, 0.95))
     terrain_height_scale_cm = float(max(terrain_height_scale_cm, 1.0))
     radius_min_frac = float(min(obstacle_radius_min_frac, obstacle_radius_max_frac))
@@ -535,6 +556,35 @@ def estimate_terrain_normal(
     return normal / norm
 
 
+def estimate_rover_body_plane(
+    env: Environment,
+    state: RoverState,
+    sampler: HeightSampler,
+    footprint_local: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    corner_world_xy = np.empty((footprint_local.shape[0], 2), dtype=float)
+    for i, (lx, ly) in enumerate(footprint_local):
+        dx, dy = rotate_xy(float(lx), float(ly), state.yaw_deg)
+        corner_world_xy[i, 0] = state.x + dx
+        corner_world_xy[i, 1] = state.y + dy
+
+    corner_heights = sample_height_bilinear_many(env, corner_world_xy[:, 0], corner_world_xy[:, 1], sampler)
+    if np.any(~np.isfinite(corner_heights)):
+        return None
+
+    corner_points = np.column_stack((corner_world_xy, corner_heights))
+    centroid = corner_points.mean(axis=0)
+    centered = corner_points - centroid
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    terrain_up = vh[-1]
+    if terrain_up[2] < 0.0:
+        terrain_up = -terrain_up
+    norm = float(np.linalg.norm(terrain_up))
+    if norm < 1e-8:
+        return None
+    return corner_points, centroid, terrain_up / norm
+
+
 def build_rover_basis(yaw_deg: float, terrain_up: np.ndarray) -> np.ndarray:
     yaw = np.deg2rad(yaw_deg)
     forward_hint = np.array([np.cos(yaw), np.sin(yaw), 0.0], dtype=float)
@@ -579,9 +629,12 @@ def compute_rover_pose(
     state: RoverState,
     sampler: HeightSampler,
     footprint_center_local: np.ndarray | None = None,
+    footprint_local: np.ndarray | None = None,
 ) -> RoverPose | None:
     if footprint_center_local is None:
         footprint_center_local = ROVER_FOOTPRINT_CENTER_LOCAL
+    if footprint_local is None:
+        footprint_local = ROVER_FOOTPRINT_LOCAL
     center_dx, center_dy = rotate_xy(
         float(footprint_center_local[0]),
         float(footprint_center_local[1]),
@@ -589,10 +642,23 @@ def compute_rover_pose(
     )
     center_x = state.x + center_dx
     center_y = state.y + center_dy
-    center_z = sample_height_bilinear(env, center_x, center_y, sampler)
-    if center_z is None:
-        return None
-    terrain_up = estimate_terrain_normal(env, center_x, center_y, sampler)
+    support_plane = estimate_rover_body_plane(env, state, sampler, footprint_local)
+    if support_plane is None:
+        center_z = sample_height_bilinear(env, center_x, center_y, sampler)
+        if center_z is None:
+            return None
+        terrain_up = estimate_terrain_normal(env, center_x, center_y, sampler)
+    else:
+        _, centroid, terrain_up = support_plane
+        plane_offset = -float(np.dot(terrain_up, centroid))
+        if abs(float(terrain_up[2])) < 1e-8:
+            center_z = float(centroid[2])
+        else:
+            center_z = -(
+                float(terrain_up[0]) * center_x
+                + float(terrain_up[1]) * center_y
+                + plane_offset
+            ) / float(terrain_up[2])
     rover_basis = build_rover_basis(state.yaw_deg, terrain_up)
     center_world = np.array([center_x, center_y, center_z], dtype=float)
     rover_origin = center_world - rover_basis @ np.array(
@@ -910,13 +976,13 @@ def view_environment(
         vis.register_key_callback(ord("A"), lambda _: (turn(ROVER_TURN_STEP_DEG), False)[1])
         vis.register_key_callback(ord("D"), lambda _: (turn(-ROVER_TURN_STEP_DEG), False)[1])
 
-        # Fallback keys in case an OS or window manager consumes WASD.
-        vis.register_key_callback(ord("I"), lambda _: (move_forward(ROVER_MOVE_STEP_CM), False)[1])
-        vis.register_key_callback(ord("K"), lambda _: (move_forward(-ROVER_MOVE_STEP_CM), False)[1])
-        vis.register_key_callback(ord("U"), lambda _: (turn(ROVER_TURN_STEP_DEG), False)[1])
-        vis.register_key_callback(ord("O"), lambda _: (turn(-ROVER_TURN_STEP_DEG), False)[1])
+        # Keep a second set of keys for larger jumps when covering ground quickly.
+        vis.register_key_callback(ord("I"), lambda _: (move_forward(ROVER_COARSE_MOVE_STEP_CM), False)[1])
+        vis.register_key_callback(ord("K"), lambda _: (move_forward(-ROVER_COARSE_MOVE_STEP_CM), False)[1])
+        vis.register_key_callback(ord("U"), lambda _: (turn(ROVER_COARSE_TURN_STEP_DEG), False)[1])
+        vis.register_key_callback(ord("O"), lambda _: (turn(-ROVER_COARSE_TURN_STEP_DEG), False)[1])
 
-        print("Open3D controls: WASD move/turn (fallback I/K/U/O), mouse to orbit/pan/zoom")
+        print("Open3D controls: WASD fine move/turn, I/K/U/O coarse move/turn, mouse to orbit/pan/zoom")
         vis.run()
     else:
         print("Open3D playback mode: running autonomous trajectory")

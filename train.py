@@ -574,6 +574,28 @@ def factorized_binary_logits_to_class_logits(
     log_p_ground = log_p_hit + log_p_ground_given_hit
     log_p_obstacle = log_p_hit + log_p_obstacle_given_hit
     return torch.stack([log_p_ground, log_p_obstacle, log_p_none], dim=-1)
+
+
+def predict_eval_logits(
+    model: nn.Module,
+    x: torch.Tensor,
+    lengths: torch.Tensor,
+    obstacle_logit_bias: float = 0.0,
+) -> torch.Tensor:
+    if hasattr(model, "forward_with_aux"):
+        out = model.forward_with_aux(x, lengths)
+        if isinstance(out, tuple) and len(out) == 3:
+            class_logits, hit_logits, obstacle_ground_logits = out
+            bias = float(obstacle_logit_bias)
+            if abs(bias) > 1e-12:
+                class_logits = factorized_binary_logits_to_class_logits(
+                    hit_logits,
+                    obstacle_ground_logits + bias,
+                )
+            return class_logits
+    return model(x, lengths)
+
+
 class GRULidarInferencer:
     def __init__(
         self,
@@ -848,6 +870,7 @@ def evaluate_detailed(
     device: torch.device,
     device_kind: str,
     num_classes: int,
+    obstacle_logit_bias: float = 0.0,
 ) -> dict:
     model.eval()
     confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
@@ -856,7 +879,7 @@ def evaluate_detailed(
         for x, lengths, y in loader:
             x = x.to(device)
             y = y.to(device)
-            logits = model(x, lengths)
+            logits = predict_eval_logits(model, x, lengths, obstacle_logit_bias=obstacle_logit_bias)
             preds = torch.argmax(logits, dim=-1)
 
             y_flat = y.reshape(-1).cpu().numpy()
@@ -873,9 +896,79 @@ def evaluate_detailed(
         denom = int(confusion[c, :].sum())
         per_class_recall.append(float(confusion[c, c]) / max(denom, 1))
 
+    total = int(confusion.sum())
+    overall_accuracy = float(np.trace(confusion)) / max(total, 1)
+
     return {
         "confusion_matrix": confusion.tolist(),
         "per_class_recall": per_class_recall,
+        "overall_accuracy": overall_accuracy,
+    }
+
+
+def build_obstacle_logit_bias_sweep(
+    min_bias: float,
+    max_bias: float,
+    step: float,
+) -> list[float]:
+    min_v = float(min_bias)
+    max_v = float(max_bias)
+    if max_v < min_v:
+        min_v, max_v = max_v, min_v
+    step_v = abs(float(step))
+    if step_v <= 0.0:
+        return [0.0]
+
+    values: list[float] = []
+    current = min_v
+    while current <= max_v + (step_v * 0.5):
+        values.append(round(current, 6))
+        current += step_v
+    if not values:
+        values = [0.0]
+    return values
+
+
+def run_obstacle_logit_bias_sweep(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    device_kind: str,
+    num_classes: int,
+    biases: list[float],
+) -> dict:
+    entries: list[dict] = []
+    best_accuracy: dict | None = None
+    best_obstacle_recall: dict | None = None
+
+    for bias in biases:
+        report = evaluate_detailed(
+            model,
+            loader,
+            device,
+            device_kind,
+            num_classes,
+            obstacle_logit_bias=float(bias),
+        )
+        entry = {
+            "obstacle_logit_bias": float(bias),
+            "overall_accuracy": float(report["overall_accuracy"]),
+            "per_class_recall": report["per_class_recall"],
+            "confusion_matrix": report["confusion_matrix"],
+        }
+        entries.append(entry)
+        if best_accuracy is None or entry["overall_accuracy"] > best_accuracy["overall_accuracy"]:
+            best_accuracy = entry
+        if (
+            best_obstacle_recall is None
+            or float(entry["per_class_recall"][1]) > float(best_obstacle_recall["per_class_recall"][1])
+        ):
+            best_obstacle_recall = entry
+
+    return {
+        "entries": entries,
+        "best_by_accuracy": best_accuracy,
+        "best_by_obstacle_recall": best_obstacle_recall,
     }
 
 
@@ -1181,6 +1274,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train GRU for current-step lidar class prediction.")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--output", type=Path, default=Path("runs/gru_lidar_classifier.pt"))
+    parser.add_argument("--eval-checkpoint", type=Path, default=None)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=48)
@@ -1212,10 +1306,18 @@ def main() -> None:
     parser.add_argument("--min-lr", type=float, default=1e-5)
     parser.add_argument("--early-stop-patience", type=int, default=4)
     parser.add_argument("--early-stop-min-epochs", type=int, default=4)
+    parser.add_argument("--sweep-obstacle-logit-bias-min", type=float, default=-1.0)
+    parser.add_argument("--sweep-obstacle-logit-bias-max", type=float, default=1.0)
+    parser.add_argument("--sweep-obstacle-logit-bias-step", type=float, default=0.1)
     args = parser.parse_args()
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    log_path = args.output.with_suffix(".log.txt")
+    report_base = args.eval_checkpoint if args.eval_checkpoint is not None else args.output
+    report_base.parent.mkdir(parents=True, exist_ok=True)
+    log_path = (
+        report_base.with_suffix(".sweep.log.txt")
+        if args.eval_checkpoint is not None
+        else args.output.with_suffix(".log.txt")
+    )
     log_fh = log_path.open("w", encoding="utf-8")
     set_log_file(log_fh)
 
@@ -1277,29 +1379,49 @@ def main() -> None:
     )
 
     log(f"Using device: {device} ({device_kind})")
-    model = GRULidarClassifier(
-        input_dim=meta["input_dim"],
-        hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers,
-        num_sensors=meta["num_sensors"],
-        num_classes=meta["num_classes"],
-        dropout=args.dropout,
-    ).to(device)
-    model_config = {
-        "model_type": "regional_gru",
-        "input_dim": meta["input_dim"],
-        "hidden_dim": args.hidden_dim,
-        "num_layers": args.num_layers,
-        "num_sensors": meta["num_sensors"],
-        "num_classes": meta["num_classes"],
-        "dropout": args.dropout,
-        "region_sensor_groups": model.region_sensor_groups,
-        "region_hidden_dims": model.region_hidden_dims,
-        "fusion_hidden_dim": int(model.fusion_hidden_dim),
-        "region_context_dim": int(model.region_context_dim),
-        "sensor_embed_dim": int(model.sensor_embed_dim),
-        "decoder_hidden_dim": int(model.decoder_hidden_dim),
-    }
+    if args.eval_checkpoint is not None:
+        log(f"Eval-only mode: loading checkpoint {args.eval_checkpoint}")
+        ckpt = load_checkpoint_for_device(args.eval_checkpoint, device, device_kind)
+        model_config = ckpt["model_config"]
+        model = GRULidarClassifier(
+            input_dim=int(model_config["input_dim"]),
+            hidden_dim=int(model_config["hidden_dim"]),
+            num_layers=int(model_config["num_layers"]),
+            num_sensors=int(model_config["num_sensors"]),
+            num_classes=int(model_config["num_classes"]),
+            dropout=float(model_config["dropout"]),
+            region_sensor_groups=model_config.get("region_sensor_groups"),
+            region_hidden_dims=model_config.get("region_hidden_dims"),
+            fusion_hidden_dim=model_config.get("fusion_hidden_dim"),
+            region_context_dim=model_config.get("region_context_dim"),
+            sensor_embed_dim=model_config.get("sensor_embed_dim"),
+            decoder_hidden_dim=model_config.get("decoder_hidden_dim"),
+        ).to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+    else:
+        model = GRULidarClassifier(
+            input_dim=meta["input_dim"],
+            hidden_dim=args.hidden_dim,
+            num_layers=args.num_layers,
+            num_sensors=meta["num_sensors"],
+            num_classes=meta["num_classes"],
+            dropout=args.dropout,
+        ).to(device)
+        model_config = {
+            "model_type": "regional_gru",
+            "input_dim": meta["input_dim"],
+            "hidden_dim": args.hidden_dim,
+            "num_layers": args.num_layers,
+            "num_sensors": meta["num_sensors"],
+            "num_classes": meta["num_classes"],
+            "dropout": args.dropout,
+            "region_sensor_groups": model.region_sensor_groups,
+            "region_hidden_dims": model.region_hidden_dims,
+            "fusion_hidden_dim": int(model.fusion_hidden_dim),
+            "region_context_dim": int(model.region_context_dim),
+            "sensor_embed_dim": int(model.sensor_embed_dim),
+            "decoder_hidden_dim": int(model.decoder_hidden_dim),
+        }
     param_count = sum(p.numel() for p in model.parameters())
     log(f"Model initialized: type={model_config['model_type']} params={param_count}")
     log(
@@ -1312,8 +1434,59 @@ def main() -> None:
         f"decoder_hidden={model_config['decoder_hidden_dim']}"
     )
 
+    if args.eval_checkpoint is not None:
+        log("Running eval-only detailed validation evaluation")
+        final_report = evaluate_detailed(model, val_loader, device, device_kind, meta["num_classes"])
+        final_report.update(
+            {
+                "num_train_samples": meta["num_train_samples"],
+                "num_val_samples": meta["num_val_samples"],
+                "source_checkpoint": str(args.eval_checkpoint),
+            }
+        )
+        val_report_path = args.eval_checkpoint.with_suffix(".eval_val_report.json")
+        with val_report_path.open("w", encoding="utf-8") as fh:
+            json.dump(final_report, fh, indent=2)
+
+        sweep_biases = build_obstacle_logit_bias_sweep(
+            args.sweep_obstacle_logit_bias_min,
+            args.sweep_obstacle_logit_bias_max,
+            args.sweep_obstacle_logit_bias_step,
+        )
+        log(
+            "Running obstacle-logit bias sweep: "
+            f"{sweep_biases[0]:.3f}..{sweep_biases[-1]:.3f} "
+            f"step={args.sweep_obstacle_logit_bias_step:.3f} "
+            f"count={len(sweep_biases)}"
+        )
+        sweep_report = run_obstacle_logit_bias_sweep(
+            model,
+            val_loader,
+            device,
+            device_kind,
+            meta["num_classes"],
+            sweep_biases,
+        )
+        sweep_report.update(
+            {
+                "source_checkpoint": str(args.eval_checkpoint),
+                "num_train_samples": meta["num_train_samples"],
+                "num_val_samples": meta["num_val_samples"],
+            }
+        )
+        sweep_report_path = args.eval_checkpoint.with_suffix(".threshold_sweep.json")
+        with sweep_report_path.open("w", encoding="utf-8") as fh:
+            json.dump(sweep_report, fh, indent=2)
+        log("Eval-only sweep complete")
+        log_plain(f"saved val report: {val_report_path}")
+        log_plain(f"saved threshold sweep: {sweep_report_path}")
+        log_plain(f"saved log: {log_path}")
+        log_fh.close()
+        set_log_file(None)
+        return
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    grad_scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    grad_scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     log(f"Optimizer initialized: AdamW lr={args.lr} weight_decay={args.weight_decay}")
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -1526,12 +1699,43 @@ def main() -> None:
     val_report_path = args.output.with_suffix(".val_report.json")
     with val_report_path.open("w", encoding="utf-8") as fh:
         json.dump(final_report, fh, indent=2)
+    sweep_biases = build_obstacle_logit_bias_sweep(
+        args.sweep_obstacle_logit_bias_min,
+        args.sweep_obstacle_logit_bias_max,
+        args.sweep_obstacle_logit_bias_step,
+    )
+    log(
+        "Running post-train obstacle-logit bias sweep: "
+        f"{sweep_biases[0]:.3f}..{sweep_biases[-1]:.3f} "
+        f"step={args.sweep_obstacle_logit_bias_step:.3f} "
+        f"count={len(sweep_biases)}"
+    )
+    sweep_report = run_obstacle_logit_bias_sweep(
+        model,
+        val_loader,
+        device,
+        device_kind,
+        meta["num_classes"],
+        sweep_biases,
+    )
+    sweep_report.update(
+        {
+            "best_epoch": best["epoch"],
+            "best_val_loss": best["val_loss"],
+            "num_train_samples": meta["num_train_samples"],
+            "num_val_samples": meta["num_val_samples"],
+        }
+    )
+    sweep_report_path = args.output.with_suffix(".threshold_sweep.json")
+    with sweep_report_path.open("w", encoding="utf-8") as fh:
+        json.dump(sweep_report, fh, indent=2)
     log("Training run complete")
     log_plain(f"saved model: {args.output}")
     log_plain(f"saved history: {history_path}")
     log_plain(f"saved metrics csv: {metrics_csv_path}")
     log_plain(f"saved split manifest: {split_manifest_path}")
     log_plain(f"saved val report: {val_report_path}")
+    log_plain(f"saved threshold sweep: {sweep_report_path}")
     log_plain(f"saved log: {log_path}")
     log_fh.close()
     set_log_file(None)

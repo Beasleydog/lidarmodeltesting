@@ -10,6 +10,7 @@ import numpy as np
 from environment_demo import (
     DEFORMATION_EPS_CM,
     GRID_SIZE,
+    ROVER_MOVE_STEP_CM,
     ROVER_TURN_STEP_DEG,
     WORLD_SIZE_CM,
     WORLDGEN_NOISE_BASE_CELLS_RANGE,
@@ -44,14 +45,14 @@ SHOW_VIEWER = False
 DATA_DIR = Path("data")
 WORLDS_TO_GENERATE = 3000
 TIMESTEPS_PER_WORLD = 300
-LOG_EVERY_N_STEPS = 2
+LOG_EVERY_N_STEPS = 1
 BASE_RANDOM_SEED: int | None = None
 VIEWER_PLAYBACK_SLEEP_S = 0.04
 HOLD_VIEWER_AFTER_PLAYBACK = False
 NUM_WORKERS = 0  # Use >1 to generate worlds in parallel. If <=0, auto-selects CPU-based worker count.
 
 # Motion model control
-MAX_MOVE_CM_PER_STEP = 120.0
+MAX_MOVE_CM_PER_STEP = float(ROVER_MOVE_STEP_CM)
 MAX_TURN_DEG_PER_STEP = float(ROVER_TURN_STEP_DEG)
 CONTROL_SEGMENT_STEPS_MIN = 8
 CONTROL_SEGMENT_STEPS_MAX = 32
@@ -96,14 +97,17 @@ RANDOM_MODE_OBSTACLE_TARGET_PROB = 0.70
 RANDOM_MODE_NEAREST_ATTRACTOR_SCALE = 0.55
 
 # Spawn behavior
-SPAWN_NEAR_OBSTACLE_MIN_CM = 160.0
-SPAWN_NEAR_OBSTACLE_MAX_CM = 1300.0
+SPAWN_NEAR_OBSTACLE_MIN_CM = 140.0
+SPAWN_NEAR_OBSTACLE_MAX_CM = 900.0
+SPAWN_NEAR_OBSTACLE_DIST_BIAS = 0.72
 SPAWN_NEAR_OBSTACLE_RETRIES = 24
 SPAWN_YAW_NOISE_STD_DEG = 30.0
 
 # Safety behavior: if rover center ends up on obstacle-deformed terrain, relocate to free ground.
 TELEPORT_ON_OBSTACLE_CONTACT = True
 TELEPORT_SAFE_CLEARANCE_CM = 260.0
+TELEPORT_PREFERRED_CLEARANCE_CM = 420.0
+TELEPORT_INNER_WORLD_FRACTION = 0.50
 TELEPORT_MAX_ATTEMPTS = 90
 # Buffer so teleport triggers only after meaningful penetration into obstacle deformation.
 TELEPORT_MIN_DEFORMATION_CM = 24.0
@@ -187,7 +191,7 @@ def _sample_world_generation_kwargs(rng: np.random.Generator) -> tuple[str, dict
         rng,
         int(WORLDGEN_NOISE_BASE_CELLS_RANGE[0]),
         int(WORLDGEN_NOISE_BASE_CELLS_RANGE[1]),
-        0.58 - 0.30 * bias,
+        0.50 - 0.25 * bias,
     )
     noise_persistence = _sample_uniform_biased(
         rng,
@@ -361,6 +365,48 @@ def _nearest_obstacle_distance_cm(x: float, y: float, obstacle_points_xy: np.nda
     return float(np.sqrt(np.min(dx * dx + dy * dy)))
 
 
+def _pick_nearest_obstacle_to_xy(x: float, y: float, obstacle_points_xy: np.ndarray) -> tuple[float, float]:
+    if obstacle_points_xy.size == 0:
+        return x, y
+    dx = obstacle_points_xy[:, 0] - x
+    dy = obstacle_points_xy[:, 1] - y
+    idx = int(np.argmin(dx * dx + dy * dy))
+    return float(obstacle_points_xy[idx, 0]), float(obstacle_points_xy[idx, 1])
+
+
+def _is_within_inner_teleport_region(env, x: float, y: float) -> bool:
+    x_min = float(env.x.min())
+    x_max = float(env.x.max())
+    y_min = float(env.y.min())
+    y_max = float(env.y.max())
+    x_center = 0.5 * (x_min + x_max)
+    y_center = 0.5 * (y_min + y_max)
+    x_half = 0.5 * (x_max - x_min) * TELEPORT_INNER_WORLD_FRACTION
+    y_half = 0.5 * (y_max - y_min) * TELEPORT_INNER_WORLD_FRACTION
+    return (
+        (x >= (x_center - x_half))
+        and (x <= (x_center + x_half))
+        and (y >= (y_center - y_half))
+        and (y <= (y_center + y_half))
+    )
+
+
+def _yaw_toward_target_with_noise(
+    x: float,
+    y: float,
+    target_x: float,
+    target_y: float,
+    rng: np.random.Generator,
+    noise_std_deg: float = SPAWN_YAW_NOISE_STD_DEG,
+) -> float:
+    dx = float(target_x - x)
+    dy = float(target_y - y)
+    if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+        return float(rng.uniform(-180.0, 180.0))
+    yaw_deg = float(np.rad2deg(np.arctan2(dy, dx)))
+    return yaw_deg + float(rng.normal(0.0, noise_std_deg))
+
+
 def _teleport_state_to_safe_ground(
     state: RoverState,
     env,
@@ -377,6 +423,14 @@ def _teleport_state_to_safe_ground(
         state.yaw_deg = float(rng.uniform(-180.0, 180.0))
         clamp_rover_state_xy(state, env)
         return
+    inner_free_indices = np.asarray(
+        [
+            (iy, ix)
+            for iy, ix in free_indices
+            if _is_within_inner_teleport_region(env, float(env.x[iy, ix]), float(env.y[iy, ix]))
+        ],
+        dtype=np.int64,
+    )
 
     x_axis = env.x[0]
     y_axis = env.y[:, 0]
@@ -385,15 +439,34 @@ def _teleport_state_to_safe_ground(
     jitter_x = 0.35 * dx_cell
     jitter_y = 0.35 * dy_cell
 
-    best_candidate: tuple[float, float, float] | None = None
-    best_clearance = -1.0
+    best_safe_candidate: tuple[float, float, float] | None = None
+    best_safe_clearance = float("inf")
+    fallback_candidate: tuple[float, float, float] | None = None
+    fallback_clearance = -1.0
     for _ in range(TELEPORT_MAX_ATTEMPTS):
-        pick = int(rng.integers(0, free_indices.shape[0]))
-        iy, ix = free_indices[pick]
-        cx = float(env.x[iy, ix] + rng.uniform(-jitter_x, jitter_x))
-        cy = float(env.y[iy, ix] + rng.uniform(-jitter_y, jitter_y))
+        if obstacle_points_xy.size > 0:
+            pick = int(rng.integers(0, obstacle_points_xy.shape[0]))
+            ox = float(obstacle_points_xy[pick, 0])
+            oy = float(obstacle_points_xy[pick, 1])
+            angle = float(rng.uniform(0.0, 2.0 * np.pi))
+            dist = _sample_uniform_biased(
+                rng,
+                TELEPORT_SAFE_CLEARANCE_CM,
+                TELEPORT_PREFERRED_CLEARANCE_CM,
+                0.75,
+            )
+            cx = ox + dist * float(np.cos(angle)) + float(rng.uniform(-jitter_x, jitter_x))
+            cy = oy + dist * float(np.sin(angle)) + float(rng.uniform(-jitter_y, jitter_y))
+        else:
+            source_indices = inner_free_indices if inner_free_indices.size > 0 else free_indices
+            pick = int(rng.integers(0, source_indices.shape[0]))
+            iy, ix = source_indices[pick]
+            cx = float(env.x[iy, ix] + rng.uniform(-jitter_x, jitter_x))
+            cy = float(env.y[iy, ix] + rng.uniform(-jitter_y, jitter_y))
         probe = RoverState(x=cx, y=cy, yaw_deg=float(rng.uniform(-180.0, 180.0)))
         clamp_rover_state_xy(probe, env)
+        if not _is_within_inner_teleport_region(env, probe.x, probe.y):
+            continue
         if _is_state_on_obstacle(
             probe,
             deformation_grid,
@@ -403,18 +476,28 @@ def _teleport_state_to_safe_ground(
         ):
             continue
         clearance = _nearest_obstacle_distance_cm(probe.x, probe.y, obstacle_points_xy)
-        if clearance > best_clearance:
-            best_clearance = clearance
-            best_candidate = (probe.x, probe.y, probe.yaw_deg)
-        if clearance >= TELEPORT_SAFE_CLEARANCE_CM:
-            state.x, state.y, state.yaw_deg = probe.x, probe.y, probe.yaw_deg
+        if clearance > fallback_clearance:
+            fallback_clearance = clearance
+            fallback_candidate = (probe.x, probe.y, probe.yaw_deg)
+        if clearance < TELEPORT_SAFE_CLEARANCE_CM:
+            continue
+        near_ox, near_oy = _pick_nearest_obstacle_to_xy(probe.x, probe.y, obstacle_points_xy)
+        probe_yaw_deg = _yaw_toward_target_with_noise(probe.x, probe.y, near_ox, near_oy, rng)
+        if clearance < best_safe_clearance:
+            best_safe_clearance = clearance
+            best_safe_candidate = (probe.x, probe.y, probe_yaw_deg)
+        if clearance <= TELEPORT_PREFERRED_CLEARANCE_CM:
+            state.x, state.y, state.yaw_deg = probe.x, probe.y, probe_yaw_deg
             return
 
-    if best_candidate is not None:
-        state.x, state.y, state.yaw_deg = best_candidate
+    if best_safe_candidate is not None:
+        state.x, state.y, state.yaw_deg = best_safe_candidate
+    elif fallback_candidate is not None:
+        state.x, state.y, state.yaw_deg = fallback_candidate
     else:
-        pick = int(rng.integers(0, free_indices.shape[0]))
-        iy, ix = free_indices[pick]
+        source_indices = inner_free_indices if inner_free_indices.size > 0 else free_indices
+        pick = int(rng.integers(0, source_indices.shape[0]))
+        iy, ix = source_indices[pick]
         state.x = float(env.x[iy, ix])
         state.y = float(env.y[iy, ix])
         state.yaw_deg = float(rng.uniform(-180.0, 180.0))
@@ -498,11 +581,15 @@ def _spawn_state_near_obstacle(env, occupied_indices: np.ndarray, rng: np.random
     for _ in range(SPAWN_NEAR_OBSTACLE_RETRIES):
         ox, oy = _pick_random_obstacle_target(env, occupied_indices, rng)
         angle = float(rng.uniform(0.0, 2.0 * np.pi))
-        dist = float(rng.uniform(SPAWN_NEAR_OBSTACLE_MIN_CM, SPAWN_NEAR_OBSTACLE_MAX_CM))
+        dist = _sample_uniform_biased(
+            rng,
+            SPAWN_NEAR_OBSTACLE_MIN_CM,
+            SPAWN_NEAR_OBSTACLE_MAX_CM,
+            SPAWN_NEAR_OBSTACLE_DIST_BIAS,
+        )
         x = ox + dist * float(np.cos(angle))
         y = oy + dist * float(np.sin(angle))
-        yaw_to_obstacle = float(np.rad2deg(np.arctan2(oy - y, ox - x)))
-        yaw_deg = yaw_to_obstacle + float(rng.normal(0.0, SPAWN_YAW_NOISE_STD_DEG))
+        yaw_deg = _yaw_toward_target_with_noise(x, y, ox, oy, rng)
         state = RoverState(x=x, y=y, yaw_deg=yaw_deg)
         clamp_rover_state_xy(state, env)
         return state
@@ -874,6 +961,17 @@ def _stop_process_pool(executor: ProcessPoolExecutor) -> None:
             proc.join(timeout=0.5)
         except Exception:
             continue
+    for proc in list(proc_map.values()):
+        try:
+            if proc.is_alive():
+                proc.kill()
+        except Exception:
+            continue
+    for proc in list(proc_map.values()):
+        try:
+            proc.join(timeout=0.25)
+        except Exception:
+            continue
 
 
 def main() -> None:
@@ -902,22 +1000,27 @@ def main() -> None:
         return
 
     print(f"Generating {WORLDS_TO_GENERATE} worlds with {num_workers} workers (headless).")
-    executor: ProcessPoolExecutor | None = None
+    executor = ProcessPoolExecutor(max_workers=num_workers)
+    future_by_world: dict = {}
     try:
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            future_by_world = {
-                executor.submit(_generate_world_dataset_worker, i, world_seed): i
-                for i, world_seed in enumerate(world_seeds)
-            }
-            for future in as_completed(future_by_world):
-                world_idx = future_by_world[future]
-                out_path = future.result()
-                print(f"Wrote world {world_idx:03d}: {out_path}")
+        future_by_world = {
+            executor.submit(_generate_world_dataset_worker, i, world_seed): i
+            for i, world_seed in enumerate(world_seeds)
+        }
+        for future in as_completed(future_by_world):
+            world_idx = future_by_world[future]
+            out_path = future.result()
+            print(f"Wrote world {world_idx:03d}: {out_path}")
     except KeyboardInterrupt:
         print("\nCtrl+C received. Cancelling pending worlds and terminating workers...")
-        if executor is not None:
-            _stop_process_pool(executor)
+        for future in future_by_world:
+            future.cancel()
+        _stop_process_pool(executor)
         raise SystemExit(130)
+    except Exception:
+        _stop_process_pool(executor)
+        raise
+    executor.shutdown(wait=True, cancel_futures=False)
 
 
 if __name__ == "__main__":
