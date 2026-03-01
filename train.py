@@ -78,7 +78,9 @@ def configure_runtime_for_device(device_kind: str) -> None:
     cudnn_backend = getattr(torch.backends, "cudnn", None)
     if cudnn_backend is not None:
         cudnn_backend.allow_tf32 = True
-        cudnn_backend.benchmark = True
+        # Prefer deterministic kernel selection over aggressive autotuning here:
+        # some CUDA stacks pick unstable/unsupported kernels for this small conv net.
+        cudnn_backend.benchmark = False
 
 
 def select_runtime_device(preferred: str | None = None) -> tuple[torch.device, str]:
@@ -1468,7 +1470,7 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=-1)
     parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--disable-pin-memory", action="store_true")
-    parser.add_argument("--amp", type=str, choices=("auto", "on", "off"), default="auto")
+    parser.add_argument("--amp", type=str, choices=("auto", "on", "off"), default="off")
     parser.add_argument("--val-fraction", type=float, default=0.25)
     parser.add_argument("--max-history", type=int, default=64)
     parser.add_argument("--histories-per-target", type=int, default=3)
