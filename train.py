@@ -390,13 +390,60 @@ def _default_region_hidden_dims(
     return region_hidden_dims
 
 
-def _pick_attention_heads(hidden_dim: int, max_heads: int = 4) -> int:
-    hidden_dim_i = max(1, int(hidden_dim))
-    head_cap = max(1, min(int(max_heads), hidden_dim_i))
-    for candidate in range(head_cap, 0, -1):
-        if hidden_dim_i % candidate == 0:
-            return candidate
-    return 1
+def _build_sensor_processing_order(region_sensor_groups: dict[str, list[int]], num_sensors: int) -> list[int]:
+    preferred = ("front", "left", "rear", "right")
+    used: set[int] = set()
+    ordered: list[int] = []
+    for name in preferred:
+        for sensor_id in region_sensor_groups.get(name, []):
+            sid = int(sensor_id)
+            if 0 <= sid < int(num_sensors) and sid not in used:
+                ordered.append(sid)
+                used.add(sid)
+    for name, sensor_ids in region_sensor_groups.items():
+        if name in preferred:
+            continue
+        for sensor_id in sensor_ids:
+            sid = int(sensor_id)
+            if 0 <= sid < int(num_sensors) and sid not in used:
+                ordered.append(sid)
+                used.add(sid)
+    for sid in range(int(num_sensors)):
+        if sid not in used:
+            ordered.append(sid)
+    return ordered
+
+
+class CausalTimeSensorBlock(nn.Module):
+    def __init__(self, channels: int, dilation: int, dropout: float):
+        super().__init__()
+        self.temporal_conv = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=(3, 1),
+            dilation=(int(dilation), 1),
+            padding=(int(dilation) * 2, 0),
+        )
+        self.temporal_norm = nn.GroupNorm(1, channels)
+        self.sensor_conv = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=(1, 3),
+            padding=(0, 1),
+        )
+        self.sensor_norm = nn.GroupNorm(1, channels)
+        self.dropout = nn.Dropout2d(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        t = self.temporal_conv(x)
+        t = t[:, :, : x.shape[2], :]
+        t = self.temporal_norm(t)
+        t = F.gelu(t)
+        s = self.sensor_conv(t)
+        s = self.sensor_norm(s)
+        s = self.dropout(F.gelu(s))
+        return residual + s
 
 
 class GRULidarClassifier(nn.Module):
@@ -418,7 +465,7 @@ class GRULidarClassifier(nn.Module):
         region_context_dim: int | None = None,
     ):
         super().__init__()
-        self.model_type = "sensor_gru_attention"
+        self.model_type = "causal_tscnn"
         self.input_dim = int(input_dim)
         self.hidden_dim = int(hidden_dim)
         self.num_layers = int(num_layers)
@@ -427,11 +474,15 @@ class GRULidarClassifier(nn.Module):
 
         if self.input_dim != 4 + 2 * self.num_sensors:
             raise ValueError(
-                f"regional GRU expects input_dim=4+2*num_sensors; got input_dim={self.input_dim} "
+                f"causal_tscnn expects input_dim=4+2*num_sensors; got input_dim={self.input_dim} "
                 f"for num_sensors={self.num_sensors}"
             )
 
         self.region_sensor_groups = _normalize_region_sensor_groups(region_sensor_groups, self.num_sensors)
+        self.sensor_order_list = _build_sensor_processing_order(self.region_sensor_groups, self.num_sensors)
+        self.sensor_restore_list = [0] * self.num_sensors
+        for ordered_idx, sensor_id in enumerate(self.sensor_order_list):
+            self.sensor_restore_list[int(sensor_id)] = int(ordered_idx)
         self.fusion_hidden_dim = (
             max(48, int(round(self.hidden_dim * 0.75)))
             if fusion_hidden_dim is None
@@ -442,66 +493,44 @@ class GRULidarClassifier(nn.Module):
             if sensor_embed_dim is None
             else max(2, int(sensor_embed_dim))
         )
-        # Keep the legacy name as a backward-compatible config input, but use it as
-        # the feed-forward width inside the same-side attention blocks.
-        attn_ff_ref = attention_ff_dim if attention_ff_dim is not None else region_context_dim
+        ff_ref = attention_ff_dim if attention_ff_dim is not None else region_context_dim
         self.attention_ff_dim = (
             max(32, int(round(max(self.hidden_dim, self.fusion_hidden_dim) * 0.75)))
-            if attn_ff_ref is None
-            else max(8, int(attn_ff_ref))
+            if ff_ref is None
+            else max(8, int(ff_ref))
         )
         self.decoder_hidden_dim = (
             max(32, self.fusion_hidden_dim)
             if decoder_hidden_dim is None
             else max(8, int(decoder_hidden_dim))
         )
-        self.region_names = list(self.region_sensor_groups.keys())
-        requested_heads = attention_heads if attention_heads is not None else 4
-        self.region_attention_heads: dict[str, int] = {}
-        self.sensor_input_dim = 8 + self.sensor_embed_dim
 
-        self.sensor_gru = nn.GRU(
-            input_size=self.sensor_input_dim,
-            hidden_size=self.hidden_dim,
-            num_layers=self.num_layers,
-            batch_first=True,
-            dropout=dropout if self.num_layers > 1 else 0.0,
+        self.register_buffer("sensor_order", torch.tensor(self.sensor_order_list, dtype=torch.long), persistent=False)
+        self.register_buffer(
+            "sensor_restore",
+            torch.tensor(self.sensor_restore_list, dtype=torch.long),
+            persistent=False,
         )
 
-        self.fusion_dropout = nn.Dropout(dropout)
-        self.fusion = nn.Linear(self.hidden_dim, self.fusion_hidden_dim)
         self.sensor_embedding = nn.Embedding(self.num_sensors, self.sensor_embed_dim)
-        self.region_attn = nn.ModuleDict()
-        self.region_attn_norm1 = nn.ModuleDict()
-        self.region_attn_ff = nn.ModuleDict()
-        self.region_attn_norm2 = nn.ModuleDict()
-        for name in self.region_names:
-            sensor_count = len(self.region_sensor_groups[name])
-            if sensor_count <= 1:
-                self.region_attention_heads[name] = 1
-                continue
-            heads = _pick_attention_heads(self.hidden_dim, max_heads=min(int(requested_heads), sensor_count))
-            self.region_attention_heads[name] = heads
-            self.region_attn[name] = nn.MultiheadAttention(
-                embed_dim=self.hidden_dim,
-                num_heads=heads,
-                dropout=dropout,
-                batch_first=True,
-            )
-            self.region_attn_norm1[name] = nn.LayerNorm(self.hidden_dim)
-            self.region_attn_ff[name] = nn.Sequential(
-                nn.Linear(self.hidden_dim, self.attention_ff_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(self.attention_ff_dim, self.hidden_dim),
-            )
-            self.region_attn_norm2[name] = nn.LayerNorm(self.hidden_dim)
+        self.input_feature_dim = 17 + self.sensor_embed_dim
+        self.stem = nn.Conv2d(self.input_feature_dim, self.hidden_dim, kernel_size=1)
+        self.stem_norm = nn.GroupNorm(1, self.hidden_dim)
+        dilations = [2 ** (i % 4) for i in range(max(1, self.num_layers))]
+        self.blocks = nn.ModuleList([CausalTimeSensorBlock(self.hidden_dim, d, dropout) for d in dilations])
+        self.backbone_dropout = nn.Dropout2d(dropout)
+        self.global_proj = nn.Linear(self.hidden_dim, self.fusion_hidden_dim)
+        self.region_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.neighbor_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+
         decoder_in_dim = (
-            self.hidden_dim
-            + self.fusion_hidden_dim
+            self.hidden_dim  # last-time conv features
+            + self.hidden_dim  # neighbor latent
+            + self.hidden_dim  # region latent
+            + self.fusion_hidden_dim  # global latent
             + self.sensor_embed_dim
-            + 4  # current pose
-            + 6  # current ray + multi-step local deltas
+            + 8  # pose + pose delta
+            + 9  # local temporal/spatial range features
         )
         self.decoder = nn.Sequential(
             nn.Linear(decoder_in_dim, self.decoder_hidden_dim),
@@ -510,108 +539,199 @@ class GRULidarClassifier(nn.Module):
             nn.Linear(self.decoder_hidden_dim, self.decoder_hidden_dim),
             nn.GELU(),
         )
+        self.obstacle_context_dim = self.hidden_dim + 3
+        self.obstacle_ground_decoder = nn.Sequential(
+            nn.Linear(self.decoder_hidden_dim + self.obstacle_context_dim, self.decoder_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.decoder_hidden_dim, self.decoder_hidden_dim),
+            nn.GELU(),
+        )
         self.hit_head = nn.Linear(self.decoder_hidden_dim, 1)
         self.obstacle_ground_head = nn.Linear(self.decoder_hidden_dim, 1)
+        self.region_attention_heads = {
+            name: max(1, min(len(ids), 1)) for name, ids in self.region_sensor_groups.items()
+        }
 
-    def _encode(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size, time_steps = x.shape[:2]
+    def _reorder_sensor_tensor(self, values: torch.Tensor) -> torch.Tensor:
+        return values.index_select(dim=2, index=self.sensor_order.to(device=values.device))
+
+    def _restore_sensor_tensor(self, values: torch.Tensor) -> torch.Tensor:
+        return values.index_select(dim=1, index=self.sensor_restore.to(device=values.device))
+
+    def _shift_time(self, values: torch.Tensor, steps: int) -> torch.Tensor:
+        steps_i = max(1, int(steps))
+        prefix = values[:, :1, :].expand(-1, steps_i, -1)
+        return torch.cat([prefix, values[:, :-steps_i, :]], dim=1)
+
+    def _shift_sensor(self, values: torch.Tensor, offset: int) -> torch.Tensor:
+        if offset < 0:
+            steps = -int(offset)
+            prefix = values[:, :, :1].expand(-1, -1, steps)
+            return torch.cat([prefix, values[:, :, :-steps]], dim=2)
+        if offset > 0:
+            steps = int(offset)
+            suffix = values[:, :, -1:].expand(-1, -1, steps)
+            return torch.cat([values[:, :, steps:], suffix], dim=2)
+        return values
+
+    def _build_spatiotemporal_input(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         pose = x[:, :, :4]
         dist = x[:, :, 4 : 4 + self.num_sensors]
         hit = x[:, :, 4 + self.num_sensors : 4 + 2 * self.num_sensors]
-        prev_dist = torch.cat([dist[:, :1, :], dist[:, :-1, :]], dim=1)
-        prev_hit = torch.cat([hit[:, :1, :], hit[:, :-1, :]], dim=1)
-        delta_dist = dist - prev_dist
-        delta_hit = hit - prev_hit
 
+        prev1_dist = self._shift_time(dist, 1)
+        prev2_dist = self._shift_time(dist, 2)
+        prev4_dist = self._shift_time(dist, 4)
+        prev1_hit = self._shift_time(hit, 1)
+        prev1_pose = self._shift_time(pose, 1)
+
+        delta1_dist = dist - prev1_dist
+        delta2_dist = dist - prev2_dist
+        delta4_dist = dist - prev4_dist
+        delta1_hit = hit - prev1_hit
+        pose_delta = pose - prev1_pose
+
+        dist_ord = self._reorder_sensor_tensor(dist)
+        hit_ord = self._reorder_sensor_tensor(hit)
+        delta1_ord = self._reorder_sensor_tensor(delta1_dist)
+        delta2_ord = self._reorder_sensor_tensor(delta2_dist)
+        delta4_ord = self._reorder_sensor_tensor(delta4_dist)
+
+        left_dist = self._shift_sensor(dist_ord, -1)
+        right_dist = self._shift_sensor(dist_ord, 1)
+        neighbor_mean_dist = 0.5 * (left_dist + right_dist)
+        neighbor_delta = dist_ord - neighbor_mean_dist
+        left_delta = dist_ord - left_dist
+        right_delta = dist_ord - right_dist
+
+        batch_size, time_steps = x.shape[:2]
         pose_expand = pose.unsqueeze(2).expand(-1, -1, self.num_sensors, -1)
-        sensor_ids = torch.arange(self.num_sensors, device=x.device)
-        sensor_embed = self.sensor_embedding(sensor_ids).view(1, 1, self.num_sensors, self.sensor_embed_dim)
+        pose_delta_expand = pose_delta.unsqueeze(2).expand(-1, -1, self.num_sensors, -1)
+        sensor_embed = self.sensor_embedding(self.sensor_order.to(device=x.device))
+        sensor_embed = sensor_embed.view(1, 1, self.num_sensors, self.sensor_embed_dim)
         sensor_embed = sensor_embed.expand(batch_size, time_steps, -1, -1)
-        sensor_steps = torch.cat(
+
+        feats = torch.cat(
             [
+                dist_ord.unsqueeze(-1),
+                hit_ord.unsqueeze(-1),
+                delta1_ord.unsqueeze(-1),
+                delta1_hit.index_select(2, self.sensor_order.to(device=x.device)).unsqueeze(-1),
+                delta2_ord.unsqueeze(-1),
+                delta4_ord.unsqueeze(-1),
+                neighbor_delta.unsqueeze(-1),
+                left_delta.unsqueeze(-1),
+                right_delta.unsqueeze(-1),
                 pose_expand,
-                dist.unsqueeze(-1),
-                hit.unsqueeze(-1),
-                delta_dist.unsqueeze(-1),
-                delta_hit.unsqueeze(-1),
+                pose_delta_expand,
                 sensor_embed,
             ],
             dim=-1,
         )
-        sensor_steps = sensor_steps.permute(0, 2, 1, 3).contiguous()
-        sensor_steps = sensor_steps.view(batch_size * self.num_sensors, time_steps, self.sensor_input_dim)
-        sensor_lengths = lengths.to(device=x.device).repeat_interleave(self.num_sensors)
-        packed = pack_padded_sequence(sensor_steps, sensor_lengths.cpu(), batch_first=True, enforce_sorted=False)
-        _, h_n = self.sensor_gru(packed)
-        sensor_states = h_n[-1].view(batch_size, self.num_sensors, self.hidden_dim)
-
-        for name in self.region_names:
-            sensor_ids = self.region_sensor_groups[name]
-            if len(sensor_ids) <= 1:
-                continue
-            region_tokens = sensor_states[:, sensor_ids, :]
-            attn_out, _ = self.region_attn[name](region_tokens, region_tokens, region_tokens, need_weights=False)
-            region_tokens = self.region_attn_norm1[name](region_tokens + self.fusion_dropout(attn_out))
-            ff_out = self.region_attn_ff[name](region_tokens)
-            region_tokens = self.region_attn_norm2[name](region_tokens + self.fusion_dropout(ff_out))
-            region_tokens = region_tokens.to(dtype=sensor_states.dtype)
-            sensor_states[:, sensor_ids, :] = region_tokens
-
-        fused = self.fusion_dropout(sensor_states.mean(dim=1))
-        return sensor_states, F.gelu(self.fusion(fused))
-
-    def _build_sensor_decoder_inputs(
-        self,
-        x: torch.Tensor,
-        lengths: torch.Tensor,
-        sensor_states: torch.Tensor,
-        fused: torch.Tensor,
-    ) -> torch.Tensor:
-        batch_size = x.shape[0]
-        device = x.device
-        lengths_dev = lengths.to(device=device)
-        batch_idx = torch.arange(batch_size, device=device)
-        last_idx = torch.clamp(lengths_dev - 1, min=0)
-        prev_idx = torch.clamp(lengths_dev - 2, min=0)
-        prev2_idx = torch.clamp(lengths_dev - 3, min=0)
-        prev4_idx = torch.clamp(lengths_dev - 5, min=0)
-
-        current_step = x[batch_idx, last_idx]
-        prev_step = x[batch_idx, prev_idx]
-        prev2_step = x[batch_idx, prev2_idx]
-        prev4_step = x[batch_idx, prev4_idx]
-
-        current_pose = current_step[:, :4]
-        current_dist = current_step[:, 4 : 4 + self.num_sensors]
-        current_hit = current_step[:, 4 + self.num_sensors : 4 + 2 * self.num_sensors]
-        prev_dist = prev_step[:, 4 : 4 + self.num_sensors]
-        prev_hit = prev_step[:, 4 + self.num_sensors : 4 + 2 * self.num_sensors]
-        prev2_dist = prev2_step[:, 4 : 4 + self.num_sensors]
-        prev4_dist = prev4_step[:, 4 : 4 + self.num_sensors]
-
-        delta1_dist = current_dist - prev_dist
-        delta1_hit = current_hit - prev_hit
-        delta2_dist = current_dist - prev2_dist
-        delta4_dist = current_dist - prev4_dist
-
-        fused_expand = fused.unsqueeze(1).expand(-1, self.num_sensors, -1)
-        pose_expand = current_pose.unsqueeze(1).expand(-1, self.num_sensors, -1)
-        local_features = torch.stack(
-            [current_dist, current_hit, delta1_dist, delta1_hit, delta2_dist, delta4_dist],
+        current_local = torch.cat(
+            [
+                dist_ord[:, -1, :].unsqueeze(-1),
+                hit_ord[:, -1, :].unsqueeze(-1),
+                delta1_ord[:, -1, :].unsqueeze(-1),
+                delta1_hit.index_select(2, self.sensor_order.to(device=x.device))[:, -1, :].unsqueeze(-1),
+                delta2_ord[:, -1, :].unsqueeze(-1),
+                delta4_ord[:, -1, :].unsqueeze(-1),
+                neighbor_delta[:, -1, :].unsqueeze(-1),
+                left_delta[:, -1, :].unsqueeze(-1),
+                right_delta[:, -1, :].unsqueeze(-1),
+            ],
             dim=-1,
         )
-        sensor_ids = torch.arange(self.num_sensors, device=device)
-        sensor_embed = self.sensor_embedding(sensor_ids).unsqueeze(0).expand(batch_size, -1, -1)
+        current_pose = pose[:, -1, :]
+        current_pose_delta = pose_delta[:, -1, :]
+        return feats, current_local, current_pose, current_pose_delta
 
-        return torch.cat([sensor_states, fused_expand, sensor_embed, pose_expand, local_features], dim=-1)
+    def _encode(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        del lengths  # conv backbone uses zero-padded histories directly
+        feats, current_local, current_pose, current_pose_delta = self._build_spatiotemporal_input(x)
+        conv_in = feats.permute(0, 3, 1, 2).contiguous()
+        h = F.gelu(self.stem_norm(self.stem(conv_in)))
+        h = self.backbone_dropout(h)
+        for block in self.blocks:
+            h = block(h)
+        h_bt = h.permute(0, 2, 3, 1).contiguous()
+        last_features = h_bt[:, -1, :, :]
+        current_local = current_local.to(dtype=last_features.dtype)
+        current_pose = current_pose.to(dtype=last_features.dtype)
+        current_pose_delta = current_pose_delta.to(dtype=last_features.dtype)
+        return last_features, current_local, current_pose, current_pose_delta
+
+    def _build_decoder_inputs(
+        self,
+        last_features: torch.Tensor,
+        current_local: torch.Tensor,
+        current_pose: torch.Tensor,
+        current_pose_delta: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = last_features.shape[0]
+        neighbor_latent = 0.5 * (
+            self._shift_sensor(last_features.transpose(1, 2), -1).transpose(1, 2)
+            + self._shift_sensor(last_features.transpose(1, 2), 1).transpose(1, 2)
+        )
+        region_latent = last_features.new_zeros(last_features.shape)
+        for name, sensor_ids in self.region_sensor_groups.items():
+            ordered_positions = [
+                self.sensor_order_list.index(int(sensor_id))
+                for sensor_id in sensor_ids
+                if int(sensor_id) in self.sensor_order_list
+            ]
+            if not ordered_positions:
+                continue
+            region_tokens = last_features[:, ordered_positions, :]
+            region_mean = region_tokens.mean(dim=1, keepdim=True)
+            region_latent[:, ordered_positions, :] = region_mean.expand(-1, len(ordered_positions), -1)
+
+        global_latent = F.gelu(self.global_proj(last_features.mean(dim=1)))
+        global_expand = global_latent.unsqueeze(1).expand(-1, self.num_sensors, -1)
+        sensor_embed = self.sensor_embedding(self.sensor_order.to(device=last_features.device)).unsqueeze(0)
+        sensor_embed = sensor_embed.expand(batch_size, -1, -1).to(dtype=last_features.dtype)
+        pose_expand = current_pose.unsqueeze(1).expand(-1, self.num_sensors, -1)
+        pose_delta_expand = current_pose_delta.unsqueeze(1).expand(-1, self.num_sensors, -1)
+
+        decoder_in = torch.cat(
+            [
+                last_features,
+                self.neighbor_proj(neighbor_latent),
+                self.region_proj(region_latent),
+                global_expand,
+                sensor_embed,
+                pose_expand,
+                pose_delta_expand,
+                current_local,
+            ],
+            dim=-1,
+        )
+        obstacle_context = torch.cat(
+            [
+                self.neighbor_proj(neighbor_latent),
+                current_local[:, :, -3:],
+            ],
+            dim=-1,
+        )
+        return decoder_in, obstacle_context
 
     def forward_with_aux(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        sensor_states, fused = self._encode(x, lengths)
-        fused = self.fusion_dropout(fused)
-        decoder_in = self._build_sensor_decoder_inputs(x, lengths, sensor_states, fused)
+        last_features, current_local, current_pose, current_pose_delta = self._encode(x, lengths)
+        decoder_in, obstacle_context = self._build_decoder_inputs(
+            last_features,
+            current_local,
+            current_pose,
+            current_pose_delta,
+        )
         decoder_out = self.decoder(decoder_in)
-        hit_logits = self.hit_head(decoder_out).squeeze(-1)
-        obstacle_ground_logits = self.obstacle_ground_head(decoder_out).squeeze(-1)
+        hit_logits_ordered = self.hit_head(decoder_out).squeeze(-1)
+        obstacle_ground_hidden = self.obstacle_ground_decoder(torch.cat([decoder_out, obstacle_context], dim=-1))
+        obstacle_ground_logits_ordered = self.obstacle_ground_head(obstacle_ground_hidden).squeeze(-1)
+        hit_logits = self._restore_sensor_tensor(hit_logits_ordered)
+        obstacle_ground_logits = self._restore_sensor_tensor(obstacle_ground_logits_ordered)
         class_logits = factorized_binary_logits_to_class_logits(hit_logits, obstacle_ground_logits)
         return class_logits, hit_logits, obstacle_ground_logits
 
@@ -737,10 +857,10 @@ def load_gru_lidar_inferencer(
 
     ckpt = load_checkpoint_for_device(checkpoint_path, device_t, device_kind)
     cfg = ckpt["model_config"]
-    if cfg.get("model_type") != "sensor_gru_attention":
+    if cfg.get("model_type") != "causal_tscnn":
         raise ValueError(
             f"Checkpoint model_type={cfg.get('model_type')!r} is not supported by this build. "
-            "Retrain with the sensor_gru_attention architecture."
+            "Retrain with the causal_tscnn architecture."
         )
     model = GRULidarClassifier(
         input_dim=int(cfg["input_dim"]),
@@ -1445,10 +1565,10 @@ def main() -> None:
         log(f"Eval-only mode: loading checkpoint {args.eval_checkpoint}")
         ckpt = load_checkpoint_for_device(args.eval_checkpoint, device, device_kind)
         model_config = ckpt["model_config"]
-        if model_config.get("model_type") != "sensor_gru_attention":
+        if model_config.get("model_type") != "causal_tscnn":
             raise ValueError(
                 f"Checkpoint model_type={model_config.get('model_type')!r} is not supported by this build. "
-                "Retrain with the sensor_gru_attention architecture."
+                "Retrain with the causal_tscnn architecture."
             )
         model = GRULidarClassifier(
             input_dim=int(model_config["input_dim"]),
@@ -1475,7 +1595,7 @@ def main() -> None:
             dropout=args.dropout,
         ).to(device)
         model_config = {
-            "model_type": "sensor_gru_attention",
+            "model_type": model.model_type,
             "input_dim": meta["input_dim"],
             "hidden_dim": args.hidden_dim,
             "num_layers": args.num_layers,
@@ -1489,18 +1609,20 @@ def main() -> None:
             "region_attention_heads": model.region_attention_heads,
             "sensor_embed_dim": int(model.sensor_embed_dim),
             "decoder_hidden_dim": int(model.decoder_hidden_dim),
+            "obstacle_context_dim": int(model.obstacle_context_dim),
         }
     param_count = sum(p.numel() for p in model.parameters())
     log(f"Model initialized: type={model_config['model_type']} params={param_count}")
     log(
-        "Sensor-state layout: "
+        "Causal Time-Sensor layout: "
         f"groups={model_config['region_sensor_groups']} "
         f"region_attention_heads={model_config.get('region_attention_heads', {})} "
         f"sensor_hidden={model_config['hidden_dim']} "
         f"global_context={model_config['fusion_hidden_dim']} "
         f"attention_ff={model_config['attention_ff_dim']} "
         f"sensor_embed={model_config['sensor_embed_dim']} "
-        f"decoder_hidden={model_config['decoder_hidden_dim']}"
+        f"decoder_hidden={model_config['decoder_hidden_dim']} "
+        f"obstacle_context={model_config.get('obstacle_context_dim', 'n/a')}"
     )
 
     if args.eval_checkpoint is not None:
