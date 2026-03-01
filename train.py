@@ -554,6 +554,7 @@ class GRULidarClassifier(nn.Module):
             region_tokens = self.region_attn_norm1[name](region_tokens + self.fusion_dropout(attn_out))
             ff_out = self.region_attn_ff[name](region_tokens)
             region_tokens = self.region_attn_norm2[name](region_tokens + self.fusion_dropout(ff_out))
+            region_tokens = region_tokens.to(dtype=sensor_states.dtype)
             sensor_states[:, sensor_ids, :] = region_tokens
 
         fused = self.fusion_dropout(sensor_states.mean(dim=1))
