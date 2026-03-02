@@ -416,7 +416,7 @@ def _build_sensor_processing_order(region_sensor_groups: dict[str, list[int]], n
     return ordered
 
 
-class TemporalGraphBlock(nn.Module):
+class CausalTimeSensorBlock(nn.Module):
     def __init__(self, channels: int, dilation: int, dropout: float):
         super().__init__()
         self.temporal_conv = nn.Conv2d(
@@ -427,20 +427,19 @@ class TemporalGraphBlock(nn.Module):
             padding=(int(dilation) * 2, 0),
         )
         self.temporal_norm = nn.GroupNorm(1, channels)
-        self.graph_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.graph_norm = nn.GroupNorm(1, channels)
+        self.sensor_conv = nn.Conv2d(channels, channels, kernel_size=(1, 3), padding=(0, 1))
+        self.sensor_norm = nn.GroupNorm(1, channels)
         self.dropout = nn.Dropout2d(dropout)
 
-    def forward(self, x: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         t = self.temporal_conv(x)
         t = t[:, :, : x.shape[2], :]
         t = F.gelu(self.temporal_norm(t))
-        mixed = torch.einsum("bcts,sn->bctn", t, adjacency)
-        mixed = self.graph_proj(mixed)
-        mixed = self.graph_norm(mixed)
-        mixed = self.dropout(F.gelu(mixed))
-        return residual + mixed
+        s = self.sensor_conv(t)
+        s = self.sensor_norm(s)
+        s = self.dropout(F.gelu(s))
+        return residual + s
 
 
 class GRULidarClassifier(nn.Module):
@@ -462,7 +461,7 @@ class GRULidarClassifier(nn.Module):
         region_context_dim: int | None = None,
     ):
         super().__init__()
-        self.model_type = "adaptive_stgcn"
+        self.model_type = "obstacle_first_causal_tscnn"
         self.input_dim = int(input_dim)
         self.hidden_dim = int(hidden_dim)
         self.num_layers = int(num_layers)
@@ -471,7 +470,7 @@ class GRULidarClassifier(nn.Module):
 
         if self.input_dim != 4 + 2 * self.num_sensors:
             raise ValueError(
-                f"adaptive_stgcn expects input_dim=4+2*num_sensors; got input_dim={self.input_dim} "
+                f"obstacle_first_causal_tscnn expects input_dim=4+2*num_sensors; got input_dim={self.input_dim} "
                 f"for num_sensors={self.num_sensors}"
             )
 
@@ -508,38 +507,12 @@ class GRULidarClassifier(nn.Module):
             torch.tensor(self.sensor_restore_list, dtype=torch.long),
             persistent=False,
         )
-        self.graph_rank = max(4, min(16, max(1, self.hidden_dim // 4)))
-        fixed_adj = torch.eye(self.num_sensors, dtype=torch.float32)
-        for idx in range(self.num_sensors):
-            if idx > 0:
-                fixed_adj[idx, idx - 1] = 1.0
-            if idx + 1 < self.num_sensors:
-                fixed_adj[idx, idx + 1] = 1.0
-        sensor_to_ordered = {sensor_id: idx for idx, sensor_id in enumerate(self.sensor_order_list)}
-        for sensor_ids in self.region_sensor_groups.values():
-            ordered_positions = [
-                sensor_to_ordered[int(sensor_id)]
-                for sensor_id in sensor_ids
-                if int(sensor_id) in sensor_to_ordered
-            ]
-            for src in ordered_positions:
-                for dst in ordered_positions:
-                    if src != dst:
-                        fixed_adj[src, dst] = max(float(fixed_adj[src, dst]), 0.5)
-        fixed_adj = fixed_adj / fixed_adj.sum(dim=1, keepdim=True).clamp_min(1.0)
-        self.register_buffer("fixed_adj", fixed_adj, persistent=False)
-
         self.sensor_embedding = nn.Embedding(self.num_sensors, self.sensor_embed_dim)
-        self.graph_query = nn.Parameter(torch.empty(self.num_sensors, self.graph_rank))
-        self.graph_key = nn.Parameter(torch.empty(self.num_sensors, self.graph_rank))
-        nn.init.normal_(self.graph_query, mean=0.0, std=0.1)
-        nn.init.normal_(self.graph_key, mean=0.0, std=0.1)
-        self.graph_mix_logit = nn.Parameter(torch.tensor(-0.5, dtype=torch.float32))
         self.input_feature_dim = 17 + self.sensor_embed_dim
         self.stem = nn.Conv2d(self.input_feature_dim, self.hidden_dim, kernel_size=1)
         self.stem_norm = nn.GroupNorm(1, self.hidden_dim)
         dilations = [2 ** (i % 4) for i in range(max(1, self.num_layers))]
-        self.blocks = nn.ModuleList([TemporalGraphBlock(self.hidden_dim, d, dropout) for d in dilations])
+        self.blocks = nn.ModuleList([CausalTimeSensorBlock(self.hidden_dim, d, dropout) for d in dilations])
         self.backbone_dropout = nn.Dropout2d(dropout)
         self.global_proj = nn.Linear(self.hidden_dim, self.fusion_hidden_dim)
         self.region_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
@@ -562,15 +535,15 @@ class GRULidarClassifier(nn.Module):
             nn.GELU(),
         )
         self.obstacle_context_dim = self.hidden_dim + 3
-        self.obstacle_ground_decoder = nn.Sequential(
+        self.safe_type_decoder = nn.Sequential(
             nn.Linear(self.decoder_hidden_dim + self.obstacle_context_dim, self.decoder_hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(self.decoder_hidden_dim, self.decoder_hidden_dim),
             nn.GELU(),
         )
-        self.hit_head = nn.Linear(self.decoder_hidden_dim, 1)
-        self.obstacle_ground_head = nn.Linear(self.decoder_hidden_dim, 1)
+        self.obstacle_head = nn.Linear(self.decoder_hidden_dim, 1)
+        self.safe_type_head = nn.Linear(self.decoder_hidden_dim, 1)
         self.region_attention_heads = {
             name: max(1, min(len(ids), 1)) for name, ids in self.region_sensor_groups.items()
         }
@@ -580,14 +553,6 @@ class GRULidarClassifier(nn.Module):
 
     def _restore_sensor_tensor(self, values: torch.Tensor) -> torch.Tensor:
         return values.index_select(dim=1, index=self.sensor_restore.to(device=values.device))
-
-    def _graph_adjacency(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        scale = float(self.graph_rank) ** -0.5
-        adaptive_scores = torch.matmul(self.graph_query, self.graph_key.transpose(0, 1)) * scale
-        adaptive_adj = torch.softmax(adaptive_scores, dim=-1).to(device=device, dtype=dtype)
-        fixed_adj = self.fixed_adj.to(device=device, dtype=dtype)
-        mix = torch.sigmoid(self.graph_mix_logit).to(device=device, dtype=dtype)
-        return (1.0 - mix) * fixed_adj + mix * adaptive_adj
 
     def _shift_time(self, values: torch.Tensor, steps: int) -> torch.Tensor:
         steps_i = max(1, int(steps))
@@ -685,9 +650,8 @@ class GRULidarClassifier(nn.Module):
         conv_in = feats.permute(0, 3, 1, 2).contiguous()
         h = F.gelu(self.stem_norm(self.stem(conv_in)))
         h = self.backbone_dropout(h)
-        adjacency = self._graph_adjacency(device=h.device, dtype=h.dtype)
         for block in self.blocks:
-            h = block(h, adjacency)
+            h = block(h)
         h_bt = h.permute(0, 2, 3, 1).contiguous()
         last_features = h_bt[:, -1, :, :]
         current_local = current_local.to(dtype=last_features.dtype)
@@ -758,29 +722,29 @@ class GRULidarClassifier(nn.Module):
             current_pose_delta,
         )
         decoder_out = self.decoder(decoder_in)
-        hit_logits_ordered = self.hit_head(decoder_out).squeeze(-1)
-        obstacle_ground_hidden = self.obstacle_ground_decoder(torch.cat([decoder_out, obstacle_context], dim=-1))
-        obstacle_ground_logits_ordered = self.obstacle_ground_head(obstacle_ground_hidden).squeeze(-1)
-        hit_logits = self._restore_sensor_tensor(hit_logits_ordered)
-        obstacle_ground_logits = self._restore_sensor_tensor(obstacle_ground_logits_ordered)
-        class_logits = factorized_binary_logits_to_class_logits(hit_logits, obstacle_ground_logits)
-        return class_logits, hit_logits, obstacle_ground_logits
+        obstacle_logits_ordered = self.obstacle_head(decoder_out).squeeze(-1)
+        safe_type_hidden = self.safe_type_decoder(torch.cat([decoder_out, obstacle_context], dim=-1))
+        ground_none_logits_ordered = self.safe_type_head(safe_type_hidden).squeeze(-1)
+        obstacle_logits = self._restore_sensor_tensor(obstacle_logits_ordered)
+        ground_none_logits = self._restore_sensor_tensor(ground_none_logits_ordered)
+        class_logits = obstacle_first_binary_logits_to_class_logits(obstacle_logits, ground_none_logits)
+        return class_logits, obstacle_logits, ground_none_logits
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         class_logits, _, _ = self.forward_with_aux(x, lengths)
         return class_logits
 
 
-def factorized_binary_logits_to_class_logits(
-    hit_logits: torch.Tensor,
-    obstacle_ground_logits: torch.Tensor,
+def obstacle_first_binary_logits_to_class_logits(
+    obstacle_logits: torch.Tensor,
+    ground_none_logits: torch.Tensor,
 ) -> torch.Tensor:
-    log_p_hit = F.logsigmoid(hit_logits)
-    log_p_none = F.logsigmoid(-hit_logits)
-    log_p_obstacle_given_hit = F.logsigmoid(obstacle_ground_logits)
-    log_p_ground_given_hit = F.logsigmoid(-obstacle_ground_logits)
-    log_p_ground = log_p_hit + log_p_ground_given_hit
-    log_p_obstacle = log_p_hit + log_p_obstacle_given_hit
+    log_p_obstacle = F.logsigmoid(obstacle_logits)
+    log_p_non_obstacle = F.logsigmoid(-obstacle_logits)
+    log_p_ground_given_non_obstacle = F.logsigmoid(ground_none_logits)
+    log_p_none_given_non_obstacle = F.logsigmoid(-ground_none_logits)
+    log_p_ground = log_p_non_obstacle + log_p_ground_given_non_obstacle
+    log_p_none = log_p_non_obstacle + log_p_none_given_non_obstacle
     return torch.stack([log_p_ground, log_p_obstacle, log_p_none], dim=-1)
 
 
@@ -793,12 +757,12 @@ def predict_eval_logits(
     if hasattr(model, "forward_with_aux"):
         out = model.forward_with_aux(x, lengths)
         if isinstance(out, tuple) and len(out) == 3:
-            class_logits, hit_logits, obstacle_ground_logits = out
+            class_logits, obstacle_logits, ground_none_logits = out
             bias = float(obstacle_logit_bias)
             if abs(bias) > 1e-12:
-                class_logits = factorized_binary_logits_to_class_logits(
-                    hit_logits,
-                    obstacle_ground_logits + bias,
+                class_logits = obstacle_first_binary_logits_to_class_logits(
+                    obstacle_logits + bias,
+                    ground_none_logits,
                 )
             return class_logits
     return model(x, lengths)
@@ -888,10 +852,10 @@ def load_gru_lidar_inferencer(
 
     ckpt = load_checkpoint_for_device(checkpoint_path, device_t, device_kind)
     cfg = ckpt["model_config"]
-    if cfg.get("model_type") != "adaptive_stgcn":
+    if cfg.get("model_type") != "obstacle_first_causal_tscnn":
         raise ValueError(
             f"Checkpoint model_type={cfg.get('model_type')!r} is not supported by this build. "
-            "Retrain with the adaptive_stgcn architecture."
+            "Retrain with the obstacle_first_causal_tscnn architecture."
         )
     model = GRULidarClassifier(
         input_dim=int(cfg["input_dim"]),
@@ -1006,21 +970,26 @@ def run_epoch(
             else nullcontext()
         )
         with amp_context:
-            logits, hit_logits, obstacle_ground_logits = model.forward_with_aux(x, lengths)
-            hit_targets = (y != 2).float()
-            hit_loss = F.binary_cross_entropy_with_logits(hit_logits, hit_targets, reduction="mean")
-            hit_mask = y != 2
-            if hit_mask.any():
-                obstacle_ground_targets = (y[hit_mask] == 1).float()
-                obstacle_loss = balanced_hard_obstacle_bce_loss(
-                    obstacle_ground_logits[hit_mask],
-                    obstacle_ground_targets,
-                    pos_weight=None,
-                    hard_fraction=hard_example_fraction,
+            logits, obstacle_logits, ground_none_logits = model.forward_with_aux(x, lengths)
+            obstacle_targets = (y == 1).float()
+            pos_weight_t = torch.tensor(float(obstacle_pos_weight), device=obstacle_logits.device, dtype=obstacle_logits.dtype)
+            obstacle_loss = balanced_hard_obstacle_bce_loss(
+                obstacle_logits,
+                obstacle_targets,
+                pos_weight=pos_weight_t,
+                hard_fraction=hard_example_fraction,
+            )
+            safe_mask = y != 1
+            if safe_mask.any():
+                ground_none_targets = (y[safe_mask] == 0).float()
+                safe_type_loss = F.binary_cross_entropy_with_logits(
+                    ground_none_logits[safe_mask],
+                    ground_none_targets,
+                    reduction="mean",
                 )
             else:
-                obstacle_loss = hit_loss.new_zeros(())
-            loss = hit_loss + obstacle_loss
+                safe_type_loss = obstacle_loss.new_zeros(())
+            loss = obstacle_loss + (0.5 * safe_type_loss)
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -1201,8 +1170,8 @@ def compute_class_weights(class_counts: np.ndarray) -> np.ndarray:
 def compute_obstacle_ground_pos_weight(class_counts: np.ndarray, max_weight: float = 12.0) -> float:
     counts = np.asarray(class_counts, dtype=np.float64)
     obstacle = max(float(counts[1]), 1.0)
-    ground = max(float(counts[0]), 1.0)
-    weight = ground / obstacle
+    non_obstacle = max(float(counts[0]) + float(counts[2]), 1.0)
+    weight = non_obstacle / obstacle
     return float(np.clip(weight, 1.0, max_weight))
 
 
@@ -1484,7 +1453,7 @@ def build_loaders(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train GRU for current-step lidar class prediction.")
+    parser = argparse.ArgumentParser(description="Train obstacle-first CNN for current-step lidar class prediction.")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--output", type=Path, default=Path("runs/gru_lidar_classifier.pt"))
     parser.add_argument("--eval-checkpoint", type=Path, default=None)
@@ -1534,7 +1503,7 @@ def main() -> None:
     log_fh = log_path.open("w", encoding="utf-8")
     set_log_file(log_fh)
 
-    log("Starting GRU lidar training script")
+    log("Starting lidar training script")
     log("Parsed args: " + json.dumps({k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}))
     log(f"Writing logs to: {log_path}")
 
@@ -1596,10 +1565,10 @@ def main() -> None:
         log(f"Eval-only mode: loading checkpoint {args.eval_checkpoint}")
         ckpt = load_checkpoint_for_device(args.eval_checkpoint, device, device_kind)
         model_config = ckpt["model_config"]
-        if model_config.get("model_type") != "adaptive_stgcn":
+        if model_config.get("model_type") != "obstacle_first_causal_tscnn":
             raise ValueError(
                 f"Checkpoint model_type={model_config.get('model_type')!r} is not supported by this build. "
-                "Retrain with the adaptive_stgcn architecture."
+                "Retrain with the obstacle_first_causal_tscnn architecture."
             )
         model = GRULidarClassifier(
             input_dim=int(model_config["input_dim"]),
@@ -1641,12 +1610,11 @@ def main() -> None:
             "sensor_embed_dim": int(model.sensor_embed_dim),
             "decoder_hidden_dim": int(model.decoder_hidden_dim),
             "obstacle_context_dim": int(model.obstacle_context_dim),
-            "graph_rank": int(model.graph_rank),
         }
     param_count = sum(p.numel() for p in model.parameters())
     log(f"Model initialized: type={model_config['model_type']} params={param_count}")
     log(
-        "Adaptive STGCN layout: "
+        "Causal Time-Sensor CNN layout: "
         f"groups={model_config['region_sensor_groups']} "
         f"region_attention_heads={model_config.get('region_attention_heads', {})} "
         f"sensor_hidden={model_config['hidden_dim']} "
@@ -1654,8 +1622,7 @@ def main() -> None:
         f"attention_ff={model_config['attention_ff_dim']} "
         f"sensor_embed={model_config['sensor_embed_dim']} "
         f"decoder_hidden={model_config['decoder_hidden_dim']} "
-        f"obstacle_context={model_config.get('obstacle_context_dim', 'n/a')} "
-        f"graph_rank={model_config.get('graph_rank', 'n/a')}"
+        f"obstacle_context={model_config.get('obstacle_context_dim', 'n/a')}"
     )
 
     if args.eval_checkpoint is not None:
@@ -1729,12 +1696,12 @@ def main() -> None:
         max_weight=args.obstacle_pos_weight_cap,
     )
     log(
-        "Using factorized training heads: hit-vs-none plus balanced obstacle-vs-ground on hit rays "
+        "Using obstacle-first heads: obstacle-vs-non-obstacle primary plus ground-vs-none on non-obstacle rays "
         f"hard_example_fraction={args.hard_example_fraction:.3f}"
     )
     log(
-        "Legacy class-weight/focal settings are ignored by the factorized loss; "
-        "the model now learns the easy and hard boundaries separately."
+        "Legacy class-weight/focal settings are ignored by the obstacle-first loss; "
+        "the model now optimizes obstacle detection first and refines safe rays second."
     )
     best = {"val_loss": float("inf"), "epoch": -1}
     history: list[dict] = []
