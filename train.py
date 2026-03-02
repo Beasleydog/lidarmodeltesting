@@ -739,13 +739,13 @@ def obstacle_first_binary_logits_to_class_logits(
     obstacle_logits: torch.Tensor,
     ground_none_logits: torch.Tensor,
 ) -> torch.Tensor:
-    log_p_obstacle = F.logsigmoid(obstacle_logits)
-    log_p_non_obstacle = F.logsigmoid(-obstacle_logits)
-    log_p_ground_given_non_obstacle = F.logsigmoid(ground_none_logits)
-    log_p_none_given_non_obstacle = F.logsigmoid(-ground_none_logits)
-    log_p_ground = log_p_non_obstacle + log_p_ground_given_non_obstacle
-    log_p_none = log_p_non_obstacle + log_p_none_given_non_obstacle
-    return torch.stack([log_p_ground, log_p_obstacle, log_p_none], dim=-1)
+    # Compose score-like logits from the two binary heads without giving obstacle
+    # an automatic advantage at zero-initialization. When both heads are near 0,
+    # all three class scores tie instead of defaulting to "obstacle".
+    obstacle_score = obstacle_logits
+    ground_score = -obstacle_logits + ground_none_logits
+    none_score = -obstacle_logits - ground_none_logits
+    return torch.stack([ground_score, obstacle_score, none_score], dim=-1)
 
 
 def predict_eval_logits(
