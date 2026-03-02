@@ -416,7 +416,7 @@ def _build_sensor_processing_order(region_sensor_groups: dict[str, list[int]], n
     return ordered
 
 
-class CausalTimeSensorBlock(nn.Module):
+class TemporalGraphBlock(nn.Module):
     def __init__(self, channels: int, dilation: int, dropout: float):
         super().__init__()
         self.temporal_conv = nn.Conv2d(
@@ -427,25 +427,20 @@ class CausalTimeSensorBlock(nn.Module):
             padding=(int(dilation) * 2, 0),
         )
         self.temporal_norm = nn.GroupNorm(1, channels)
-        self.sensor_conv = nn.Conv2d(
-            channels,
-            channels,
-            kernel_size=(1, 3),
-            padding=(0, 1),
-        )
-        self.sensor_norm = nn.GroupNorm(1, channels)
+        self.graph_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.graph_norm = nn.GroupNorm(1, channels)
         self.dropout = nn.Dropout2d(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
         residual = x
         t = self.temporal_conv(x)
         t = t[:, :, : x.shape[2], :]
-        t = self.temporal_norm(t)
-        t = F.gelu(t)
-        s = self.sensor_conv(t)
-        s = self.sensor_norm(s)
-        s = self.dropout(F.gelu(s))
-        return residual + s
+        t = F.gelu(self.temporal_norm(t))
+        mixed = torch.einsum("bcts,sn->bctn", t, adjacency)
+        mixed = self.graph_proj(mixed)
+        mixed = self.graph_norm(mixed)
+        mixed = self.dropout(F.gelu(mixed))
+        return residual + mixed
 
 
 class GRULidarClassifier(nn.Module):
@@ -467,7 +462,7 @@ class GRULidarClassifier(nn.Module):
         region_context_dim: int | None = None,
     ):
         super().__init__()
-        self.model_type = "causal_tscnn"
+        self.model_type = "adaptive_stgcn"
         self.input_dim = int(input_dim)
         self.hidden_dim = int(hidden_dim)
         self.num_layers = int(num_layers)
@@ -476,7 +471,7 @@ class GRULidarClassifier(nn.Module):
 
         if self.input_dim != 4 + 2 * self.num_sensors:
             raise ValueError(
-                f"causal_tscnn expects input_dim=4+2*num_sensors; got input_dim={self.input_dim} "
+                f"adaptive_stgcn expects input_dim=4+2*num_sensors; got input_dim={self.input_dim} "
                 f"for num_sensors={self.num_sensors}"
             )
 
@@ -513,13 +508,38 @@ class GRULidarClassifier(nn.Module):
             torch.tensor(self.sensor_restore_list, dtype=torch.long),
             persistent=False,
         )
+        self.graph_rank = max(4, min(16, max(1, self.hidden_dim // 4)))
+        fixed_adj = torch.eye(self.num_sensors, dtype=torch.float32)
+        for idx in range(self.num_sensors):
+            if idx > 0:
+                fixed_adj[idx, idx - 1] = 1.0
+            if idx + 1 < self.num_sensors:
+                fixed_adj[idx, idx + 1] = 1.0
+        sensor_to_ordered = {sensor_id: idx for idx, sensor_id in enumerate(self.sensor_order_list)}
+        for sensor_ids in self.region_sensor_groups.values():
+            ordered_positions = [
+                sensor_to_ordered[int(sensor_id)]
+                for sensor_id in sensor_ids
+                if int(sensor_id) in sensor_to_ordered
+            ]
+            for src in ordered_positions:
+                for dst in ordered_positions:
+                    if src != dst:
+                        fixed_adj[src, dst] = max(float(fixed_adj[src, dst]), 0.5)
+        fixed_adj = fixed_adj / fixed_adj.sum(dim=1, keepdim=True).clamp_min(1.0)
+        self.register_buffer("fixed_adj", fixed_adj, persistent=False)
 
         self.sensor_embedding = nn.Embedding(self.num_sensors, self.sensor_embed_dim)
+        self.graph_query = nn.Parameter(torch.empty(self.num_sensors, self.graph_rank))
+        self.graph_key = nn.Parameter(torch.empty(self.num_sensors, self.graph_rank))
+        nn.init.normal_(self.graph_query, mean=0.0, std=0.1)
+        nn.init.normal_(self.graph_key, mean=0.0, std=0.1)
+        self.graph_mix_logit = nn.Parameter(torch.tensor(-0.5, dtype=torch.float32))
         self.input_feature_dim = 17 + self.sensor_embed_dim
         self.stem = nn.Conv2d(self.input_feature_dim, self.hidden_dim, kernel_size=1)
         self.stem_norm = nn.GroupNorm(1, self.hidden_dim)
         dilations = [2 ** (i % 4) for i in range(max(1, self.num_layers))]
-        self.blocks = nn.ModuleList([CausalTimeSensorBlock(self.hidden_dim, d, dropout) for d in dilations])
+        self.blocks = nn.ModuleList([TemporalGraphBlock(self.hidden_dim, d, dropout) for d in dilations])
         self.backbone_dropout = nn.Dropout2d(dropout)
         self.global_proj = nn.Linear(self.hidden_dim, self.fusion_hidden_dim)
         self.region_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
@@ -560,6 +580,14 @@ class GRULidarClassifier(nn.Module):
 
     def _restore_sensor_tensor(self, values: torch.Tensor) -> torch.Tensor:
         return values.index_select(dim=1, index=self.sensor_restore.to(device=values.device))
+
+    def _graph_adjacency(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        scale = float(self.graph_rank) ** -0.5
+        adaptive_scores = torch.matmul(self.graph_query, self.graph_key.transpose(0, 1)) * scale
+        adaptive_adj = torch.softmax(adaptive_scores, dim=-1).to(device=device, dtype=dtype)
+        fixed_adj = self.fixed_adj.to(device=device, dtype=dtype)
+        mix = torch.sigmoid(self.graph_mix_logit).to(device=device, dtype=dtype)
+        return (1.0 - mix) * fixed_adj + mix * adaptive_adj
 
     def _shift_time(self, values: torch.Tensor, steps: int) -> torch.Tensor:
         steps_i = max(1, int(steps))
@@ -657,8 +685,9 @@ class GRULidarClassifier(nn.Module):
         conv_in = feats.permute(0, 3, 1, 2).contiguous()
         h = F.gelu(self.stem_norm(self.stem(conv_in)))
         h = self.backbone_dropout(h)
+        adjacency = self._graph_adjacency(device=h.device, dtype=h.dtype)
         for block in self.blocks:
-            h = block(h)
+            h = block(h, adjacency)
         h_bt = h.permute(0, 2, 3, 1).contiguous()
         last_features = h_bt[:, -1, :, :]
         current_local = current_local.to(dtype=last_features.dtype)
@@ -859,10 +888,10 @@ def load_gru_lidar_inferencer(
 
     ckpt = load_checkpoint_for_device(checkpoint_path, device_t, device_kind)
     cfg = ckpt["model_config"]
-    if cfg.get("model_type") != "causal_tscnn":
+    if cfg.get("model_type") != "adaptive_stgcn":
         raise ValueError(
             f"Checkpoint model_type={cfg.get('model_type')!r} is not supported by this build. "
-            "Retrain with the causal_tscnn architecture."
+            "Retrain with the adaptive_stgcn architecture."
         )
     model = GRULidarClassifier(
         input_dim=int(cfg["input_dim"]),
@@ -1567,10 +1596,10 @@ def main() -> None:
         log(f"Eval-only mode: loading checkpoint {args.eval_checkpoint}")
         ckpt = load_checkpoint_for_device(args.eval_checkpoint, device, device_kind)
         model_config = ckpt["model_config"]
-        if model_config.get("model_type") != "causal_tscnn":
+        if model_config.get("model_type") != "adaptive_stgcn":
             raise ValueError(
                 f"Checkpoint model_type={model_config.get('model_type')!r} is not supported by this build. "
-                "Retrain with the causal_tscnn architecture."
+                "Retrain with the adaptive_stgcn architecture."
             )
         model = GRULidarClassifier(
             input_dim=int(model_config["input_dim"]),
@@ -1612,11 +1641,12 @@ def main() -> None:
             "sensor_embed_dim": int(model.sensor_embed_dim),
             "decoder_hidden_dim": int(model.decoder_hidden_dim),
             "obstacle_context_dim": int(model.obstacle_context_dim),
+            "graph_rank": int(model.graph_rank),
         }
     param_count = sum(p.numel() for p in model.parameters())
     log(f"Model initialized: type={model_config['model_type']} params={param_count}")
     log(
-        "Causal Time-Sensor layout: "
+        "Adaptive STGCN layout: "
         f"groups={model_config['region_sensor_groups']} "
         f"region_attention_heads={model_config.get('region_attention_heads', {})} "
         f"sensor_hidden={model_config['hidden_dim']} "
@@ -1624,7 +1654,8 @@ def main() -> None:
         f"attention_ff={model_config['attention_ff_dim']} "
         f"sensor_embed={model_config['sensor_embed_dim']} "
         f"decoder_hidden={model_config['decoder_hidden_dim']} "
-        f"obstacle_context={model_config.get('obstacle_context_dim', 'n/a')}"
+        f"obstacle_context={model_config.get('obstacle_context_dim', 'n/a')} "
+        f"graph_rank={model_config.get('graph_rank', 'n/a')}"
     )
 
     if args.eval_checkpoint is not None:
