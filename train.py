@@ -768,6 +768,26 @@ def predict_eval_logits(
     return model(x, lengths)
 
 
+def predict_eval_obstacle_logits(
+    model: nn.Module,
+    x: torch.Tensor,
+    lengths: torch.Tensor,
+    obstacle_logit_bias: float = 0.0,
+) -> torch.Tensor:
+    if hasattr(model, "forward_with_aux"):
+        out = model.forward_with_aux(x, lengths)
+        if isinstance(out, tuple) and len(out) == 3:
+            _, obstacle_logits, _ = out
+            bias = float(obstacle_logit_bias)
+            if abs(bias) > 1e-12:
+                obstacle_logits = obstacle_logits + bias
+            return obstacle_logits
+    logits = model(x, lengths)
+    if logits.ndim == 3 and logits.shape[-1] >= 2:
+        return logits[..., 1] - logits[..., 0]
+    raise ValueError("Model does not expose obstacle logits for binary evaluation.")
+
+
 class GRULidarInferencer:
     def __init__(
         self,
@@ -939,6 +959,7 @@ def run_epoch(
     hard_example_fraction: float = 0.25,
     obstacle_primary_loss_weight: float = 2.0,
     safe_type_loss_weight: float = 0.2,
+    binary_obstacle_only: bool = False,
     use_amp: bool = False,
     grad_scaler=None,
 ) -> tuple[float, float]:
@@ -991,10 +1012,13 @@ def run_epoch(
                 )
             else:
                 safe_type_loss = obstacle_loss.new_zeros(())
-            loss = (
-                (float(obstacle_primary_loss_weight) * obstacle_loss)
-                + (float(safe_type_loss_weight) * safe_type_loss)
-            )
+            if binary_obstacle_only:
+                loss = float(obstacle_primary_loss_weight) * obstacle_loss
+            else:
+                loss = (
+                    (float(obstacle_primary_loss_weight) * obstacle_loss)
+                    + (float(safe_type_loss_weight) * safe_type_loss)
+                )
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -1012,15 +1036,24 @@ def run_epoch(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer_step_for_device(optimizer, device_kind)
 
-        preds = torch.argmax(logits, dim=-1)
-        total_correct += int((preds == y).sum().item())
-        total_count += int(y.numel())
+        if binary_obstacle_only:
+            binary_targets = (y == 1).long()
+            preds = (obstacle_logits > 0).long()
+            total_correct += int((preds == binary_targets).sum().item())
+            total_count += int(binary_targets.numel())
+            y_flat = binary_targets.reshape(-1).detach().cpu().numpy()
+            p_flat = preds.reshape(-1).detach().cpu().numpy()
+        else:
+            preds = torch.argmax(logits, dim=-1)
+            total_correct += int((preds == y).sum().item())
+            total_count += int(y.numel())
+            y_flat = y.reshape(-1).detach().cpu().numpy()
+            p_flat = preds.reshape(-1).detach().cpu().numpy()
+
         batch_sequences = int(y.shape[0])
         total_loss += float(loss.item()) * float(batch_sequences)
         seen_sequences += batch_sequences
 
-        y_flat = y.reshape(-1).detach().cpu().numpy()
-        p_flat = preds.reshape(-1).detach().cpu().numpy()
         for cls_id in range(num_classes):
             cls_mask = y_flat == cls_id
             cls_count = int(np.sum(cls_mask))
@@ -1031,15 +1064,25 @@ def run_epoch(
         if log_every_batches > 0 and (batch_idx % log_every_batches == 0 or batch_idx == batch_count):
             running_loss = total_loss / max(seen_sequences, 1)
             running_acc = total_correct / max(total_count, 1)
-            obstacle_acc = fmt_acc(int(class_correct[1]), int(class_totals[1]))
-            ground_acc = fmt_acc(int(class_correct[0]), int(class_totals[0]))
-            nothing_acc = fmt_acc(int(class_correct[2]), int(class_totals[2]))
-            log(
-                f"{phase_name} epoch {epoch_idx:03d}/{total_epochs:03d} "
-                f"batch {batch_idx:04d}/{batch_count:04d} "
-                f"loss={running_loss:.5f} acc={running_acc:.4f} "
-                f"class_acc(o/g/n)={obstacle_acc}/{ground_acc}/{nothing_acc}"
-            )
+            if binary_obstacle_only:
+                non_obstacle_acc = fmt_acc(int(class_correct[0]), int(class_totals[0]))
+                obstacle_acc = fmt_acc(int(class_correct[1]), int(class_totals[1]))
+                log(
+                    f"{phase_name} epoch {epoch_idx:03d}/{total_epochs:03d} "
+                    f"batch {batch_idx:04d}/{batch_count:04d} "
+                    f"loss={running_loss:.5f} acc={running_acc:.4f} "
+                    f"binary_acc(non/o)={non_obstacle_acc}/{obstacle_acc}"
+                )
+            else:
+                obstacle_acc = fmt_acc(int(class_correct[1]), int(class_totals[1]))
+                ground_acc = fmt_acc(int(class_correct[0]), int(class_totals[0]))
+                nothing_acc = fmt_acc(int(class_correct[2]), int(class_totals[2]))
+                log(
+                    f"{phase_name} epoch {epoch_idx:03d}/{total_epochs:03d} "
+                    f"batch {batch_idx:04d}/{batch_count:04d} "
+                    f"loss={running_loss:.5f} acc={running_acc:.4f} "
+                    f"class_acc(o/g/n)={obstacle_acc}/{ground_acc}/{nothing_acc}"
+                )
 
     avg_loss = total_loss / max(len(loader.dataset), 1)
     acc = total_correct / max(total_count, 1)
@@ -1058,6 +1101,7 @@ def evaluate_detailed(
     device_kind: str,
     num_classes: int,
     obstacle_logit_bias: float = 0.0,
+    binary_obstacle_only: bool = False,
 ) -> dict:
     model.eval()
     confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
@@ -1066,10 +1110,21 @@ def evaluate_detailed(
         for x, lengths, y in loader:
             x = x.to(device)
             y = y.to(device)
-            logits = predict_eval_logits(model, x, lengths, obstacle_logit_bias=obstacle_logit_bias)
-            preds = torch.argmax(logits, dim=-1)
+            if binary_obstacle_only:
+                obstacle_logits = predict_eval_obstacle_logits(
+                    model,
+                    x,
+                    lengths,
+                    obstacle_logit_bias=obstacle_logit_bias,
+                )
+                preds = (obstacle_logits > 0).long()
+                y_eval = (y == 1).long()
+            else:
+                logits = predict_eval_logits(model, x, lengths, obstacle_logit_bias=obstacle_logit_bias)
+                preds = torch.argmax(logits, dim=-1)
+                y_eval = y
 
-            y_flat = y.reshape(-1).cpu().numpy()
+            y_flat = y_eval.reshape(-1).cpu().numpy()
             p_flat = preds.reshape(-1).cpu().numpy()
             for yt, yp in zip(y_flat, p_flat):
                 confusion[int(yt), int(yp)] += 1
@@ -1123,6 +1178,7 @@ def run_obstacle_logit_bias_sweep(
     device_kind: str,
     num_classes: int,
     biases: list[float],
+    binary_obstacle_only: bool = False,
 ) -> dict:
     entries: list[dict] = []
     best_accuracy: dict | None = None
@@ -1136,6 +1192,7 @@ def run_obstacle_logit_bias_sweep(
             device_kind,
             num_classes,
             obstacle_logit_bias=float(bias),
+            binary_obstacle_only=binary_obstacle_only,
         )
         entry = {
             "obstacle_logit_bias": float(bias),
@@ -1489,6 +1546,7 @@ def main() -> None:
     parser.add_argument("--hard-example-fraction", type=float, default=1.0)
     parser.add_argument("--obstacle-primary-loss-weight", type=float, default=2.0)
     parser.add_argument("--safe-type-loss-weight", type=float, default=0.2)
+    parser.add_argument("--binary-obstacle-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--plateau-factor", type=float, default=0.5)
     parser.add_argument("--plateau-patience", type=int, default=1)
@@ -1530,6 +1588,7 @@ def main() -> None:
         f"device={device_kind} num_workers={loader_num_workers} "
         f"pin_memory={loader_pin_memory} amp={amp_enabled}"
     )
+    binary_obstacle_only_mode = bool(args.binary_obstacle_only)
 
     train_loader, val_loader, meta = build_loaders(
         data_dir=args.data_dir,
@@ -1592,6 +1651,7 @@ def main() -> None:
             attention_heads=model_config.get("attention_heads"),
         ).to(device)
         model.load_state_dict(ckpt["model_state_dict"])
+        binary_obstacle_only_mode = bool(model_config.get("binary_obstacle_only", binary_obstacle_only_mode))
     else:
         model = GRULidarClassifier(
             input_dim=meta["input_dim"],
@@ -1617,6 +1677,7 @@ def main() -> None:
             "sensor_embed_dim": int(model.sensor_embed_dim),
             "decoder_hidden_dim": int(model.decoder_hidden_dim),
             "obstacle_context_dim": int(model.obstacle_context_dim),
+            "binary_obstacle_only": bool(binary_obstacle_only_mode),
         }
     param_count = sum(p.numel() for p in model.parameters())
     log(f"Model initialized: type={model_config['model_type']} params={param_count}")
@@ -1632,14 +1693,24 @@ def main() -> None:
         f"obstacle_context={model_config.get('obstacle_context_dim', 'n/a')}"
     )
 
+    eval_num_classes = 2 if binary_obstacle_only_mode else meta["num_classes"]
+
     if args.eval_checkpoint is not None:
         log("Running eval-only detailed validation evaluation")
-        final_report = evaluate_detailed(model, val_loader, device, device_kind, meta["num_classes"])
+        final_report = evaluate_detailed(
+            model,
+            val_loader,
+            device,
+            device_kind,
+            eval_num_classes,
+            binary_obstacle_only=binary_obstacle_only_mode,
+        )
         final_report.update(
             {
                 "num_train_samples": meta["num_train_samples"],
                 "num_val_samples": meta["num_val_samples"],
                 "source_checkpoint": str(args.eval_checkpoint),
+                "binary_obstacle_only": bool(binary_obstacle_only_mode),
             }
         )
         val_report_path = args.eval_checkpoint.with_suffix(".eval_val_report.json")
@@ -1662,14 +1733,16 @@ def main() -> None:
             val_loader,
             device,
             device_kind,
-            meta["num_classes"],
+            eval_num_classes,
             sweep_biases,
+            binary_obstacle_only=binary_obstacle_only_mode,
         )
         sweep_report.update(
             {
                 "source_checkpoint": str(args.eval_checkpoint),
                 "num_train_samples": meta["num_train_samples"],
                 "num_val_samples": meta["num_val_samples"],
+                "binary_obstacle_only": bool(binary_obstacle_only_mode),
             }
         )
         sweep_report_path = args.eval_checkpoint.with_suffix(".threshold_sweep.json")
@@ -1702,16 +1775,27 @@ def main() -> None:
         np.asarray(meta["train_class_counts"], dtype=np.float32),
         max_weight=args.obstacle_pos_weight_cap,
     )
-    log(
-        "Using obstacle-first heads: obstacle-vs-non-obstacle primary plus ground-vs-none on non-obstacle rays "
-        f"hard_example_fraction={args.hard_example_fraction:.3f} "
-        f"obstacle_primary_loss_weight={args.obstacle_primary_loss_weight:.3f} "
-        f"safe_type_loss_weight={args.safe_type_loss_weight:.3f}"
-    )
-    log(
-        "Legacy class-weight/focal settings are ignored by the obstacle-first loss; "
-        "the model now optimizes obstacle detection first and refines safe rays second."
-    )
+    if binary_obstacle_only_mode:
+        log(
+            "Using binary obstacle-only training: obstacle-vs-non-obstacle only "
+            f"hard_example_fraction={args.hard_example_fraction:.3f} "
+            f"obstacle_primary_loss_weight={args.obstacle_primary_loss_weight:.3f}"
+        )
+        log(
+            "Ground-vs-none refinement is disabled for this experiment; "
+            "the run now directly tests whether the backbone can learn obstacle detection."
+        )
+    else:
+        log(
+            "Using obstacle-first heads: obstacle-vs-non-obstacle primary plus ground-vs-none on non-obstacle rays "
+            f"hard_example_fraction={args.hard_example_fraction:.3f} "
+            f"obstacle_primary_loss_weight={args.obstacle_primary_loss_weight:.3f} "
+            f"safe_type_loss_weight={args.safe_type_loss_weight:.3f}"
+        )
+        log(
+            "Legacy class-weight/focal settings are ignored by the obstacle-first loss; "
+            "the model now optimizes obstacle detection first and refines safe rays second."
+        )
     best = {"val_loss": float("inf"), "epoch": -1}
     history: list[dict] = []
     metrics_csv_path = args.output.with_suffix(".metrics.csv")
@@ -1764,7 +1848,7 @@ def main() -> None:
             optimizer,
             device,
             device_kind,
-            meta["num_classes"],
+            eval_num_classes,
             epoch_idx=epoch,
             total_epochs=args.epochs,
             phase_name="train",
@@ -1779,6 +1863,7 @@ def main() -> None:
             hard_example_fraction=args.hard_example_fraction,
             obstacle_primary_loss_weight=args.obstacle_primary_loss_weight,
             safe_type_loss_weight=args.safe_type_loss_weight,
+            binary_obstacle_only=binary_obstacle_only_mode,
             use_amp=amp_enabled,
             grad_scaler=grad_scaler,
         )
@@ -1788,7 +1873,7 @@ def main() -> None:
             None,
             device,
             device_kind,
-            meta["num_classes"],
+            eval_num_classes,
             epoch_idx=epoch,
             total_epochs=args.epochs,
             phase_name="val",
@@ -1802,6 +1887,7 @@ def main() -> None:
             hard_example_fraction=args.hard_example_fraction,
             obstacle_primary_loss_weight=args.obstacle_primary_loss_weight,
             safe_type_loss_weight=args.safe_type_loss_weight,
+            binary_obstacle_only=binary_obstacle_only_mode,
             use_amp=amp_enabled,
         )
         scheduler.step(val_loss)
@@ -1846,7 +1932,10 @@ def main() -> None:
                         "obstacle_pos_weight_reference": obstacle_pos_weight,
                         "obstacle_pos_weight_cap": args.obstacle_pos_weight_cap,
                         "hard_example_fraction": args.hard_example_fraction,
-                        "loss_type": "factorized_binary",
+                        "obstacle_primary_loss_weight": args.obstacle_primary_loss_weight,
+                        "safe_type_loss_weight": args.safe_type_loss_weight,
+                        "binary_obstacle_only": bool(binary_obstacle_only_mode),
+                        "loss_type": "binary_obstacle_only" if binary_obstacle_only_mode else "obstacle_first_binary",
                         "prediction_target": "current_step_lidar_class",
                         "focal_gamma": args.focal_gamma,
                         "label_smoothing": args.label_smoothing,
@@ -1891,13 +1980,21 @@ def main() -> None:
         best_ckpt = load_checkpoint_for_device(args.output, device, device_kind)
         model.load_state_dict(best_ckpt["model_state_dict"])
     log("Running detailed validation evaluation")
-    final_report = evaluate_detailed(model, val_loader, device, device_kind, meta["num_classes"])
+    final_report = evaluate_detailed(
+        model,
+        val_loader,
+        device,
+        device_kind,
+        eval_num_classes,
+        binary_obstacle_only=binary_obstacle_only_mode,
+    )
     final_report.update(
         {
             "best_epoch": best["epoch"],
             "best_val_loss": best["val_loss"],
             "num_train_samples": meta["num_train_samples"],
             "num_val_samples": meta["num_val_samples"],
+            "binary_obstacle_only": bool(binary_obstacle_only_mode),
         }
     )
     val_report_path = args.output.with_suffix(".val_report.json")
@@ -1919,8 +2016,9 @@ def main() -> None:
         val_loader,
         device,
         device_kind,
-        meta["num_classes"],
+        eval_num_classes,
         sweep_biases,
+        binary_obstacle_only=binary_obstacle_only_mode,
     )
     sweep_report.update(
         {
@@ -1928,6 +2026,7 @@ def main() -> None:
             "best_val_loss": best["val_loss"],
             "num_train_samples": meta["num_train_samples"],
             "num_val_samples": meta["num_val_samples"],
+            "binary_obstacle_only": bool(binary_obstacle_only_mode),
         }
     )
     sweep_report_path = args.output.with_suffix(".threshold_sweep.json")
