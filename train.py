@@ -107,59 +107,6 @@ def log_plain(message: str) -> None:
     _emit_log_line(message)
 
 
-def build_sensor_geometry_features(
-    num_sensors: int,
-    region_sensor_groups: dict[str, list[int]],
-) -> np.ndarray:
-    num_sensors_i = int(num_sensors)
-    region_names = list(region_sensor_groups.keys())
-    region_dim = max(1, len(region_names))
-    geom_dim = 7 + region_dim
-    out = np.zeros((num_sensors_i, geom_dim), dtype=np.float32)
-
-    base_count = min(num_sensors_i, int(MODEL_SENSOR_COORDS_CM.shape[0]), int(MODEL_SENSOR_YAW_PITCH_DEG.shape[0]))
-    if base_count > 0:
-        coords = MODEL_SENSOR_COORDS_CM[:base_count].astype(np.float32, copy=True)
-        coord_scale = np.maximum(np.max(np.abs(MODEL_SENSOR_COORDS_CM), axis=0), 1.0).astype(np.float32)
-        coords = coords / coord_scale
-
-        yaw_pitch = MODEL_SENSOR_YAW_PITCH_DEG[:base_count]
-        yaw_rad = np.deg2rad(yaw_pitch[:, 0].astype(np.float32))
-        pitch_rad = np.deg2rad(yaw_pitch[:, 1].astype(np.float32))
-
-        out[:base_count, 0] = np.sin(yaw_rad)
-        out[:base_count, 1] = np.cos(yaw_rad)
-        out[:base_count, 2] = np.sin(pitch_rad)
-        out[:base_count, 3] = np.cos(pitch_rad)
-        out[:base_count, 4:7] = coords
-
-    region_lookup: dict[int, int] = {}
-    for region_idx, sensor_ids in enumerate(region_sensor_groups.values()):
-        for sensor_id in sensor_ids:
-            sid = int(sensor_id)
-            if 0 <= sid < num_sensors_i:
-                region_lookup[sid] = region_idx
-
-    default_region_idx = 0
-    for sensor_id in range(num_sensors_i):
-        region_idx = region_lookup.get(sensor_id, default_region_idx)
-        out[sensor_id, 7 + region_idx] = 1.0
-
-    return out
-
-
-def load_model_state_with_geometry_compat(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> None:
-    incompatible = model.load_state_dict(state_dict, strict=False)
-    allowed_missing = {"sensor_geometry_proj.weight"}
-    missing = set(incompatible.missing_keys)
-    unexpected = set(incompatible.unexpected_keys)
-    if unexpected:
-        raise RuntimeError(f"Unexpected checkpoint keys: {sorted(unexpected)}")
-    disallowed_missing = missing - allowed_missing
-    if disallowed_missing:
-        raise RuntimeError(f"Missing checkpoint keys: {sorted(disallowed_missing)}")
-
-
 def resolve_data_loader_workers(requested: int) -> int:
     req = int(requested)
     if req >= 0:
@@ -543,6 +490,18 @@ class CausalTimeSensorBlock(nn.Module):
         return residual + s
 
 
+class TemporalUNetFuse(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.proj = nn.Conv2d(channels * 2, channels, kernel_size=1)
+        self.norm = nn.GroupNorm(1, channels)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(x, size=(skip.shape[2], skip.shape[3]), mode="nearest")
+        x = torch.cat([x, skip], dim=1)
+        return F.gelu(self.norm(self.proj(x)))
+
+
 class GRULidarClassifier(nn.Module):
     def __init__(
         self,
@@ -562,7 +521,7 @@ class GRULidarClassifier(nn.Module):
         region_context_dim: int | None = None,
     ):
         super().__init__()
-        self.model_type = "obstacle_first_causal_tscnn"
+        self.model_type = "obstacle_first_tsunet"
         self.input_dim = int(input_dim)
         self.hidden_dim = int(hidden_dim)
         self.num_layers = int(num_layers)
@@ -571,7 +530,7 @@ class GRULidarClassifier(nn.Module):
 
         if self.input_dim != 4 + 2 * self.num_sensors:
             raise ValueError(
-                f"obstacle_first_causal_tscnn expects input_dim=4+2*num_sensors; got input_dim={self.input_dim} "
+                f"obstacle_first_tsunet expects input_dim=4+2*num_sensors; got input_dim={self.input_dim} "
                 f"for num_sensors={self.num_sensors}"
             )
 
@@ -608,21 +567,35 @@ class GRULidarClassifier(nn.Module):
             torch.tensor(self.sensor_restore_list, dtype=torch.long),
             persistent=False,
         )
-        sensor_geometry_np = build_sensor_geometry_features(self.num_sensors, self.region_sensor_groups)
-        self.register_buffer(
-            "sensor_geometry",
-            torch.from_numpy(sensor_geometry_np),
-            persistent=False,
-        )
-        self.sensor_geometry_dim = int(sensor_geometry_np.shape[1])
         self.sensor_embedding = nn.Embedding(self.num_sensors, self.sensor_embed_dim)
-        self.sensor_geometry_proj = nn.Linear(self.sensor_geometry_dim, self.sensor_embed_dim, bias=False)
-        nn.init.zeros_(self.sensor_geometry_proj.weight)
         self.input_feature_dim = 17 + self.sensor_embed_dim
         self.stem = nn.Conv2d(self.input_feature_dim, self.hidden_dim, kernel_size=1)
         self.stem_norm = nn.GroupNorm(1, self.hidden_dim)
-        dilations = [2 ** (i % 4) for i in range(max(1, self.num_layers))]
-        self.blocks = nn.ModuleList([CausalTimeSensorBlock(self.hidden_dim, d, dropout) for d in dilations])
+        self.unet_depth = max(2, min(4, max(1, self.num_layers)))
+        enc_dilations = [2 ** min(i, 3) for i in range(self.unet_depth)]
+        self.encoder_blocks = nn.ModuleList(
+            [CausalTimeSensorBlock(self.hidden_dim, d, dropout) for d in enc_dilations]
+        )
+        bottleneck_dilation = 2 ** min(self.unet_depth, 3)
+        self.bottleneck_blocks = nn.ModuleList(
+            [
+                CausalTimeSensorBlock(self.hidden_dim, bottleneck_dilation, dropout),
+                CausalTimeSensorBlock(self.hidden_dim, bottleneck_dilation, dropout),
+            ]
+        )
+        self.decoder_fuse = nn.ModuleList(
+            [TemporalUNetFuse(self.hidden_dim) for _ in range(self.unet_depth - 1)]
+        )
+        self.decoder_blocks = nn.ModuleList(
+            [
+                CausalTimeSensorBlock(
+                    self.hidden_dim,
+                    enc_dilations[self.unet_depth - 2 - i],
+                    dropout,
+                )
+                for i in range(self.unet_depth - 1)
+            ]
+        )
         self.backbone_dropout = nn.Dropout2d(dropout)
         self.global_proj = nn.Linear(self.hidden_dim, self.fusion_hidden_dim)
         self.region_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
@@ -720,11 +693,6 @@ class GRULidarClassifier(nn.Module):
         sensor_embed = self.sensor_embedding(self.sensor_order.to(device=x.device))
         sensor_embed = sensor_embed.view(1, 1, self.num_sensors, self.sensor_embed_dim)
         sensor_embed = sensor_embed.expand(batch_size, time_steps, -1, -1)
-        sensor_geometry = self.sensor_geometry.index_select(0, self.sensor_order.to(device=x.device))
-        sensor_geometry = sensor_geometry.view(1, 1, self.num_sensors, self.sensor_geometry_dim)
-        sensor_geometry = sensor_geometry.expand(batch_size, time_steps, -1, -1)
-        sensor_token = sensor_embed + self.sensor_geometry_proj(sensor_geometry).to(dtype=sensor_embed.dtype)
-
         feats = torch.cat(
             [
                 dist_ord.unsqueeze(-1),
@@ -738,7 +706,7 @@ class GRULidarClassifier(nn.Module):
                 right_delta.unsqueeze(-1),
                 pose_expand,
                 pose_delta_expand,
-                sensor_token,
+                sensor_embed,
             ],
             dim=-1,
         )
@@ -766,8 +734,17 @@ class GRULidarClassifier(nn.Module):
         conv_in = feats.permute(0, 3, 1, 2).contiguous()
         h = F.gelu(self.stem_norm(self.stem(conv_in)))
         h = self.backbone_dropout(h)
-        for block in self.blocks:
+        skips: list[torch.Tensor] = []
+        for block_idx, block in enumerate(self.encoder_blocks):
             h = block(h)
+            skips.append(h)
+            if block_idx < len(self.encoder_blocks) - 1 and h.shape[2] > 1:
+                h = h[:, :, ::2, :]
+        for block in self.bottleneck_blocks:
+            h = block(h)
+        for up_idx, skip_idx in enumerate(range(len(skips) - 2, -1, -1)):
+            h = self.decoder_fuse[up_idx](h, skips[skip_idx])
+            h = self.decoder_blocks[up_idx](h)
         h_bt = h.permute(0, 2, 3, 1).contiguous()
         last_features = h_bt[:, -1, :, :]
         current_local = current_local.to(dtype=last_features.dtype)
@@ -804,9 +781,6 @@ class GRULidarClassifier(nn.Module):
         global_expand = global_latent.unsqueeze(1).expand(-1, self.num_sensors, -1)
         sensor_embed = self.sensor_embedding(self.sensor_order.to(device=last_features.device)).unsqueeze(0)
         sensor_embed = sensor_embed.expand(batch_size, -1, -1).to(dtype=last_features.dtype)
-        sensor_geometry = self.sensor_geometry.index_select(0, self.sensor_order.to(device=last_features.device)).unsqueeze(0)
-        sensor_geometry = sensor_geometry.expand(batch_size, -1, -1).to(dtype=last_features.dtype)
-        sensor_token = sensor_embed + self.sensor_geometry_proj(sensor_geometry).to(dtype=last_features.dtype)
         pose_expand = current_pose.unsqueeze(1).expand(-1, self.num_sensors, -1)
         pose_delta_expand = current_pose_delta.unsqueeze(1).expand(-1, self.num_sensors, -1)
 
@@ -816,7 +790,7 @@ class GRULidarClassifier(nn.Module):
                 self.neighbor_proj(neighbor_latent),
                 self.region_proj(region_latent),
                 global_expand,
-                sensor_token,
+                sensor_embed,
                 pose_expand,
                 pose_delta_expand,
                 current_local,
@@ -1022,10 +996,10 @@ def load_gru_lidar_inferencer(
 
     ckpt = load_checkpoint_for_device(checkpoint_path, device_t, device_kind)
     cfg = ckpt["model_config"]
-    if cfg.get("model_type") != "obstacle_first_causal_tscnn":
+    if cfg.get("model_type") != "obstacle_first_tsunet":
         raise ValueError(
             f"Checkpoint model_type={cfg.get('model_type')!r} is not supported by this build. "
-            "Retrain with the obstacle_first_causal_tscnn architecture."
+            "Retrain with the obstacle_first_tsunet architecture."
         )
     model = GRULidarClassifier(
         input_dim=int(cfg["input_dim"]),
@@ -1041,7 +1015,7 @@ def load_gru_lidar_inferencer(
         attention_ff_dim=cfg.get("attention_ff_dim", cfg.get("region_context_dim")),
         attention_heads=cfg.get("attention_heads"),
     ).to(device_t)
-    load_model_state_with_geometry_compat(model, ckpt["model_state_dict"])
+    model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
     norm = ckpt["norm"]
@@ -1799,10 +1773,10 @@ def main() -> None:
         log(f"Eval-only mode: loading checkpoint {args.eval_checkpoint}")
         ckpt = load_checkpoint_for_device(args.eval_checkpoint, device, device_kind)
         model_config = ckpt["model_config"]
-        if model_config.get("model_type") != "obstacle_first_causal_tscnn":
+        if model_config.get("model_type") != "obstacle_first_tsunet":
             raise ValueError(
                 f"Checkpoint model_type={model_config.get('model_type')!r} is not supported by this build. "
-                "Retrain with the obstacle_first_causal_tscnn architecture."
+                "Retrain with the obstacle_first_tsunet architecture."
             )
         model = GRULidarClassifier(
             input_dim=int(model_config["input_dim"]),
@@ -1818,7 +1792,7 @@ def main() -> None:
             attention_ff_dim=model_config.get("attention_ff_dim", model_config.get("region_context_dim")),
             attention_heads=model_config.get("attention_heads"),
         ).to(device)
-        load_model_state_with_geometry_compat(model, ckpt["model_state_dict"])
+        model.load_state_dict(ckpt["model_state_dict"])
         binary_obstacle_only_mode = bool(model_config.get("binary_obstacle_only", binary_obstacle_only_mode))
     else:
         model = GRULidarClassifier(
@@ -1843,7 +1817,6 @@ def main() -> None:
             "attention_heads": int(max(model.region_attention_heads.values(), default=1)),
             "region_attention_heads": model.region_attention_heads,
             "sensor_embed_dim": int(model.sensor_embed_dim),
-            "sensor_geometry_dim": int(model.sensor_geometry_dim),
             "decoder_hidden_dim": int(model.decoder_hidden_dim),
             "obstacle_context_dim": int(model.obstacle_context_dim),
             "binary_obstacle_only": bool(binary_obstacle_only_mode),
@@ -1851,14 +1824,14 @@ def main() -> None:
     param_count = sum(p.numel() for p in model.parameters())
     log(f"Model initialized: type={model_config['model_type']} params={param_count}")
     log(
-        "Causal Time-Sensor CNN layout: "
+        "Time-Sensor U-Net layout: "
         f"groups={model_config['region_sensor_groups']} "
         f"region_attention_heads={model_config.get('region_attention_heads', {})} "
         f"sensor_hidden={model_config['hidden_dim']} "
+        f"unet_depth={model.unet_depth} "
         f"global_context={model_config['fusion_hidden_dim']} "
         f"attention_ff={model_config['attention_ff_dim']} "
         f"sensor_embed={model_config['sensor_embed_dim']} "
-        f"sensor_geometry={model_config.get('sensor_geometry_dim', 'n/a')} "
         f"decoder_hidden={model_config['decoder_hidden_dim']} "
         f"obstacle_context={model_config.get('obstacle_context_dim', 'n/a')}"
     )
@@ -2149,7 +2122,7 @@ def main() -> None:
     if args.output.exists():
         log("Loading best checkpoint for final validation report")
         best_ckpt = load_checkpoint_for_device(args.output, device, device_kind)
-        load_model_state_with_geometry_compat(model, best_ckpt["model_state_dict"])
+        model.load_state_dict(best_ckpt["model_state_dict"])
     log("Running detailed validation evaluation")
     final_report = evaluate_detailed(
         model,
