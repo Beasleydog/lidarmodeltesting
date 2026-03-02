@@ -995,7 +995,12 @@ def run_epoch(
         with amp_context:
             logits, obstacle_logits, ground_none_logits = model.forward_with_aux(x, lengths)
             obstacle_targets = (y == 1).float()
-            pos_weight_t = torch.tensor(float(obstacle_pos_weight), device=obstacle_logits.device, dtype=obstacle_logits.dtype)
+            effective_obstacle_pos_weight = 1.0 if binary_obstacle_only else float(obstacle_pos_weight)
+            pos_weight_t = torch.tensor(
+                effective_obstacle_pos_weight,
+                device=obstacle_logits.device,
+                dtype=obstacle_logits.dtype,
+            )
             obstacle_loss = balanced_hard_obstacle_bce_loss(
                 obstacle_logits,
                 obstacle_targets,
@@ -1590,6 +1595,9 @@ def main() -> None:
     )
     binary_obstacle_only_mode = bool(args.binary_obstacle_only)
 
+    effective_obstacle_oversample_target_frac = (
+        0.0 if binary_obstacle_only_mode else args.obstacle_oversample_target_frac
+    )
     train_loader, val_loader, meta = build_loaders(
         data_dir=args.data_dir,
         val_fraction=args.val_fraction,
@@ -1600,7 +1608,7 @@ def main() -> None:
         max_history=args.max_history,
         histories_per_target=args.histories_per_target,
         exclude_after_teleport_steps=args.exclude_after_teleport_steps,
-        obstacle_oversample_target_frac=args.obstacle_oversample_target_frac,
+        obstacle_oversample_target_frac=effective_obstacle_oversample_target_frac,
         seed=args.seed,
     )
     if len(train_loader.dataset) == 0:
@@ -1621,6 +1629,8 @@ def main() -> None:
         f"sampled={meta['train_sampled_obstacle_target_fraction']:.3f} "
         f"counts={meta['train_obstacle_target_samples']}/{meta['train_non_obstacle_target_samples']}"
     )
+    if binary_obstacle_only_mode:
+        log("Binary obstacle-only mode disables obstacle-window oversampling; using natural sample mix.")
     log(
         "Class counts (ground, obstacle, none): "
         f"train={meta['train_class_counts']} val={meta['val_class_counts']}"
@@ -1813,7 +1823,7 @@ def main() -> None:
                 "max_history": args.max_history,
                 "histories_per_target": args.histories_per_target,
                 "exclude_after_teleport_steps": args.exclude_after_teleport_steps,
-                "obstacle_oversample_target_frac": args.obstacle_oversample_target_frac,
+                "obstacle_oversample_target_frac": effective_obstacle_oversample_target_frac,
                 "sequence_sampling": meta["sequence_sampling"],
                 "train_teleport_rows": meta["train_teleport_rows"],
                 "val_teleport_rows": meta["val_teleport_rows"],
@@ -1923,7 +1933,7 @@ def main() -> None:
                         "max_history": args.max_history,
                         "histories_per_target": args.histories_per_target,
                         "exclude_after_teleport_steps": args.exclude_after_teleport_steps,
-                        "obstacle_oversample_target_frac": args.obstacle_oversample_target_frac,
+                        "obstacle_oversample_target_frac": effective_obstacle_oversample_target_frac,
                         "sequence_sampling": meta["sequence_sampling"],
                         "class_weighting": "inactive_factorized_reference_only",
                         "class_weights_reference": class_weights_np.tolist(),
