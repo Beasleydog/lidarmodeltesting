@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+import json
+from pathlib import Path
 import time
 
 import numpy as np
@@ -106,9 +108,12 @@ LIDAR_CLASS_GROUND = 0
 LIDAR_CLASS_OBSTACLE = 1
 LIDAR_CLASS_NONE = 2
 TERRAIN_CMAP = ["#ffffff", "#f3f3f3", "#d8d8d8", "#b88e62", "#915a2b", "#5a2a10"]
-USE_MODEL_LIDAR_CLASSIFIER = False
+USE_MODEL_LIDAR_CLASSIFIER = True
 MODEL_LIDAR_CHECKPOINT_PATH = "runs/gru_lidar_classifier.pt"
 MODEL_LIDAR_MAX_HISTORY = 64
+MODEL_LIDAR_USE_CALIBRATED_BIAS = True
+MODEL_LIDAR_DEFAULT_OBSTACLE_BIAS = 0.2
+MODEL_LIDAR_BIAS_SELECTION = "best_by_accuracy"
 
 # (yaw_deg, pitch_deg) in rover frame where +X is forward, +Y is left, +Z is up.
 # Positive yaw rotates CCW from +X toward +Y. Negative pitch points downward.
@@ -859,6 +864,9 @@ def view_environment(
     model_inferencer = None
     model_inferencer_failed = False
     model_feature_history: list[np.ndarray] = []
+    last_status_len = 0
+    model_obstacle_logit_bias = float(MODEL_LIDAR_DEFAULT_OBSTACLE_BIAS)
+    last_mismatch_signature = None
     if USE_MODEL_LIDAR_CLASSIFIER:
         try:
             from train import load_gru_lidar_inferencer
@@ -867,7 +875,21 @@ def view_environment(
                 MODEL_LIDAR_CHECKPOINT_PATH,
                 max_history=MODEL_LIDAR_MAX_HISTORY,
             )
-            print(f"Model lidar classifier enabled: {MODEL_LIDAR_CHECKPOINT_PATH}")
+            if getattr(model_inferencer, "binary_obstacle_only", False) and MODEL_LIDAR_USE_CALIBRATED_BIAS:
+                sweep_path = Path(MODEL_LIDAR_CHECKPOINT_PATH).with_suffix(".threshold_sweep.json")
+                if sweep_path.exists():
+                    try:
+                        sweep_payload = json.loads(sweep_path.read_text(encoding="utf-8"))
+                        chosen = sweep_payload.get(str(MODEL_LIDAR_BIAS_SELECTION))
+                        if isinstance(chosen, dict) and "obstacle_logit_bias" in chosen:
+                            model_obstacle_logit_bias = float(chosen["obstacle_logit_bias"])
+                    except Exception as exc:
+                        print(f"Model lidar classifier threshold sweep ignored (read failed): {exc}")
+            print(
+                f"Model lidar classifier enabled: {MODEL_LIDAR_CHECKPOINT_PATH}"
+                f" binary={getattr(model_inferencer, 'binary_obstacle_only', False)}"
+                f" obstacle_bias={model_obstacle_logit_bias:+.3f}"
+            )
         except Exception as exc:
             model_inferencer_failed = True
             print(f"Model lidar classifier disabled (load failed): {exc}")
@@ -895,7 +917,7 @@ def view_environment(
     vis.add_geometry(ray_mesh, reset_bounding_box=False)
 
     def draw_dynamic() -> None:
-        nonlocal model_inferencer_failed
+        nonlocal model_inferencer_failed, last_status_len, last_mismatch_signature
         pose = compute_rover_pose(env, rover_state, height_sampler, footprint_center_local=footprint_center_local)
         if pose is None:
             return
@@ -917,13 +939,69 @@ def view_environment(
         ray_points[1::2] = scan.end_points
 
         class_ids_for_color = scan.class_ids
-        if model_inferencer is not None and not model_inferencer_failed and len(model_feature_history) > 0:
+        mismatch_summary = ""
+        feature_t = None
+        if model_inferencer is not None and not model_inferencer_failed:
+            pose_xyzyaw = np.array(
+                [rover_state.x, rover_state.y, float(pose.origin[2]), rover_state.yaw_deg],
+                dtype=np.float32,
+            )
+            feature_t = model_inferencer.featurize_timestep(pose_xyzyaw, scan.distances_cm.astype(np.float32))
             try:
-                model_pred = model_inferencer.predict_next_from_feature_history(
-                    np.asarray(model_feature_history, dtype=np.float32)
-                )
-                if model_pred.shape[0] == sensor_count:
-                    class_ids_for_color = model_pred.astype(np.int32)
+                history_for_pred = np.asarray([*model_feature_history, feature_t], dtype=np.float32)
+                if getattr(model_inferencer, "binary_obstacle_only", False):
+                    pred_obstacle_mask = model_inferencer.predict_current_obstacle_mask_from_feature_history_with_bias(
+                        history_for_pred,
+                        obstacle_logit_bias=model_obstacle_logit_bias,
+                    )
+                    actual_obstacle_mask = scan.class_ids.astype(np.int32) == 1
+                    mismatch_mask = pred_obstacle_mask != actual_obstacle_mask
+                    class_ids_for_color = np.where(pred_obstacle_mask, 1, scan.class_ids).astype(np.int32)
+                    mismatch_ids = np.flatnonzero(mismatch_mask)
+                    pred_obstacle_count = int(np.count_nonzero(pred_obstacle_mask))
+                    actual_obstacle_count = int(np.count_nonzero(actual_obstacle_mask))
+                    mismatch_summary = (
+                        f" obstacle_mismatch={int(mismatch_ids.size)}/{sensor_count}"
+                        f" pred_o={pred_obstacle_count} actual_o={actual_obstacle_count}"
+                    )
+                    if mismatch_ids.size > 0:
+                        mismatch_summary += f" ids={mismatch_ids.tolist()}"
+                    mismatch_signature = (
+                        "binary",
+                        int(mismatch_ids.size),
+                        tuple(int(i) for i in mismatch_ids.tolist()),
+                        pred_obstacle_count,
+                        actual_obstacle_count,
+                    )
+                    if mismatch_signature != last_mismatch_signature:
+                        print(
+                            "\n"
+                            f"Model check: obstacle_mismatch={int(mismatch_ids.size)}/{sensor_count}"
+                            f" pred_o={pred_obstacle_count} actual_o={actual_obstacle_count}"
+                            f" bias={model_obstacle_logit_bias:+.3f}"
+                            + (f" ids={mismatch_ids.tolist()}" if mismatch_ids.size > 0 else "")
+                        )
+                        last_mismatch_signature = mismatch_signature
+                else:
+                    model_pred = model_inferencer.predict_current_from_feature_history(history_for_pred)
+                    if model_pred.shape[0] == sensor_count:
+                        class_ids_for_color = model_pred.astype(np.int32)
+                        mismatch_ids = np.flatnonzero(class_ids_for_color != scan.class_ids.astype(np.int32))
+                        mismatch_summary = f" class_mismatch={int(mismatch_ids.size)}/{sensor_count}"
+                        if mismatch_ids.size > 0:
+                            mismatch_summary += f" ids={mismatch_ids.tolist()}"
+                        mismatch_signature = (
+                            "multiclass",
+                            int(mismatch_ids.size),
+                            tuple(int(i) for i in mismatch_ids.tolist()),
+                        )
+                        if mismatch_signature != last_mismatch_signature:
+                            print(
+                                "\n"
+                                f"Model check: class_mismatch={int(mismatch_ids.size)}/{sensor_count}"
+                                + (f" ids={mismatch_ids.tolist()}" if mismatch_ids.size > 0 else "")
+                            )
+                            last_mismatch_signature = mismatch_signature
             except Exception as exc:
                 model_inferencer_failed = True
                 print(f"Model lidar classifier disabled (runtime error): {exc}")
@@ -931,12 +1009,7 @@ def view_environment(
         for i, class_id in enumerate(class_ids_for_color):
             ray_colors[i] = hex_to_rgb01(lidar_class_id_to_color_hex(int(class_id)))
 
-        if model_inferencer is not None and not model_inferencer_failed:
-            pose_xyzyaw = np.array(
-                [rover_state.x, rover_state.y, float(pose.origin[2]), rover_state.yaw_deg],
-                dtype=np.float32,
-            )
-            feature_t = model_inferencer.featurize_timestep(pose_xyzyaw, scan.distances_cm.astype(np.float32))
+        if model_inferencer is not None and not model_inferencer_failed and feature_t is not None:
             model_feature_history.append(feature_t)
             if MODEL_LIDAR_MAX_HISTORY > 0 and len(model_feature_history) > MODEL_LIDAR_MAX_HISTORY:
                 del model_feature_history[:-MODEL_LIDAR_MAX_HISTORY]
@@ -948,10 +1021,10 @@ def view_environment(
         vis.update_geometry(rover_outline_dyn)
         vis.update_geometry(ray_mesh)
         vis.update_renderer()
-        print(
-            f"Pose x={rover_state.x:.0f} y={rover_state.y:.0f} yaw={rover_state.yaw_deg:.1f}",
-            end="\r",
-        )
+        status_text = f"Pose x={rover_state.x:.0f} y={rover_state.y:.0f} yaw={rover_state.yaw_deg:.1f}{mismatch_summary}"
+        padding = max(0, last_status_len - len(status_text))
+        print(status_text + (" " * padding), end="\r")
+        last_status_len = len(status_text)
 
     def move_forward(distance_cm: float) -> None:
         move_rover_forward(rover_state, distance_cm)

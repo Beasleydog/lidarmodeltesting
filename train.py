@@ -35,6 +35,54 @@ class NormStats:
     dist_std: float
 
 
+# Fixed rover sensor geometry used to inject explicit physical structure.
+# These match the simulator layout in environment_demo.py.
+MODEL_SENSOR_COORDS_CM = np.array(
+    [
+        (250.0, 245.0, 50.0),
+        (325.0, 75.0, 130.0),
+        (325.0, 0.0, 130.0),
+        (325.0, -75.0, 130.0),
+        (250.0, -245.0, 50.0),
+        (325.0, 75.0, 130.0),
+        (325.0, -75.0, 130.0),
+        (40.0, 235.0, 100.0),
+        (40.0, -235.0, 100.0),
+        (-215.0, 270.0, 70.0),
+        (-320.0, 80.0, 10.0),
+        (-320.0, -50.0, 10.0),
+        (-215.0, -215.0, 70.0),
+        (325.0, 75.0, 130.0),
+        (325.0, -75.0, 130.0),
+        (250.0, 245.0, 50.0),
+        (250.0, -245.0, 50.0),
+    ],
+    dtype=np.float32,
+)
+MODEL_SENSOR_YAW_PITCH_DEG = np.array(
+    [
+        (30.0, 0.0),
+        (20.0, -20.0),
+        (0.0, 0.0),
+        (-20.0, -20.0),
+        (-30.0, 0.0),
+        (0.0, -25.0),
+        (0.0, -25.0),
+        (90.0, -20.0),
+        (-90.0, -20.0),
+        (140.0, 0.0),
+        (180.0, 0.0),
+        (180.0, 0.0),
+        (-140.0, 0.0),
+        (20.0, -10.0),
+        (-20.0, -10.0),
+        (15.0, 0.0),
+        (-15.0, 0.0),
+    ],
+    dtype=np.float32,
+)
+
+
 _LOG_FILE: TextIO | None = None
 
 
@@ -57,6 +105,59 @@ def log(message: str) -> None:
 
 def log_plain(message: str) -> None:
     _emit_log_line(message)
+
+
+def build_sensor_geometry_features(
+    num_sensors: int,
+    region_sensor_groups: dict[str, list[int]],
+) -> np.ndarray:
+    num_sensors_i = int(num_sensors)
+    region_names = list(region_sensor_groups.keys())
+    region_dim = max(1, len(region_names))
+    geom_dim = 7 + region_dim
+    out = np.zeros((num_sensors_i, geom_dim), dtype=np.float32)
+
+    base_count = min(num_sensors_i, int(MODEL_SENSOR_COORDS_CM.shape[0]), int(MODEL_SENSOR_YAW_PITCH_DEG.shape[0]))
+    if base_count > 0:
+        coords = MODEL_SENSOR_COORDS_CM[:base_count].astype(np.float32, copy=True)
+        coord_scale = np.maximum(np.max(np.abs(MODEL_SENSOR_COORDS_CM), axis=0), 1.0).astype(np.float32)
+        coords = coords / coord_scale
+
+        yaw_pitch = MODEL_SENSOR_YAW_PITCH_DEG[:base_count]
+        yaw_rad = np.deg2rad(yaw_pitch[:, 0].astype(np.float32))
+        pitch_rad = np.deg2rad(yaw_pitch[:, 1].astype(np.float32))
+
+        out[:base_count, 0] = np.sin(yaw_rad)
+        out[:base_count, 1] = np.cos(yaw_rad)
+        out[:base_count, 2] = np.sin(pitch_rad)
+        out[:base_count, 3] = np.cos(pitch_rad)
+        out[:base_count, 4:7] = coords
+
+    region_lookup: dict[int, int] = {}
+    for region_idx, sensor_ids in enumerate(region_sensor_groups.values()):
+        for sensor_id in sensor_ids:
+            sid = int(sensor_id)
+            if 0 <= sid < num_sensors_i:
+                region_lookup[sid] = region_idx
+
+    default_region_idx = 0
+    for sensor_id in range(num_sensors_i):
+        region_idx = region_lookup.get(sensor_id, default_region_idx)
+        out[sensor_id, 7 + region_idx] = 1.0
+
+    return out
+
+
+def load_model_state_with_geometry_compat(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> None:
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    allowed_missing = {"sensor_geometry_proj.weight"}
+    missing = set(incompatible.missing_keys)
+    unexpected = set(incompatible.unexpected_keys)
+    if unexpected:
+        raise RuntimeError(f"Unexpected checkpoint keys: {sorted(unexpected)}")
+    disallowed_missing = missing - allowed_missing
+    if disallowed_missing:
+        raise RuntimeError(f"Missing checkpoint keys: {sorted(disallowed_missing)}")
 
 
 def resolve_data_loader_workers(requested: int) -> int:
@@ -507,7 +608,16 @@ class GRULidarClassifier(nn.Module):
             torch.tensor(self.sensor_restore_list, dtype=torch.long),
             persistent=False,
         )
+        sensor_geometry_np = build_sensor_geometry_features(self.num_sensors, self.region_sensor_groups)
+        self.register_buffer(
+            "sensor_geometry",
+            torch.from_numpy(sensor_geometry_np),
+            persistent=False,
+        )
+        self.sensor_geometry_dim = int(sensor_geometry_np.shape[1])
         self.sensor_embedding = nn.Embedding(self.num_sensors, self.sensor_embed_dim)
+        self.sensor_geometry_proj = nn.Linear(self.sensor_geometry_dim, self.sensor_embed_dim, bias=False)
+        nn.init.zeros_(self.sensor_geometry_proj.weight)
         self.input_feature_dim = 17 + self.sensor_embed_dim
         self.stem = nn.Conv2d(self.input_feature_dim, self.hidden_dim, kernel_size=1)
         self.stem_norm = nn.GroupNorm(1, self.hidden_dim)
@@ -557,7 +667,9 @@ class GRULidarClassifier(nn.Module):
     def _shift_time(self, values: torch.Tensor, steps: int) -> torch.Tensor:
         steps_i = max(1, int(steps))
         prefix = values[:, :1, :].expand(-1, steps_i, -1)
-        return torch.cat([prefix, values[:, :-steps_i, :]], dim=1)
+        # Keep the shifted tensor the same length as the input, even when the
+        # requested shift is longer than the available history.
+        return torch.cat([prefix, values], dim=1)[:, : values.shape[1], :]
 
     def _shift_sensor(self, values: torch.Tensor, offset: int) -> torch.Tensor:
         if offset < 0:
@@ -608,6 +720,10 @@ class GRULidarClassifier(nn.Module):
         sensor_embed = self.sensor_embedding(self.sensor_order.to(device=x.device))
         sensor_embed = sensor_embed.view(1, 1, self.num_sensors, self.sensor_embed_dim)
         sensor_embed = sensor_embed.expand(batch_size, time_steps, -1, -1)
+        sensor_geometry = self.sensor_geometry.index_select(0, self.sensor_order.to(device=x.device))
+        sensor_geometry = sensor_geometry.view(1, 1, self.num_sensors, self.sensor_geometry_dim)
+        sensor_geometry = sensor_geometry.expand(batch_size, time_steps, -1, -1)
+        sensor_token = sensor_embed + self.sensor_geometry_proj(sensor_geometry).to(dtype=sensor_embed.dtype)
 
         feats = torch.cat(
             [
@@ -622,7 +738,7 @@ class GRULidarClassifier(nn.Module):
                 right_delta.unsqueeze(-1),
                 pose_expand,
                 pose_delta_expand,
-                sensor_embed,
+                sensor_token,
             ],
             dim=-1,
         )
@@ -688,6 +804,9 @@ class GRULidarClassifier(nn.Module):
         global_expand = global_latent.unsqueeze(1).expand(-1, self.num_sensors, -1)
         sensor_embed = self.sensor_embedding(self.sensor_order.to(device=last_features.device)).unsqueeze(0)
         sensor_embed = sensor_embed.expand(batch_size, -1, -1).to(dtype=last_features.dtype)
+        sensor_geometry = self.sensor_geometry.index_select(0, self.sensor_order.to(device=last_features.device)).unsqueeze(0)
+        sensor_geometry = sensor_geometry.expand(batch_size, -1, -1).to(dtype=last_features.dtype)
+        sensor_token = sensor_embed + self.sensor_geometry_proj(sensor_geometry).to(dtype=last_features.dtype)
         pose_expand = current_pose.unsqueeze(1).expand(-1, self.num_sensors, -1)
         pose_delta_expand = current_pose_delta.unsqueeze(1).expand(-1, self.num_sensors, -1)
 
@@ -697,7 +816,7 @@ class GRULidarClassifier(nn.Module):
                 self.neighbor_proj(neighbor_latent),
                 self.region_proj(region_latent),
                 global_expand,
-                sensor_embed,
+                sensor_token,
                 pose_expand,
                 pose_delta_expand,
                 current_local,
@@ -797,6 +916,7 @@ class GRULidarInferencer:
         num_sensors: int,
         input_dim: int,
         max_history: int = 64,
+        binary_obstacle_only: bool = False,
     ):
         self.model = model.eval()
         self.stats = stats
@@ -804,11 +924,12 @@ class GRULidarInferencer:
         self.num_sensors = int(num_sensors)
         self.input_dim = int(input_dim)
         self.max_history = int(max_history)
+        self.binary_obstacle_only = bool(binary_obstacle_only)
 
     def featurize_timestep(self, pose_xyzyaw: np.ndarray, lidar_cm: np.ndarray) -> np.ndarray:
         return featurize_timestep(pose_xyzyaw, lidar_cm, self.stats)
 
-    def predict_current_from_feature_history(self, feature_history: np.ndarray) -> np.ndarray:
+    def _prepare_history_tensor(self, feature_history: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
         if feature_history.ndim != 2:
             raise ValueError("feature_history must be shape [T, F]")
         if feature_history.shape[1] != self.input_dim:
@@ -821,9 +942,38 @@ class GRULidarInferencer:
 
         x = torch.from_numpy(feature_history.astype(np.float32)).unsqueeze(0).to(self.device)
         lengths = torch.tensor([x.shape[1]], dtype=torch.long, device=self.device)
+        return x, lengths
+
+    def predict_current_from_feature_history(self, feature_history: np.ndarray) -> np.ndarray:
+        x, lengths = self._prepare_history_tensor(feature_history)
         with torch.no_grad():
             logits = self.model(x, lengths)
             pred = torch.argmax(logits, dim=-1).squeeze(0).cpu().numpy().astype(np.int64)
+        if pred.shape[0] != self.num_sensors:
+            raise RuntimeError(f"predicted {pred.shape[0]} sensors, expected {self.num_sensors}")
+        return pred
+
+    def predict_current_obstacle_mask_from_feature_history(self, feature_history: np.ndarray) -> np.ndarray:
+        return self.predict_current_obstacle_mask_from_feature_history_with_bias(feature_history, obstacle_logit_bias=0.0)
+
+    def predict_current_obstacle_logits_from_feature_history(self, feature_history: np.ndarray) -> np.ndarray:
+        x, lengths = self._prepare_history_tensor(feature_history)
+        with torch.no_grad():
+            obstacle_logits = predict_eval_obstacle_logits(self.model, x, lengths)
+            pred = obstacle_logits.squeeze(0).cpu().numpy().astype(np.float32)
+        if pred.shape[0] != self.num_sensors:
+            raise RuntimeError(f"predicted {pred.shape[0]} sensors, expected {self.num_sensors}")
+        return pred
+
+    def predict_current_obstacle_mask_from_feature_history_with_bias(
+        self,
+        feature_history: np.ndarray,
+        obstacle_logit_bias: float = 0.0,
+    ) -> np.ndarray:
+        x, lengths = self._prepare_history_tensor(feature_history)
+        with torch.no_grad():
+            obstacle_logits = predict_eval_obstacle_logits(self.model, x, lengths, obstacle_logit_bias=obstacle_logit_bias)
+            pred = (obstacle_logits > 0).squeeze(0).cpu().numpy().astype(bool)
         if pred.shape[0] != self.num_sensors:
             raise RuntimeError(f"predicted {pred.shape[0]} sensors, expected {self.num_sensors}")
         return pred
@@ -891,7 +1041,7 @@ def load_gru_lidar_inferencer(
         attention_ff_dim=cfg.get("attention_ff_dim", cfg.get("region_context_dim")),
         attention_heads=cfg.get("attention_heads"),
     ).to(device_t)
-    model.load_state_dict(ckpt["model_state_dict"])
+    load_model_state_with_geometry_compat(model, ckpt["model_state_dict"])
     model.eval()
 
     norm = ckpt["norm"]
@@ -910,6 +1060,7 @@ def load_gru_lidar_inferencer(
         num_sensors=int(cfg["num_sensors"]),
         input_dim=int(cfg["input_dim"]),
         max_history=int(max_history),
+        binary_obstacle_only=bool(ckpt.get("meta", {}).get("binary_obstacle_only", False)),
     )
 
 
@@ -1667,7 +1818,7 @@ def main() -> None:
             attention_ff_dim=model_config.get("attention_ff_dim", model_config.get("region_context_dim")),
             attention_heads=model_config.get("attention_heads"),
         ).to(device)
-        model.load_state_dict(ckpt["model_state_dict"])
+        load_model_state_with_geometry_compat(model, ckpt["model_state_dict"])
         binary_obstacle_only_mode = bool(model_config.get("binary_obstacle_only", binary_obstacle_only_mode))
     else:
         model = GRULidarClassifier(
@@ -1692,6 +1843,7 @@ def main() -> None:
             "attention_heads": int(max(model.region_attention_heads.values(), default=1)),
             "region_attention_heads": model.region_attention_heads,
             "sensor_embed_dim": int(model.sensor_embed_dim),
+            "sensor_geometry_dim": int(model.sensor_geometry_dim),
             "decoder_hidden_dim": int(model.decoder_hidden_dim),
             "obstacle_context_dim": int(model.obstacle_context_dim),
             "binary_obstacle_only": bool(binary_obstacle_only_mode),
@@ -1706,6 +1858,7 @@ def main() -> None:
         f"global_context={model_config['fusion_hidden_dim']} "
         f"attention_ff={model_config['attention_ff_dim']} "
         f"sensor_embed={model_config['sensor_embed_dim']} "
+        f"sensor_geometry={model_config.get('sensor_geometry_dim', 'n/a')} "
         f"decoder_hidden={model_config['decoder_hidden_dim']} "
         f"obstacle_context={model_config.get('obstacle_context_dim', 'n/a')}"
     )
@@ -1996,7 +2149,7 @@ def main() -> None:
     if args.output.exists():
         log("Loading best checkpoint for final validation report")
         best_ckpt = load_checkpoint_for_device(args.output, device, device_kind)
-        model.load_state_dict(best_ckpt["model_state_dict"])
+        load_model_state_with_geometry_compat(model, best_ckpt["model_state_dict"])
     log("Running detailed validation evaluation")
     final_report = evaluate_detailed(
         model,
