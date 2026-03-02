@@ -937,6 +937,8 @@ def run_epoch(
     obstacle_aux_weight: float = 1.0,
     obstacle_pos_weight: float = 1.0,
     hard_example_fraction: float = 0.25,
+    obstacle_primary_loss_weight: float = 2.0,
+    safe_type_loss_weight: float = 0.2,
     use_amp: bool = False,
     grad_scaler=None,
 ) -> tuple[float, float]:
@@ -989,7 +991,10 @@ def run_epoch(
                 )
             else:
                 safe_type_loss = obstacle_loss.new_zeros(())
-            loss = obstacle_loss + (0.5 * safe_type_loss)
+            loss = (
+                (float(obstacle_primary_loss_weight) * obstacle_loss)
+                + (float(safe_type_loss_weight) * safe_type_loss)
+            )
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -1482,6 +1487,8 @@ def main() -> None:
     parser.add_argument("--obstacle-aux-weight", type=float, default=0.35)
     parser.add_argument("--obstacle-pos-weight-cap", type=float, default=4.0)
     parser.add_argument("--hard-example-fraction", type=float, default=1.0)
+    parser.add_argument("--obstacle-primary-loss-weight", type=float, default=2.0)
+    parser.add_argument("--safe-type-loss-weight", type=float, default=0.2)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--plateau-factor", type=float, default=0.5)
     parser.add_argument("--plateau-patience", type=int, default=1)
@@ -1697,7 +1704,9 @@ def main() -> None:
     )
     log(
         "Using obstacle-first heads: obstacle-vs-non-obstacle primary plus ground-vs-none on non-obstacle rays "
-        f"hard_example_fraction={args.hard_example_fraction:.3f}"
+        f"hard_example_fraction={args.hard_example_fraction:.3f} "
+        f"obstacle_primary_loss_weight={args.obstacle_primary_loss_weight:.3f} "
+        f"safe_type_loss_weight={args.safe_type_loss_weight:.3f}"
     )
     log(
         "Legacy class-weight/focal settings are ignored by the obstacle-first loss; "
@@ -1768,6 +1777,8 @@ def main() -> None:
             obstacle_aux_weight=args.obstacle_aux_weight,
             obstacle_pos_weight=obstacle_pos_weight,
             hard_example_fraction=args.hard_example_fraction,
+            obstacle_primary_loss_weight=args.obstacle_primary_loss_weight,
+            safe_type_loss_weight=args.safe_type_loss_weight,
             use_amp=amp_enabled,
             grad_scaler=grad_scaler,
         )
@@ -1789,6 +1800,8 @@ def main() -> None:
             obstacle_aux_weight=args.obstacle_aux_weight,
             obstacle_pos_weight=obstacle_pos_weight,
             hard_example_fraction=args.hard_example_fraction,
+            obstacle_primary_loss_weight=args.obstacle_primary_loss_weight,
+            safe_type_loss_weight=args.safe_type_loss_weight,
             use_amp=amp_enabled,
         )
         scheduler.step(val_loss)
