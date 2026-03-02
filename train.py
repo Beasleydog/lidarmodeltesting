@@ -1001,12 +1001,19 @@ def run_epoch(
                 device=obstacle_logits.device,
                 dtype=obstacle_logits.dtype,
             )
-            obstacle_loss = balanced_hard_obstacle_bce_loss(
-                obstacle_logits,
-                obstacle_targets,
-                pos_weight=pos_weight_t,
-                hard_fraction=hard_example_fraction,
-            )
+            if binary_obstacle_only:
+                obstacle_loss = F.binary_cross_entropy_with_logits(
+                    obstacle_logits,
+                    obstacle_targets,
+                    reduction="mean",
+                )
+            else:
+                obstacle_loss = balanced_hard_obstacle_bce_loss(
+                    obstacle_logits,
+                    obstacle_targets,
+                    pos_weight=pos_weight_t,
+                    hard_fraction=hard_example_fraction,
+                )
             safe_mask = y != 1
             if safe_mask.any():
                 ground_none_targets = (y[safe_mask] == 0).float()
@@ -1018,7 +1025,7 @@ def run_epoch(
             else:
                 safe_type_loss = obstacle_loss.new_zeros(())
             if binary_obstacle_only:
-                loss = float(obstacle_primary_loss_weight) * obstacle_loss
+                loss = obstacle_loss
             else:
                 loss = (
                     (float(obstacle_primary_loss_weight) * obstacle_loss)
@@ -1788,8 +1795,9 @@ def main() -> None:
     if binary_obstacle_only_mode:
         log(
             "Using binary obstacle-only training: obstacle-vs-non-obstacle only "
-            f"hard_example_fraction={args.hard_example_fraction:.3f} "
-            f"obstacle_primary_loss_weight={args.obstacle_primary_loss_weight:.3f}"
+            "with plain BCE on all rays "
+            f"(hard_example_fraction and obstacle_primary_loss_weight ignored: "
+            f"{args.hard_example_fraction:.3f}, {args.obstacle_primary_loss_weight:.3f})"
         )
         log(
             "Ground-vs-none refinement is disabled for this experiment; "
