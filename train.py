@@ -324,13 +324,17 @@ class SequencePieceDataset(Dataset):
         max_history: int,
         histories_per_target: int = 3,
         exclude_after_teleport_steps: int = 1,
+        history_step_min: int = 1,
+        history_step_max: int = 4,
         seed: int = 0,
     ):
         self.features_by_world = features_by_world
         self.targets_by_world = targets_by_world
         self.histories_per_target = int(max(histories_per_target, 1))
         self.exclude_after_teleport_steps = int(max(exclude_after_teleport_steps, 0))
-        self.index: list[tuple[int, int, int]] = []
+        self.history_step_min = int(max(history_step_min, 1))
+        self.history_step_max = int(max(history_step_max, self.history_step_min))
+        self.index: list[tuple[int, np.ndarray, int]] = []
         self.sample_has_obstacle_target: list[bool] = []
         rng = np.random.default_rng(seed)
 
@@ -346,13 +350,29 @@ class SequencePieceDataset(Dataset):
             for end in range(t_steps):
                 if invalid_targets[end]:
                     continue
-                # Sequence is [start:end+1), predict class at end.
-                history_max = end + 1 if max_history <= 0 else min(end + 1, max_history)
+                history_max = self._max_history_length_for_end(
+                    end,
+                    max_history,
+                    self.history_step_min,
+                )
                 history_lengths = self._sample_history_lengths(history_max, self.histories_per_target, rng)
                 for hist_len in history_lengths:
-                    start = end + 1 - hist_len
-                    self.index.append((wi, start, end))
+                    time_indices = self._sample_history_indices(
+                        end,
+                        hist_len,
+                        self.history_step_min,
+                        self.history_step_max,
+                        rng,
+                    )
+                    self.index.append((wi, time_indices, end))
                     self.sample_has_obstacle_target.append(bool(np.any(self.targets_by_world[wi][end] == 1)))
+
+    @staticmethod
+    def _max_history_length_for_end(end: int, max_history: int, step_min: int) -> int:
+        feasible_from_start = (int(end) // max(int(step_min), 1)) + 1
+        if max_history <= 0:
+            return feasible_from_start
+        return min(feasible_from_start, int(max_history))
 
     @staticmethod
     def _sample_history_lengths(history_max: int, k: int, rng: np.random.Generator) -> list[int]:
@@ -375,12 +395,43 @@ class SequencePieceDataset(Dataset):
             lengths.extend(int(v) for v in sampled.tolist())
         return sorted(set(lengths))
 
+    @staticmethod
+    def _sample_history_indices(
+        end: int,
+        hist_len: int,
+        step_min: int,
+        step_max: int,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        if hist_len <= 1:
+            return np.asarray([int(end)], dtype=np.int64)
+
+        step_min_i = max(int(step_min), 1)
+        step_max_i = max(int(step_max), step_min_i)
+        cursor = int(end)
+        reverse_indices = [cursor]
+        total_back_steps = hist_len - 1
+
+        for pick_idx in range(total_back_steps):
+            remaining_after_pick = total_back_steps - pick_idx - 1
+            min_prev_index = remaining_after_pick * step_min_i
+            max_allowed_step = min(step_max_i, cursor - min_prev_index)
+            if max_allowed_step <= step_min_i:
+                step = max_allowed_step
+            else:
+                step = int(rng.integers(step_min_i, max_allowed_step + 1))
+            cursor -= max(step, 1)
+            reverse_indices.append(cursor)
+
+        reverse_indices.reverse()
+        return np.asarray(reverse_indices, dtype=np.int64)
+
     def __len__(self) -> int:
         return len(self.index)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        wi, start, end = self.index[idx]
-        x = self.features_by_world[wi][start : end + 1]
+        wi, time_indices, end = self.index[idx]
+        x = self.features_by_world[wi][time_indices]
         y = self.targets_by_world[wi][end]
         return torch.from_numpy(x), torch.from_numpy(y)
 
@@ -997,6 +1048,200 @@ class GRULidarClassifier(nn.Module):
         return class_logits
 
 
+class LegacyCausalTSCNNClassifier(GRULidarClassifier):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        num_layers: int,
+        num_sensors: int,
+        num_classes: int,
+        dropout: float,
+        region_sensor_groups: dict[str, list[int]] | None = None,
+        region_hidden_dims: dict[str, int] | None = None,
+        fusion_hidden_dim: int | None = None,
+        sensor_embed_dim: int | None = None,
+        decoder_hidden_dim: int | None = None,
+        attention_ff_dim: int | None = None,
+        attention_heads: int | None = None,
+        region_context_dim: int | None = None,
+    ):
+        del region_hidden_dims, attention_heads
+        nn.Module.__init__(self)
+        self.model_type = "obstacle_first_causal_tscnn"
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.num_layers = int(num_layers)
+        self.num_sensors = int(num_sensors)
+        self.num_classes = int(num_classes)
+
+        if self.input_dim != 4 + 2 * self.num_sensors:
+            raise ValueError(
+                f"obstacle_first_causal_tscnn expects input_dim=4+2*num_sensors; got input_dim={self.input_dim} "
+                f"for num_sensors={self.num_sensors}"
+            )
+
+        self.region_sensor_groups = _normalize_region_sensor_groups(region_sensor_groups, self.num_sensors)
+        self.sensor_order_list = _build_sensor_processing_order(self.region_sensor_groups, self.num_sensors)
+        self.sensor_restore_list = [0] * self.num_sensors
+        for ordered_idx, sensor_id in enumerate(self.sensor_order_list):
+            self.sensor_restore_list[int(sensor_id)] = int(ordered_idx)
+        self.fusion_hidden_dim = (
+            max(48, self.hidden_dim)
+            if fusion_hidden_dim is None
+            else max(8, int(fusion_hidden_dim))
+        )
+        self.sensor_embed_dim = (
+            max(4, min(16, int(round(self.hidden_dim * 0.25))))
+            if sensor_embed_dim is None
+            else max(2, int(sensor_embed_dim))
+        )
+        ff_ref = attention_ff_dim if attention_ff_dim is not None else region_context_dim
+        self.attention_ff_dim = (
+            max(48, max(self.hidden_dim, self.fusion_hidden_dim))
+            if ff_ref is None
+            else max(8, int(ff_ref))
+        )
+        self.decoder_hidden_dim = (
+            max(48, max(self.hidden_dim, self.fusion_hidden_dim))
+            if decoder_hidden_dim is None
+            else max(8, int(decoder_hidden_dim))
+        )
+
+        self.register_buffer("sensor_order", torch.tensor(self.sensor_order_list, dtype=torch.long), persistent=False)
+        self.register_buffer(
+            "sensor_restore",
+            torch.tensor(self.sensor_restore_list, dtype=torch.long),
+            persistent=False,
+        )
+        self.sensor_embedding = nn.Embedding(self.num_sensors, self.sensor_embed_dim)
+        self.input_feature_dim = 17 + self.sensor_embed_dim
+        self.stem = nn.Conv2d(self.input_feature_dim, self.hidden_dim, kernel_size=1)
+        self.stem_norm = nn.GroupNorm(1, self.hidden_dim)
+        self.blocks = nn.ModuleList(
+            [CausalTimeSensorBlock(self.hidden_dim, 2 ** min(i, 3), dropout) for i in range(max(1, self.num_layers))]
+        )
+        self.backbone_depth = len(self.blocks)
+        self.backbone_dropout = nn.Dropout2d(dropout)
+        self.global_proj = nn.Linear(self.hidden_dim, self.fusion_hidden_dim)
+        self.region_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.neighbor_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+
+        decoder_in_dim = (
+            self.hidden_dim
+            + self.hidden_dim
+            + self.hidden_dim
+            + self.fusion_hidden_dim
+            + self.sensor_embed_dim
+            + 8
+            + 9
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(decoder_in_dim, self.decoder_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.decoder_hidden_dim, self.decoder_hidden_dim),
+            nn.GELU(),
+        )
+        self.obstacle_context_dim = self.hidden_dim + 3
+        self.safe_type_decoder = nn.Sequential(
+            nn.Linear(self.decoder_hidden_dim + self.obstacle_context_dim, self.decoder_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.decoder_hidden_dim, self.decoder_hidden_dim),
+            nn.GELU(),
+        )
+        self.obstacle_head = nn.Linear(self.decoder_hidden_dim, 1)
+        self.safe_type_head = nn.Linear(self.decoder_hidden_dim, 1)
+        self.region_attention_heads = {
+            name: max(1, min(len(ids), 1)) for name, ids in self.region_sensor_groups.items()
+        }
+
+    def _encode(
+        self, x: torch.Tensor, lengths: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        del lengths
+        feats, current_local, current_pose, current_pose_delta = self._build_spatiotemporal_input(x)
+        conv_in = feats.permute(0, 3, 1, 2).contiguous()
+        h = F.gelu(self.stem_norm(self.stem(conv_in)))
+        h = self.backbone_dropout(h)
+        for block in self.blocks:
+            h = block(h)
+        h_bt = h.permute(0, 2, 3, 1).contiguous()
+        last_features = h_bt[:, -1, :, :]
+        current_local = current_local.to(dtype=last_features.dtype)
+        current_pose = current_pose.to(dtype=last_features.dtype)
+        current_pose_delta = current_pose_delta.to(dtype=last_features.dtype)
+        return last_features, current_local, current_pose, current_pose_delta
+
+    def _forward_details(self, x: torch.Tensor, lengths: torch.Tensor) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+        last_features, current_local, current_pose, current_pose_delta = self._encode(x, lengths)
+        decoder_in, obstacle_context = self._build_decoder_inputs(
+            last_features,
+            current_local,
+            current_pose,
+            current_pose_delta,
+        )
+        decoder_out = self.decoder(decoder_in)
+        obstacle_logits_ordered = self.obstacle_head(decoder_out).squeeze(-1)
+        safe_type_hidden = self.safe_type_decoder(torch.cat([decoder_out, obstacle_context], dim=-1))
+        ground_none_logits_ordered = self.safe_type_head(safe_type_hidden).squeeze(-1)
+        obstacle_logits = self._restore_sensor_tensor(obstacle_logits_ordered)
+        ground_none_logits = self._restore_sensor_tensor(ground_none_logits_ordered)
+        class_logits = obstacle_first_binary_logits_to_class_logits(obstacle_logits, ground_none_logits)
+        return {
+            "class_logits": class_logits,
+            "obstacle_logits": obstacle_logits,
+            "ground_none_logits": ground_none_logits,
+            "aux_obstacle_logits": [],
+        }
+
+
+def infer_checkpoint_model_type(
+    model_config: dict,
+    state_dict: dict[str, torch.Tensor] | None = None,
+) -> str:
+    cfg_type = str(model_config.get("model_type", "")).strip()
+    if state_dict:
+        state_keys = list(state_dict.keys())
+        if any(key.startswith("encoder_blocks.") or key.startswith("downsample_blocks.") for key in state_keys):
+            return "obstacle_first_tsunet"
+        if any(key.startswith("blocks.") for key in state_keys):
+            return "obstacle_first_causal_tscnn"
+    if cfg_type in {"obstacle_first_tsunet", "obstacle_first_causal_tscnn"}:
+        return cfg_type
+    raise ValueError(
+        f"Checkpoint model_type={cfg_type!r} is not supported by this build. "
+        "Supported types: obstacle_first_causal_tscnn, obstacle_first_tsunet."
+    )
+
+
+def build_lidar_model_from_config(
+    model_config: dict,
+    state_dict: dict[str, torch.Tensor] | None = None,
+) -> nn.Module:
+    resolved_model_type = infer_checkpoint_model_type(model_config, state_dict)
+    common_kwargs = dict(
+        input_dim=int(model_config["input_dim"]),
+        hidden_dim=int(model_config["hidden_dim"]),
+        num_layers=int(model_config["num_layers"]),
+        num_sensors=int(model_config["num_sensors"]),
+        num_classes=int(model_config["num_classes"]),
+        dropout=float(model_config["dropout"]),
+        region_sensor_groups=model_config.get("region_sensor_groups"),
+        fusion_hidden_dim=model_config.get("fusion_hidden_dim"),
+        sensor_embed_dim=model_config.get("sensor_embed_dim"),
+        decoder_hidden_dim=model_config.get("decoder_hidden_dim"),
+        attention_ff_dim=model_config.get("attention_ff_dim", model_config.get("region_context_dim")),
+        attention_heads=model_config.get("attention_heads"),
+    )
+    if resolved_model_type == "obstacle_first_tsunet":
+        return GRULidarClassifier(**common_kwargs)
+    if resolved_model_type == "obstacle_first_causal_tscnn":
+        return LegacyCausalTSCNNClassifier(**common_kwargs)
+    raise ValueError(f"Unsupported resolved model_type={resolved_model_type!r}")
+
+
 def obstacle_first_binary_logits_to_class_logits(
     obstacle_logits: torch.Tensor,
     ground_none_logits: torch.Tensor,
@@ -1053,7 +1298,7 @@ def predict_eval_obstacle_logits(
 class GRULidarInferencer:
     def __init__(
         self,
-        model: GRULidarClassifier,
+        model: nn.Module,
         stats: NormStats,
         device: torch.device,
         num_sensors: int,
@@ -1164,26 +1409,9 @@ def load_gru_lidar_inferencer(
         device_kind = str(device_t.type)
 
     ckpt = load_checkpoint_for_device(checkpoint_path, device_t, device_kind)
-    cfg = ckpt["model_config"]
-    if cfg.get("model_type") != "obstacle_first_tsunet":
-        raise ValueError(
-            f"Checkpoint model_type={cfg.get('model_type')!r} is not supported by this build. "
-            "Retrain with the obstacle_first_tsunet architecture."
-        )
-    model = GRULidarClassifier(
-        input_dim=int(cfg["input_dim"]),
-        hidden_dim=int(cfg["hidden_dim"]),
-        num_layers=int(cfg["num_layers"]),
-        num_sensors=int(cfg["num_sensors"]),
-        num_classes=int(cfg["num_classes"]),
-        dropout=float(cfg["dropout"]),
-        region_sensor_groups=cfg.get("region_sensor_groups"),
-        fusion_hidden_dim=cfg.get("fusion_hidden_dim"),
-        sensor_embed_dim=cfg.get("sensor_embed_dim"),
-        decoder_hidden_dim=cfg.get("decoder_hidden_dim"),
-        attention_ff_dim=cfg.get("attention_ff_dim", cfg.get("region_context_dim")),
-        attention_heads=cfg.get("attention_heads"),
-    ).to(device_t)
+    cfg = dict(ckpt["model_config"])
+    cfg["model_type"] = infer_checkpoint_model_type(cfg, ckpt.get("model_state_dict"))
+    model = build_lidar_model_from_config(cfg, ckpt.get("model_state_dict")).to(device_t)
     load_model_state_with_compat(model, ckpt["model_state_dict"])
     model.eval()
 
@@ -1663,6 +1891,8 @@ def build_loaders(
     max_history: int,
     histories_per_target: int,
     exclude_after_teleport_steps: int,
+    history_step_min: int,
+    history_step_max: int,
     obstacle_oversample_target_frac: float,
     seed: int,
 ) -> tuple[DataLoader, DataLoader, dict]:
@@ -1736,7 +1966,8 @@ def build_loaders(
 
     log(
         "Constructing sequence-piece datasets "
-        f"(sampled histories_per_target={histories_per_target})"
+        f"(sampled histories_per_target={histories_per_target} "
+        f"history_step_range={max(1, int(history_step_min))}..{max(int(history_step_min), int(history_step_max))})"
     )
     train_ds = SequencePieceDataset(
         list(train_feats),
@@ -1745,6 +1976,8 @@ def build_loaders(
         max_history=max_history,
         histories_per_target=histories_per_target,
         exclude_after_teleport_steps=exclude_after_teleport_steps,
+        history_step_min=history_step_min,
+        history_step_max=history_step_max,
         seed=seed,
     )
     val_ds = SequencePieceDataset(
@@ -1754,6 +1987,8 @@ def build_loaders(
         max_history=max_history,
         histories_per_target=histories_per_target,
         exclude_after_teleport_steps=exclude_after_teleport_steps,
+        history_step_min=history_step_min,
+        history_step_max=history_step_max,
         seed=seed + 1,
     )
     log(f"Dataset samples -> train={len(train_ds)} val={len(val_ds)}")
@@ -1822,7 +2057,9 @@ def build_loaders(
         "num_classes": 3,
         "histories_per_target": int(histories_per_target),
         "exclude_after_teleport_steps": int(exclude_after_teleport_steps),
-        "sequence_sampling": "sampled_per_target",
+        "history_step_min": int(max(history_step_min, 1)),
+        "history_step_max": int(max(history_step_max, max(history_step_min, 1))),
+        "sequence_sampling": "sampled_per_target_variable_step",
         "obstacle_oversample_target_frac": float(obstacle_oversample_target_frac),
         "train_obstacle_target_samples": int(oversample_meta["obstacle_samples"]),
         "train_non_obstacle_target_samples": int(oversample_meta["non_obstacle_samples"]),
@@ -1869,6 +2106,8 @@ def main() -> None:
     parser.add_argument("--max-history", type=int, default=64)
     parser.add_argument("--histories-per-target", type=int, default=3)
     parser.add_argument("--exclude-after-teleport-steps", type=int, default=1)
+    parser.add_argument("--history-step-min", type=int, default=1)
+    parser.add_argument("--history-step-max", type=int, default=4)
     parser.add_argument("--obstacle-oversample-target-frac", type=float, default=0.50)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--log-every-batches", type=int, default=25)
@@ -1937,6 +2176,8 @@ def main() -> None:
         max_history=args.max_history,
         histories_per_target=args.histories_per_target,
         exclude_after_teleport_steps=args.exclude_after_teleport_steps,
+        history_step_min=args.history_step_min,
+        history_step_max=args.history_step_max,
         obstacle_oversample_target_frac=effective_obstacle_oversample_target_frac,
         seed=args.seed,
     )
@@ -1951,6 +2192,11 @@ def main() -> None:
         "Teleport rows: "
         f"train={meta['train_teleport_rows']} val={meta['val_teleport_rows']} "
         f"(exclude_after_teleport_steps={meta['exclude_after_teleport_steps']})"
+    )
+    log(
+        "History sampling: "
+        f"length<= {args.max_history} sampled={meta['histories_per_target']} "
+        f"step_range={meta['history_step_min']}..{meta['history_step_max']}"
     )
     log(
         "Obstacle-target sample mix: "
@@ -1969,26 +2215,9 @@ def main() -> None:
     if args.eval_checkpoint is not None:
         log(f"Eval-only mode: loading checkpoint {args.eval_checkpoint}")
         ckpt = load_checkpoint_for_device(args.eval_checkpoint, device, device_kind)
-        model_config = ckpt["model_config"]
-        if model_config.get("model_type") != "obstacle_first_tsunet":
-            raise ValueError(
-                f"Checkpoint model_type={model_config.get('model_type')!r} is not supported by this build. "
-                "Retrain with the obstacle_first_tsunet architecture."
-            )
-        model = GRULidarClassifier(
-            input_dim=int(model_config["input_dim"]),
-            hidden_dim=int(model_config["hidden_dim"]),
-            num_layers=int(model_config["num_layers"]),
-            num_sensors=int(model_config["num_sensors"]),
-            num_classes=int(model_config["num_classes"]),
-            dropout=float(model_config["dropout"]),
-            region_sensor_groups=model_config.get("region_sensor_groups"),
-            fusion_hidden_dim=model_config.get("fusion_hidden_dim"),
-            sensor_embed_dim=model_config.get("sensor_embed_dim"),
-            decoder_hidden_dim=model_config.get("decoder_hidden_dim"),
-            attention_ff_dim=model_config.get("attention_ff_dim", model_config.get("region_context_dim")),
-            attention_heads=model_config.get("attention_heads"),
-        ).to(device)
+        model_config = dict(ckpt["model_config"])
+        model_config["model_type"] = infer_checkpoint_model_type(model_config, ckpt.get("model_state_dict"))
+        model = build_lidar_model_from_config(model_config, ckpt.get("model_state_dict")).to(device)
         load_model_state_with_compat(model, ckpt["model_state_dict"], log)
         binary_obstacle_only_mode = bool(model_config.get("binary_obstacle_only", binary_obstacle_only_mode))
     else:
@@ -2022,18 +2251,32 @@ def main() -> None:
         }
     param_count = sum(p.numel() for p in model.parameters())
     log(f"Model initialized: type={model_config['model_type']} params={param_count}")
-    log(
-        "Time-Sensor U-Net layout: "
-        f"groups={model_config['region_sensor_groups']} "
-        f"region_attention_heads={model_config.get('region_attention_heads', {})} "
-        f"sensor_hidden={model_config['hidden_dim']} "
-        f"unet_depth={model.unet_depth} "
-        f"global_context={model_config['fusion_hidden_dim']} "
-        f"attention_ff={model_config['attention_ff_dim']} "
-        f"sensor_embed={model_config['sensor_embed_dim']} "
-        f"decoder_hidden={model_config['decoder_hidden_dim']} "
-        f"obstacle_context={model_config.get('obstacle_context_dim', 'n/a')}"
-    )
+    if model_config["model_type"] == "obstacle_first_tsunet":
+        log(
+            "Time-Sensor U-Net layout: "
+            f"groups={model_config['region_sensor_groups']} "
+            f"region_attention_heads={model_config.get('region_attention_heads', {})} "
+            f"sensor_hidden={model_config['hidden_dim']} "
+            f"unet_depth={model.unet_depth} "
+            f"global_context={model_config['fusion_hidden_dim']} "
+            f"attention_ff={model_config['attention_ff_dim']} "
+            f"sensor_embed={model_config['sensor_embed_dim']} "
+            f"decoder_hidden={model_config['decoder_hidden_dim']} "
+            f"obstacle_context={model_config.get('obstacle_context_dim', 'n/a')}"
+        )
+    else:
+        log(
+            "Causal TS-CNN layout: "
+            f"groups={model_config['region_sensor_groups']} "
+            f"region_attention_heads={model_config.get('region_attention_heads', {})} "
+            f"sensor_hidden={model_config['hidden_dim']} "
+            f"blocks={getattr(model, 'backbone_depth', model_config['num_layers'])} "
+            f"global_context={model_config['fusion_hidden_dim']} "
+            f"attention_ff={model_config['attention_ff_dim']} "
+            f"sensor_embed={model_config['sensor_embed_dim']} "
+            f"decoder_hidden={model_config['decoder_hidden_dim']} "
+            f"obstacle_context={model_config.get('obstacle_context_dim', 'n/a')}"
+        )
 
     eval_num_classes = 2 if binary_obstacle_only_mode else meta["num_classes"]
 
@@ -2156,6 +2399,8 @@ def main() -> None:
                 "max_history": args.max_history,
                 "histories_per_target": args.histories_per_target,
                 "exclude_after_teleport_steps": args.exclude_after_teleport_steps,
+                "history_step_min": args.history_step_min,
+                "history_step_max": args.history_step_max,
                 "obstacle_oversample_target_frac": effective_obstacle_oversample_target_frac,
                 "sequence_sampling": meta["sequence_sampling"],
                 "train_teleport_rows": meta["train_teleport_rows"],
@@ -2266,6 +2511,8 @@ def main() -> None:
                         "max_history": args.max_history,
                         "histories_per_target": args.histories_per_target,
                         "exclude_after_teleport_steps": args.exclude_after_teleport_steps,
+                        "history_step_min": args.history_step_min,
+                        "history_step_max": args.history_step_max,
                         "obstacle_oversample_target_frac": effective_obstacle_oversample_target_frac,
                         "sequence_sampling": meta["sequence_sampling"],
                         "class_weighting": "inactive_factorized_reference_only",

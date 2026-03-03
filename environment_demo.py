@@ -8,7 +8,7 @@ import numpy as np
 # ===== Config =====
 GRID_SIZE = 60
 OBSTACLE_COUNT = 220
-SEED = 7
+SEED = 67
 
 # Rover LIDAR sensor coordinates from documentation (assumed centimeters).
 # Format: (x, y, z) relative to rover origin.
@@ -111,9 +111,12 @@ TERRAIN_CMAP = ["#ffffff", "#f3f3f3", "#d8d8d8", "#b88e62", "#915a2b", "#5a2a10"
 USE_MODEL_LIDAR_CLASSIFIER = True
 MODEL_LIDAR_CHECKPOINT_PATH = "runs/gru_lidar_classifier.pt"
 MODEL_LIDAR_MAX_HISTORY = 64
+MODEL_LIDAR_HISTORY_PUSH_EVERY_TICKS = 5
 MODEL_LIDAR_USE_CALIBRATED_BIAS = True
 MODEL_LIDAR_DEFAULT_OBSTACLE_BIAS = 0.2
 MODEL_LIDAR_BIAS_SELECTION = "best_by_accuracy"
+MODEL_PREDICTED_OBSTACLE_MARKER_HEIGHT_CM = 220.0
+MODEL_PREDICTED_OBSTACLE_MARKERS_PERSIST = True
 
 # (yaw_deg, pitch_deg) in rover frame where +X is forward, +Y is left, +Z is up.
 # Positive yaw rotates CCW from +X toward +Y. Negative pitch points downward.
@@ -864,6 +867,7 @@ def view_environment(
     model_inferencer = None
     model_inferencer_failed = False
     model_feature_history: list[np.ndarray] = []
+    model_history_tick_count = 0
     last_status_len = 0
     model_obstacle_logit_bias = float(MODEL_LIDAR_DEFAULT_OBSTACLE_BIAS)
     last_mismatch_signature = None
@@ -915,9 +919,19 @@ def view_environment(
     ray_mesh.lines = o3d.utility.Vector2iVector(ray_lines)
     ray_mesh.colors = o3d.utility.Vector3dVector(ray_colors)
     vis.add_geometry(ray_mesh, reset_bounding_box=False)
+    predicted_obstacle_marker_points = np.zeros((0, 3), dtype=float)
+    predicted_obstacle_marker_lines = np.zeros((0, 2), dtype=np.int32)
+    predicted_obstacle_marker_colors = np.zeros((0, 3), dtype=float)
+    predicted_obstacle_marker_mesh = o3d.geometry.LineSet()
+    predicted_obstacle_marker_mesh.points = o3d.utility.Vector3dVector(predicted_obstacle_marker_points)
+    predicted_obstacle_marker_mesh.lines = o3d.utility.Vector2iVector(predicted_obstacle_marker_lines)
+    predicted_obstacle_marker_mesh.colors = o3d.utility.Vector3dVector(predicted_obstacle_marker_colors)
+    vis.add_geometry(predicted_obstacle_marker_mesh, reset_bounding_box=False)
+    persistent_obstacle_marker_keys: set[tuple[float, float, float]] = set()
+    persistent_obstacle_marker_bases: list[np.ndarray] = []
 
     def draw_dynamic() -> None:
-        nonlocal model_inferencer_failed, last_status_len, last_mismatch_signature
+        nonlocal model_inferencer_failed, model_history_tick_count, last_status_len, last_mismatch_signature
         pose = compute_rover_pose(env, rover_state, height_sampler, footprint_center_local=footprint_center_local)
         if pose is None:
             return
@@ -939,6 +953,7 @@ def view_environment(
         ray_points[1::2] = scan.end_points
 
         class_ids_for_color = scan.class_ids
+        predicted_obstacle_mask = np.zeros((sensor_count,), dtype=bool)
         mismatch_summary = ""
         feature_t = None
         if model_inferencer is not None and not model_inferencer_failed:
@@ -954,6 +969,7 @@ def view_environment(
                         history_for_pred,
                         obstacle_logit_bias=model_obstacle_logit_bias,
                     )
+                    predicted_obstacle_mask = pred_obstacle_mask.astype(bool, copy=False)
                     actual_obstacle_mask = scan.class_ids.astype(np.int32) == 1
                     mismatch_mask = pred_obstacle_mask != actual_obstacle_mask
                     class_ids_for_color = np.where(pred_obstacle_mask, 1, scan.class_ids).astype(np.int32)
@@ -986,6 +1002,7 @@ def view_environment(
                     model_pred = model_inferencer.predict_current_from_feature_history(history_for_pred)
                     if model_pred.shape[0] == sensor_count:
                         class_ids_for_color = model_pred.astype(np.int32)
+                        predicted_obstacle_mask = class_ids_for_color == LIDAR_CLASS_OBSTACLE
                         mismatch_ids = np.flatnonzero(class_ids_for_color != scan.class_ids.astype(np.int32))
                         mismatch_summary = f" class_mismatch={int(mismatch_ids.size)}/{sensor_count}"
                         if mismatch_ids.size > 0:
@@ -1009,17 +1026,57 @@ def view_environment(
         for i, class_id in enumerate(class_ids_for_color):
             ray_colors[i] = hex_to_rgb01(lidar_class_id_to_color_hex(int(class_id)))
 
+        if MODEL_PREDICTED_OBSTACLE_MARKERS_PERSIST:
+            for base_point in scan.end_points[predicted_obstacle_mask]:
+                marker_key = tuple(np.round(base_point.astype(float), 1).tolist())
+                if marker_key in persistent_obstacle_marker_keys:
+                    continue
+                persistent_obstacle_marker_keys.add(marker_key)
+                persistent_obstacle_marker_bases.append(np.asarray(base_point, dtype=float).copy())
+            marker_bases = (
+                np.vstack(persistent_obstacle_marker_bases)
+                if persistent_obstacle_marker_bases
+                else np.zeros((0, 3), dtype=float)
+            )
+        else:
+            marker_bases = np.asarray(scan.end_points[predicted_obstacle_mask], dtype=float)
+
+        marker_count = int(marker_bases.shape[0])
+        if marker_count > 0:
+            predicted_obstacle_marker_points = np.repeat(marker_bases, 2, axis=0)
+            predicted_obstacle_marker_points[1::2, 2] += MODEL_PREDICTED_OBSTACLE_MARKER_HEIGHT_CM
+            predicted_obstacle_marker_lines = np.column_stack(
+                (np.arange(marker_count, dtype=np.int32) * 2, np.arange(marker_count, dtype=np.int32) * 2 + 1)
+            )
+            predicted_obstacle_marker_colors = np.tile(
+                hex_to_rgb01(LIDAR_OBSTACLE_COLOR)[None, :],
+                (marker_count, 1),
+            )
+        else:
+            predicted_obstacle_marker_points = np.zeros((0, 3), dtype=float)
+            predicted_obstacle_marker_lines = np.zeros((0, 2), dtype=np.int32)
+            predicted_obstacle_marker_colors = np.zeros((0, 3), dtype=float)
+
         if model_inferencer is not None and not model_inferencer_failed and feature_t is not None:
-            model_feature_history.append(feature_t)
-            if MODEL_LIDAR_MAX_HISTORY > 0 and len(model_feature_history) > MODEL_LIDAR_MAX_HISTORY:
-                del model_feature_history[:-MODEL_LIDAR_MAX_HISTORY]
+            model_history_tick_count += 1
+            history_push_every = max(1, int(MODEL_LIDAR_HISTORY_PUSH_EVERY_TICKS))
+            if model_history_tick_count % history_push_every == 0:
+                model_feature_history.append(feature_t)
+                if MODEL_LIDAR_MAX_HISTORY > 0 and len(model_feature_history) > MODEL_LIDAR_MAX_HISTORY:
+                    del model_feature_history[:-MODEL_LIDAR_MAX_HISTORY]
 
         ray_points[:, 2] *= TERRAIN_VERTICAL_EXAGGERATION
+        if predicted_obstacle_marker_points.size > 0:
+            predicted_obstacle_marker_points[:, 2] *= TERRAIN_VERTICAL_EXAGGERATION
         ray_mesh.points = o3d.utility.Vector3dVector(ray_points)
         ray_mesh.colors = o3d.utility.Vector3dVector(ray_colors)
+        predicted_obstacle_marker_mesh.points = o3d.utility.Vector3dVector(predicted_obstacle_marker_points)
+        predicted_obstacle_marker_mesh.lines = o3d.utility.Vector2iVector(predicted_obstacle_marker_lines)
+        predicted_obstacle_marker_mesh.colors = o3d.utility.Vector3dVector(predicted_obstacle_marker_colors)
 
         vis.update_geometry(rover_outline_dyn)
         vis.update_geometry(ray_mesh)
+        vis.update_geometry(predicted_obstacle_marker_mesh)
         vis.update_renderer()
         status_text = f"Pose x={rover_state.x:.0f} y={rover_state.y:.0f} yaw={rover_state.yaw_deg:.1f}{mismatch_summary}"
         padding = max(0, last_status_len - len(status_text))
