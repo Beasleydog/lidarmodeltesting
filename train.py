@@ -183,6 +183,29 @@ def load_checkpoint_for_device(path: str | Path, device: torch.device, device_ki
     return torch.load(path, map_location=map_location)
 
 
+def load_model_state_with_compat(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    log_fn=None,
+) -> None:
+    load_result = model.load_state_dict(state_dict, strict=False)
+    if log_fn is None:
+        return
+    missing = list(load_result.missing_keys)
+    unexpected = list(load_result.unexpected_keys)
+    if not missing and not unexpected:
+        return
+    parts: list[str] = []
+    if missing:
+        parts.append(f"missing={len(missing)}")
+    if unexpected:
+        parts.append(f"unexpected={len(unexpected)}")
+    log_fn(
+        "Loaded checkpoint with compatibility fallback "
+        f"({', '.join(parts)})."
+    )
+
+
 def _split_single_world_for_validation(world: WorldData, val_fraction: float) -> tuple[WorldData, WorldData]:
     t_steps = world.pose.shape[0]
     if t_steps < 2:
@@ -490,16 +513,93 @@ class CausalTimeSensorBlock(nn.Module):
         return residual + s
 
 
+class TemporalDownsampleBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.temporal_stride = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=(3, 1),
+            stride=(2, 1),
+            padding=(1, 0),
+            groups=channels,
+            bias=False,
+        )
+        self.mix = nn.Conv2d(channels, channels, kernel_size=1)
+        self.norm = nn.GroupNorm(1, channels)
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        with torch.no_grad():
+            self.temporal_stride.weight.zero_()
+            self.temporal_stride.weight[:, 0, 1, 0] = 1.0
+            self.mix.weight.zero_()
+            if self.mix.bias is not None:
+                self.mix.bias.zero_()
+            eye = torch.eye(
+                self.mix.out_channels,
+                self.mix.in_channels,
+                device=self.mix.weight.device,
+                dtype=self.mix.weight.dtype,
+            )
+            self.mix.weight[:, :, 0, 0] = eye
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.temporal_stride(x)
+        x = self.mix(x)
+        return F.gelu(self.norm(x))
+
+
 class TemporalUNetFuse(nn.Module):
     def __init__(self, channels: int):
         super().__init__()
+        self.up = nn.ConvTranspose2d(
+            channels,
+            channels,
+            kernel_size=(2, 1),
+            stride=(2, 1),
+            groups=channels,
+            bias=False,
+        )
         self.proj = nn.Conv2d(channels * 2, channels, kernel_size=1)
         self.norm = nn.GroupNorm(1, channels)
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        with torch.no_grad():
+            self.up.weight.zero_()
+            self.up.weight[:, 0, :, 0] = 1.0
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = F.interpolate(x, size=(skip.shape[2], skip.shape[3]), mode="nearest")
+        x = self.up(x)
+        if x.shape[2] != skip.shape[2] or x.shape[3] != skip.shape[3]:
+            x = F.interpolate(x, size=(skip.shape[2], skip.shape[3]), mode="nearest")
         x = torch.cat([x, skip], dim=1)
         return F.gelu(self.norm(self.proj(x)))
+
+
+class SensorRefinementBlock(nn.Module):
+    def __init__(self, channels: int, dropout: float):
+        super().__init__()
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
+        self.norm1 = nn.GroupNorm(1, channels)
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(1, channels)
+        self.dropout = nn.Dropout(dropout)
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        with torch.no_grad():
+            self.conv2.weight.zero_()
+            if self.conv2.bias is not None:
+                self.conv2.bias.zero_()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        y = x.transpose(1, 2).contiguous()
+        y = F.gelu(self.norm1(self.conv1(y)))
+        y = self.dropout(F.gelu(self.norm2(self.conv2(y))))
+        return residual + y.transpose(1, 2).contiguous()
 
 
 class GRULidarClassifier(nn.Module):
@@ -576,13 +676,18 @@ class GRULidarClassifier(nn.Module):
         self.encoder_blocks = nn.ModuleList(
             [CausalTimeSensorBlock(self.hidden_dim, d, dropout) for d in enc_dilations]
         )
-        bottleneck_dilation = 2 ** min(self.unet_depth, 3)
+        self.downsample_blocks = nn.ModuleList(
+            [TemporalDownsampleBlock(self.hidden_dim) for _ in range(self.unet_depth - 1)]
+        )
+        bottleneck_dilation = 2 ** min(self.unet_depth + 1, 4)
         self.bottleneck_blocks = nn.ModuleList(
             [
                 CausalTimeSensorBlock(self.hidden_dim, bottleneck_dilation, dropout),
                 CausalTimeSensorBlock(self.hidden_dim, bottleneck_dilation, dropout),
+                CausalTimeSensorBlock(self.hidden_dim, bottleneck_dilation * 2, dropout),
             ]
         )
+        self._zero_init_residual_block(self.bottleneck_blocks[-1])
         self.decoder_fuse = nn.ModuleList(
             [TemporalUNetFuse(self.hidden_dim) for _ in range(self.unet_depth - 1)]
         )
@@ -596,10 +701,18 @@ class GRULidarClassifier(nn.Module):
                 for i in range(self.unet_depth - 1)
             ]
         )
+        self.aux_decoder_levels = min(2, self.unet_depth - 1)
+        self.aux_sensor_refiners = nn.ModuleList(
+            [SensorRefinementBlock(self.hidden_dim, dropout * 0.5) for _ in range(self.aux_decoder_levels)]
+        )
+        self.aux_obstacle_heads = nn.ModuleList(
+            [nn.Linear(self.hidden_dim, 1) for _ in range(self.aux_decoder_levels)]
+        )
         self.backbone_dropout = nn.Dropout2d(dropout)
         self.global_proj = nn.Linear(self.hidden_dim, self.fusion_hidden_dim)
         self.region_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
         self.neighbor_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.final_sensor_refiner = SensorRefinementBlock(self.hidden_dim, dropout)
 
         decoder_in_dim = (
             self.hidden_dim  # last-time conv features
@@ -626,10 +739,27 @@ class GRULidarClassifier(nn.Module):
             nn.GELU(),
         )
         self.obstacle_head = nn.Linear(self.decoder_hidden_dim, 1)
+        boundary_hidden_dim = max(8, min(64, self.decoder_hidden_dim // 2))
+        self.boundary_refine = nn.Sequential(
+            nn.Linear(12, boundary_hidden_dim),
+            nn.GELU(),
+            nn.Linear(boundary_hidden_dim, 1),
+        )
+        nn.init.zeros_(self.boundary_refine[-1].weight)
+        nn.init.zeros_(self.boundary_refine[-1].bias)
         self.safe_type_head = nn.Linear(self.decoder_hidden_dim, 1)
         self.region_attention_heads = {
             name: max(1, min(len(ids), 1)) for name, ids in self.region_sensor_groups.items()
         }
+
+    def _zero_init_residual_block(self, block: CausalTimeSensorBlock) -> None:
+        with torch.no_grad():
+            block.temporal_conv.weight.zero_()
+            if block.temporal_conv.bias is not None:
+                block.temporal_conv.bias.zero_()
+            block.sensor_conv.weight.zero_()
+            if block.sensor_conv.bias is not None:
+                block.sensor_conv.bias.zero_()
 
     def _reorder_sensor_tensor(self, values: torch.Tensor) -> torch.Tensor:
         return values.index_select(dim=2, index=self.sensor_order.to(device=values.device))
@@ -728,7 +858,9 @@ class GRULidarClassifier(nn.Module):
         current_pose_delta = pose_delta[:, -1, :]
         return feats, current_local, current_pose, current_pose_delta
 
-    def _encode(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _encode(
+        self, x: torch.Tensor, lengths: torch.Tensor
+    ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         del lengths  # conv backbone uses zero-padded histories directly
         feats, current_local, current_pose, current_pose_delta = self._build_spatiotemporal_input(x)
         conv_in = feats.permute(0, 3, 1, 2).contiguous()
@@ -739,18 +871,21 @@ class GRULidarClassifier(nn.Module):
             h = block(h)
             skips.append(h)
             if block_idx < len(self.encoder_blocks) - 1 and h.shape[2] > 1:
-                h = h[:, :, ::2, :]
+                h = self.downsample_blocks[block_idx](h)
         for block in self.bottleneck_blocks:
             h = block(h)
+        decoder_last_features: list[torch.Tensor] = []
         for up_idx, skip_idx in enumerate(range(len(skips) - 2, -1, -1)):
             h = self.decoder_fuse[up_idx](h, skips[skip_idx])
             h = self.decoder_blocks[up_idx](h)
+            if up_idx < self.aux_decoder_levels:
+                decoder_last_features.append(h.permute(0, 2, 3, 1).contiguous()[:, -1, :, :])
         h_bt = h.permute(0, 2, 3, 1).contiguous()
         last_features = h_bt[:, -1, :, :]
         current_local = current_local.to(dtype=last_features.dtype)
         current_pose = current_pose.to(dtype=last_features.dtype)
         current_pose_delta = current_pose_delta.to(dtype=last_features.dtype)
-        return last_features, current_local, current_pose, current_pose_delta
+        return last_features, decoder_last_features, current_local, current_pose, current_pose_delta
 
     def _build_decoder_inputs(
         self,
@@ -806,21 +941,55 @@ class GRULidarClassifier(nn.Module):
         )
         return decoder_in, obstacle_context
 
-    def forward_with_aux(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        last_features, current_local, current_pose, current_pose_delta = self._encode(x, lengths)
+    def _forward_details(self, x: torch.Tensor, lengths: torch.Tensor) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+        last_features, decoder_last_features, current_local, current_pose, current_pose_delta = self._encode(x, lengths)
+        refined_last_features = self.final_sensor_refiner(last_features)
         decoder_in, obstacle_context = self._build_decoder_inputs(
-            last_features,
+            refined_last_features,
             current_local,
             current_pose,
             current_pose_delta,
         )
         decoder_out = self.decoder(decoder_in)
-        obstacle_logits_ordered = self.obstacle_head(decoder_out).squeeze(-1)
+        base_obstacle_logits_ordered = self.obstacle_head(decoder_out).squeeze(-1)
+        ordered_logits_bt = base_obstacle_logits_ordered.unsqueeze(1)
+        left_neighbor_logits = self._shift_sensor(ordered_logits_bt, -1).squeeze(1)
+        right_neighbor_logits = self._shift_sensor(ordered_logits_bt, 1).squeeze(1)
+        boundary_inputs = torch.cat(
+            [
+                base_obstacle_logits_ordered.unsqueeze(-1),
+                left_neighbor_logits.unsqueeze(-1),
+                right_neighbor_logits.unsqueeze(-1),
+                current_local,
+            ],
+            dim=-1,
+        )
+        obstacle_logits_ordered = base_obstacle_logits_ordered + self.boundary_refine(boundary_inputs).squeeze(-1)
         safe_type_hidden = self.safe_type_decoder(torch.cat([decoder_out, obstacle_context], dim=-1))
         ground_none_logits_ordered = self.safe_type_head(safe_type_hidden).squeeze(-1)
+        aux_obstacle_logits: list[torch.Tensor] = []
+        for head_idx, features in enumerate(decoder_last_features[: self.aux_decoder_levels]):
+            aux_features = self.aux_sensor_refiners[head_idx](features)
+            aux_logits_ordered = self.aux_obstacle_heads[head_idx](aux_features).squeeze(-1)
+            aux_obstacle_logits.append(self._restore_sensor_tensor(aux_logits_ordered))
         obstacle_logits = self._restore_sensor_tensor(obstacle_logits_ordered)
         ground_none_logits = self._restore_sensor_tensor(ground_none_logits_ordered)
         class_logits = obstacle_first_binary_logits_to_class_logits(obstacle_logits, ground_none_logits)
+        return {
+            "class_logits": class_logits,
+            "obstacle_logits": obstacle_logits,
+            "ground_none_logits": ground_none_logits,
+            "aux_obstacle_logits": aux_obstacle_logits,
+        }
+
+    def forward_with_training_details(self, x: torch.Tensor, lengths: torch.Tensor) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+        return self._forward_details(x, lengths)
+
+    def forward_with_aux(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        details = self._forward_details(x, lengths)
+        class_logits = details["class_logits"]
+        obstacle_logits = details["obstacle_logits"]
+        ground_none_logits = details["ground_none_logits"]
         return class_logits, obstacle_logits, ground_none_logits
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
@@ -1015,7 +1184,7 @@ def load_gru_lidar_inferencer(
         attention_ff_dim=cfg.get("attention_ff_dim", cfg.get("region_context_dim")),
         attention_heads=cfg.get("attention_heads"),
     ).to(device_t)
-    model.load_state_dict(ckpt["model_state_dict"])
+    load_model_state_with_compat(model, ckpt["model_state_dict"])
     model.eval()
 
     norm = ckpt["norm"]
@@ -1118,7 +1287,11 @@ def run_epoch(
             else nullcontext()
         )
         with amp_context:
-            logits, obstacle_logits, ground_none_logits = model.forward_with_aux(x, lengths)
+            details = model.forward_with_training_details(x, lengths)
+            logits = details["class_logits"]
+            obstacle_logits = details["obstacle_logits"]
+            ground_none_logits = details["ground_none_logits"]
+            aux_obstacle_logits = details["aux_obstacle_logits"]
             obstacle_targets = (y == 1).float()
             effective_obstacle_pos_weight = 1.0 if binary_obstacle_only else float(obstacle_pos_weight)
             pos_weight_t = torch.tensor(
@@ -1139,6 +1312,29 @@ def run_epoch(
                     pos_weight=pos_weight_t,
                     hard_fraction=hard_example_fraction,
                 )
+            aux_loss_terms: list[torch.Tensor] = []
+            for aux_logits in aux_obstacle_logits:
+                if binary_obstacle_only:
+                    aux_loss_terms.append(
+                        F.binary_cross_entropy_with_logits(
+                            aux_logits,
+                            obstacle_targets,
+                            reduction="mean",
+                        )
+                    )
+                else:
+                    aux_loss_terms.append(
+                        balanced_hard_obstacle_bce_loss(
+                            aux_logits,
+                            obstacle_targets,
+                            pos_weight=pos_weight_t,
+                            hard_fraction=hard_example_fraction,
+                        )
+                    )
+            if aux_loss_terms:
+                obstacle_aux_loss = torch.stack(aux_loss_terms).mean()
+            else:
+                obstacle_aux_loss = obstacle_loss.new_zeros(())
             safe_mask = y != 1
             if safe_mask.any():
                 ground_none_targets = (y[safe_mask] == 0).float()
@@ -1150,10 +1346,11 @@ def run_epoch(
             else:
                 safe_type_loss = obstacle_loss.new_zeros(())
             if binary_obstacle_only:
-                loss = obstacle_loss
+                loss = obstacle_loss + (float(obstacle_aux_weight) * obstacle_aux_loss)
             else:
                 loss = (
                     (float(obstacle_primary_loss_weight) * obstacle_loss)
+                    + (float(obstacle_aux_weight) * obstacle_aux_loss)
                     + (float(safe_type_loss_weight) * safe_type_loss)
                 )
 
@@ -1792,7 +1989,7 @@ def main() -> None:
             attention_ff_dim=model_config.get("attention_ff_dim", model_config.get("region_context_dim")),
             attention_heads=model_config.get("attention_heads"),
         ).to(device)
-        model.load_state_dict(ckpt["model_state_dict"])
+        load_model_state_with_compat(model, ckpt["model_state_dict"], log)
         binary_obstacle_only_mode = bool(model_config.get("binary_obstacle_only", binary_obstacle_only_mode))
     else:
         model = GRULidarClassifier(
@@ -1805,6 +2002,7 @@ def main() -> None:
         ).to(device)
         model_config = {
             "model_type": model.model_type,
+            "architecture_revision": 2,
             "input_dim": meta["input_dim"],
             "hidden_dim": args.hidden_dim,
             "num_layers": args.num_layers,
@@ -1819,6 +2017,7 @@ def main() -> None:
             "sensor_embed_dim": int(model.sensor_embed_dim),
             "decoder_hidden_dim": int(model.decoder_hidden_dim),
             "obstacle_context_dim": int(model.obstacle_context_dim),
+            "aux_decoder_levels": int(model.aux_decoder_levels),
             "binary_obstacle_only": bool(binary_obstacle_only_mode),
         }
     param_count = sum(p.numel() for p in model.parameters())
