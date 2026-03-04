@@ -83,6 +83,28 @@ MODEL_SENSOR_YAW_PITCH_DEG = np.array(
 )
 
 
+def _sensor_dirs_from_yaw_pitch_deg(yaw_pitch_deg: np.ndarray) -> np.ndarray:
+    yaw = np.deg2rad(yaw_pitch_deg[:, 0].astype(np.float32))
+    pitch = np.deg2rad(yaw_pitch_deg[:, 1].astype(np.float32))
+    cp = np.cos(pitch)
+    return np.stack(
+        [
+            cp * np.cos(yaw),
+            cp * np.sin(yaw),
+            np.sin(pitch),
+        ],
+        axis=1,
+    ).astype(np.float32)
+
+
+MODEL_SENSOR_DIRS_LOCAL = _sensor_dirs_from_yaw_pitch_deg(MODEL_SENSOR_YAW_PITCH_DEG)
+LEGACY_FEATURE_MODE = "legacy_normalized"
+EGO_MAP_FEATURE_MODE = "ego_map_raw"
+DEFAULT_LIDAR_MAX_RANGE_CM = 1000.0
+POSE_FEATURE_DIM_LEGACY = 4
+POSE_FEATURE_DIM_EGO_MAP = 12
+
+
 _LOG_FILE: TextIO | None = None
 
 
@@ -234,6 +256,87 @@ def _sensor_keys(fieldnames: list[str], prefix: str) -> list[str]:
     return keys
 
 
+def _basis_fieldnames() -> list[str]:
+    return [
+        "basis_xx",
+        "basis_xy",
+        "basis_xz",
+        "basis_yx",
+        "basis_yy",
+        "basis_yz",
+        "basis_zx",
+        "basis_zy",
+        "basis_zz",
+    ]
+
+
+def _flat_basis_from_yaw_deg(yaw_deg: np.ndarray) -> np.ndarray:
+    yaw_rad = np.deg2rad(yaw_deg.astype(np.float32))
+    cos_yaw = np.cos(yaw_rad)
+    sin_yaw = np.sin(yaw_rad)
+    basis = np.zeros((yaw_deg.shape[0], 3, 3), dtype=np.float32)
+    basis[:, 0, 0] = cos_yaw
+    basis[:, 1, 0] = sin_yaw
+    basis[:, 0, 1] = -sin_yaw
+    basis[:, 1, 1] = cos_yaw
+    basis[:, 2, 2] = 1.0
+    return basis
+
+
+def pose_array_to_legacy_xyzyaw(pose: np.ndarray) -> np.ndarray:
+    pose = np.asarray(pose, dtype=np.float32)
+    if pose.ndim != 2:
+        raise ValueError("pose must be shape [T,P]")
+    if pose.shape[1] == POSE_FEATURE_DIM_LEGACY:
+        return pose
+    if pose.shape[1] != POSE_FEATURE_DIM_EGO_MAP:
+        raise ValueError(f"Unsupported pose feature dim {pose.shape[1]}; expected 4 or 12")
+    origin = pose[:, :3]
+    basis = pose[:, 3:].reshape(-1, 3, 3)
+    yaw = np.rad2deg(np.arctan2(basis[:, 1, 0], basis[:, 0, 0])).astype(np.float32)
+    return np.concatenate([origin, yaw[:, None]], axis=1).astype(np.float32)
+
+
+def pose_array_to_geometry_features(pose: np.ndarray) -> np.ndarray:
+    pose = np.asarray(pose, dtype=np.float32)
+    if pose.ndim != 2:
+        raise ValueError("pose must be shape [T,P]")
+    if pose.shape[1] == POSE_FEATURE_DIM_EGO_MAP:
+        return pose
+    if pose.shape[1] != POSE_FEATURE_DIM_LEGACY:
+        raise ValueError(f"Unsupported pose feature dim {pose.shape[1]}; expected 4 or 12")
+    origin = pose[:, :3]
+    yaw = pose[:, 3]
+    basis = _flat_basis_from_yaw_deg(yaw).reshape(-1, 9)
+    return np.concatenate([origin, basis], axis=1).astype(np.float32)
+
+
+def assemble_pose_features(
+    pose_values: np.ndarray,
+    target_pose_dim: int,
+    basis: np.ndarray | None = None,
+) -> np.ndarray:
+    pose_arr = np.asarray(pose_values, dtype=np.float32).reshape(-1)
+    if pose_arr.shape[0] == int(target_pose_dim):
+        return pose_arr.astype(np.float32, copy=False)
+    if int(target_pose_dim) == POSE_FEATURE_DIM_LEGACY:
+        if pose_arr.shape[0] == 3 and basis is not None:
+            basis_arr = np.asarray(basis, dtype=np.float32).reshape(3, 3)
+            yaw = float(np.rad2deg(np.arctan2(basis_arr[1, 0], basis_arr[0, 0])))
+            return np.concatenate([pose_arr, np.asarray([yaw], dtype=np.float32)], axis=0).astype(np.float32)
+        if pose_arr.shape[0] == POSE_FEATURE_DIM_EGO_MAP:
+            return pose_array_to_legacy_xyzyaw(pose_arr[None, :])[0]
+    if int(target_pose_dim) == POSE_FEATURE_DIM_EGO_MAP:
+        if pose_arr.shape[0] == 3 and basis is not None:
+            basis_arr = np.asarray(basis, dtype=np.float32).reshape(9)
+            return np.concatenate([pose_arr, basis_arr], axis=0).astype(np.float32)
+        if pose_arr.shape[0] == POSE_FEATURE_DIM_LEGACY:
+            return pose_array_to_geometry_features(pose_arr[None, :])[0]
+    raise ValueError(
+        f"Cannot assemble pose features with input dim={pose_arr.shape[0]} target dim={target_pose_dim}"
+    )
+
+
 def load_world_file(path: Path) -> WorldData:
     with path.open("r", encoding="utf-8", newline="") as fh:
         reader = csv.DictReader(fh)
@@ -243,6 +346,8 @@ def load_world_file(path: Path) -> WorldData:
         class_keys = _sensor_keys(reader.fieldnames, "lidar_class_")
         if len(cm_keys) == 0 or len(cm_keys) != len(class_keys):
             raise ValueError(f"{path} has invalid lidar columns")
+        basis_keys = [name for name in _basis_fieldnames() if name in reader.fieldnames]
+        has_basis_cols = len(basis_keys) == 9
 
         pose_rows: list[list[float]] = []
         cm_rows: list[list[float]] = []
@@ -250,14 +355,16 @@ def load_world_file(path: Path) -> WorldData:
         teleport_rows: list[int] = []
         has_teleport_col = "teleport_flag" in reader.fieldnames
         for row in reader:
-            pose_rows.append(
-                [
-                    float(row["x_cm"]),
-                    float(row["y_cm"]),
-                    float(row["z_cm"]),
-                    float(row["yaw_deg"]),
-                ]
-            )
+            base_pose = [
+                float(row["x_cm"]),
+                float(row["y_cm"]),
+                float(row["z_cm"]),
+            ]
+            if has_basis_cols:
+                base_pose.extend(float(row[name]) for name in basis_keys)
+            else:
+                base_pose.append(float(row["yaw_deg"]))
+            pose_rows.append(base_pose)
             cm_rows.append([float(row[k]) for k in cm_keys])
             cls_rows.append([int(row[k]) for k in class_keys])
             teleport_rows.append(int(float(row["teleport_flag"])) if has_teleport_col else 0)
@@ -272,8 +379,16 @@ def load_world_file(path: Path) -> WorldData:
     )
 
 
-def compute_norm_stats(worlds: Iterable[WorldData]) -> NormStats:
-    pose_all = np.concatenate([w.pose for w in worlds], axis=0)
+def compute_norm_stats(worlds: Iterable[WorldData], feature_mode: str) -> NormStats:
+    if feature_mode == EGO_MAP_FEATURE_MODE:
+        return NormStats(
+            pose_mean=np.zeros((POSE_FEATURE_DIM_EGO_MAP,), dtype=np.float32),
+            pose_std=np.ones((POSE_FEATURE_DIM_EGO_MAP,), dtype=np.float32),
+            dist_mean=0.0,
+            dist_std=1.0,
+        )
+
+    pose_all = np.concatenate([pose_array_to_legacy_xyzyaw(w.pose) for w in worlds], axis=0)
     pose_mean = pose_all.mean(axis=0)
     pose_std = pose_all.std(axis=0) + 1e-6
 
@@ -293,26 +408,48 @@ def compute_norm_stats(worlds: Iterable[WorldData]) -> NormStats:
     )
 
 
-def world_to_features(world: WorldData, stats: NormStats) -> tuple[np.ndarray, np.ndarray]:
-    pose = (world.pose - stats.pose_mean[None, :]) / stats.pose_std[None, :]
-
+def world_to_features(
+    world: WorldData,
+    stats: NormStats,
+    feature_mode: str,
+    no_hit_range_cm: float = DEFAULT_LIDAR_MAX_RANGE_CM,
+) -> tuple[np.ndarray, np.ndarray]:
     hit = (world.lidar_cm >= 0.0).astype(np.float32)
-    dist = np.where(hit > 0.0, world.lidar_cm, 0.0)
-    dist = (dist - stats.dist_mean) / stats.dist_std
-    dist = np.where(hit > 0.0, dist, 0.0)
 
-    features = np.concatenate([pose, dist.astype(np.float32), hit], axis=1)
+    if feature_mode == EGO_MAP_FEATURE_MODE:
+        pose = pose_array_to_geometry_features(world.pose)
+        dist = np.where(hit > 0.0, world.lidar_cm, float(no_hit_range_cm)).astype(np.float32)
+    else:
+        pose_raw = pose_array_to_legacy_xyzyaw(world.pose)
+        pose = (pose_raw - stats.pose_mean[None, :]) / stats.pose_std[None, :]
+        dist = np.where(hit > 0.0, world.lidar_cm, 0.0)
+        dist = (dist - stats.dist_mean) / stats.dist_std
+        dist = np.where(hit > 0.0, dist, 0.0).astype(np.float32)
+
+    features = np.concatenate([pose.astype(np.float32), dist, hit], axis=1)
     targets = world.lidar_class.astype(np.int64)
     return features, targets
 
 
-def featurize_timestep(pose_xyzyaw: np.ndarray, lidar_cm: np.ndarray, stats: NormStats) -> np.ndarray:
-    pose = (pose_xyzyaw.astype(np.float32) - stats.pose_mean) / stats.pose_std
+def featurize_timestep(
+    pose_values: np.ndarray,
+    lidar_cm: np.ndarray,
+    stats: NormStats,
+    basis: np.ndarray | None = None,
+    no_hit_range_cm: float = DEFAULT_LIDAR_MAX_RANGE_CM,
+) -> np.ndarray:
+    target_pose_dim = int(stats.pose_mean.shape[0])
+    pose = assemble_pose_features(pose_values, target_pose_dim, basis=basis)
     hit = (lidar_cm >= 0.0).astype(np.float32)
+    if target_pose_dim == POSE_FEATURE_DIM_EGO_MAP:
+        dist = np.where(hit > 0.0, lidar_cm.astype(np.float32), float(no_hit_range_cm))
+        return np.concatenate([pose.astype(np.float32), dist.astype(np.float32), hit], axis=0).astype(np.float32)
+
+    pose = (pose.astype(np.float32) - stats.pose_mean) / stats.pose_std
     dist = np.where(hit > 0.0, lidar_cm.astype(np.float32), 0.0)
     dist = (dist - stats.dist_mean) / stats.dist_std
     dist = np.where(hit > 0.0, dist, 0.0)
-    return np.concatenate([pose, dist, hit], axis=0).astype(np.float32)
+    return np.concatenate([pose, dist.astype(np.float32), hit], axis=0).astype(np.float32)
 
 
 class SequencePieceDataset(Dataset):
@@ -322,18 +459,22 @@ class SequencePieceDataset(Dataset):
         targets_by_world: list[np.ndarray],
         teleport_flags_by_world: list[np.ndarray],
         max_history: int,
+        min_history: int = 1,
         histories_per_target: int = 3,
         exclude_after_teleport_steps: int = 1,
         history_step_min: int = 1,
         history_step_max: int = 4,
+        include_relative_age_feature: bool = False,
         seed: int = 0,
     ):
         self.features_by_world = features_by_world
         self.targets_by_world = targets_by_world
+        self.min_history = int(max(min_history, 1))
         self.histories_per_target = int(max(histories_per_target, 1))
         self.exclude_after_teleport_steps = int(max(exclude_after_teleport_steps, 0))
         self.history_step_min = int(max(history_step_min, 1))
         self.history_step_max = int(max(history_step_max, self.history_step_min))
+        self.include_relative_age_feature = bool(include_relative_age_feature)
         self.index: list[tuple[int, np.ndarray, int]] = []
         self.sample_has_obstacle_target: list[bool] = []
         rng = np.random.default_rng(seed)
@@ -355,7 +496,14 @@ class SequencePieceDataset(Dataset):
                     max_history,
                     self.history_step_min,
                 )
-                history_lengths = self._sample_history_lengths(history_max, self.histories_per_target, rng)
+                if history_max < self.min_history:
+                    continue
+                history_lengths = self._sample_history_lengths(
+                    self.min_history,
+                    history_max,
+                    self.histories_per_target,
+                    rng,
+                )
                 for hist_len in history_lengths:
                     time_indices = self._sample_history_indices(
                         end,
@@ -375,21 +523,29 @@ class SequencePieceDataset(Dataset):
         return min(feasible_from_start, int(max_history))
 
     @staticmethod
-    def _sample_history_lengths(history_max: int, k: int, rng: np.random.Generator) -> list[int]:
-        if history_max <= 0:
+    def _sample_history_lengths(
+        history_min: int,
+        history_max: int,
+        k: int,
+        rng: np.random.Generator,
+    ) -> list[int]:
+        history_min_i = int(max(history_min, 1))
+        history_max_i = int(max(history_max, history_min_i))
+        if history_max_i < history_min_i:
             return []
-        if history_max <= k:
-            return list(range(1, history_max + 1))
+        total_choices = history_max_i - history_min_i + 1
+        if total_choices <= k:
+            return list(range(history_min_i, history_max_i + 1))
         if k <= 1:
-            return [history_max]
+            return [history_max_i]
 
-        # Always include shortest and longest contexts.
-        lengths = [1, history_max]
+        # Always include the shortest and longest allowed contexts.
+        lengths = [history_min_i, history_max_i]
         remaining = k - len(lengths)
         if remaining <= 0:
             return sorted(set(lengths))
 
-        candidates = np.arange(2, history_max, dtype=np.int32)
+        candidates = np.arange(history_min_i + 1, history_max_i, dtype=np.int32)
         if candidates.size > 0:
             sampled = rng.choice(candidates, size=min(remaining, candidates.size), replace=False)
             lengths.extend(int(v) for v in sampled.tolist())
@@ -432,6 +588,9 @@ class SequencePieceDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         wi, time_indices, end = self.index[idx]
         x = self.features_by_world[wi][time_indices]
+        if self.include_relative_age_feature:
+            ages = (int(end) - time_indices.astype(np.int64)).astype(np.float32)[:, None]
+            x = np.concatenate([x, ages], axis=1)
         y = self.targets_by_world[wi][end]
         return torch.from_numpy(x), torch.from_numpy(y)
 
@@ -651,6 +810,373 @@ class SensorRefinementBlock(nn.Module):
         y = F.gelu(self.norm1(self.conv1(y)))
         y = self.dropout(F.gelu(self.norm2(self.conv2(y))))
         return residual + y.transpose(1, 2).contiguous()
+
+
+class MapResidualBlock(nn.Module):
+    def __init__(self, channels: int, dilation: int, dropout: float):
+        super().__init__()
+        pad = int(max(dilation, 1))
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=pad, dilation=pad)
+        self.norm1 = nn.GroupNorm(1, channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=pad, dilation=pad)
+        self.norm2 = nn.GroupNorm(1, channels)
+        self.dropout = nn.Dropout2d(dropout)
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        with torch.no_grad():
+            self.conv2.weight.zero_()
+            if self.conv2.bias is not None:
+                self.conv2.bias.zero_()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = F.gelu(self.norm1(self.conv1(x)))
+        y = self.dropout(F.gelu(self.norm2(self.conv2(y))))
+        return x + y
+
+
+class EgocentricMapLidarClassifier(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        num_layers: int,
+        num_sensors: int,
+        num_classes: int,
+        dropout: float,
+        region_sensor_groups: dict[str, list[int]] | None = None,
+        region_hidden_dims: dict[str, int] | None = None,
+        fusion_hidden_dim: int | None = None,
+        sensor_embed_dim: int | None = None,
+        decoder_hidden_dim: int | None = None,
+        attention_ff_dim: int | None = None,
+        attention_heads: int | None = None,
+        region_context_dim: int | None = None,
+        map_half_extent_cm: float = 3000.0,
+        map_cell_size_cm: float = 100.0,
+        map_ray_write_samples: int = 8,
+        query_ray_samples: int = 8,
+        max_range_cm: float = DEFAULT_LIDAR_MAX_RANGE_CM,
+    ):
+        del region_sensor_groups, region_hidden_dims, attention_ff_dim, attention_heads, region_context_dim
+        super().__init__()
+        self.model_type = "obstacle_first_ego_map_cnn"
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.num_layers = int(max(num_layers, 1))
+        self.num_sensors = int(num_sensors)
+        self.num_classes = int(num_classes)
+        self.expects_relative_age_feature = True
+        self.age_feature_dim = 1
+        self.pose_dim = int(self.input_dim - 2 * self.num_sensors - self.age_feature_dim)
+        if self.pose_dim != POSE_FEATURE_DIM_EGO_MAP:
+            raise ValueError(
+                f"obstacle_first_ego_map_cnn expects input_dim=12+2*num_sensors+1; "
+                f"got input_dim={self.input_dim} for num_sensors={self.num_sensors}"
+            )
+
+        self.map_half_extent_cm = float(max(map_half_extent_cm, max_range_cm))
+        self.map_cell_size_cm = float(max(map_cell_size_cm, 10.0))
+        self.max_range_cm = float(max(max_range_cm, 1.0))
+        self.map_ray_write_samples = int(max(map_ray_write_samples, 1))
+        self.query_ray_samples = int(max(query_ray_samples, 1))
+        self.map_size = int(max(8, round((2.0 * self.map_half_extent_cm) / self.map_cell_size_cm)))
+        self.map_channels = 5
+        self.sensor_embed_dim = (
+            max(4, min(16, int(round(self.hidden_dim * 0.25))))
+            if sensor_embed_dim is None
+            else max(2, int(sensor_embed_dim))
+        )
+        self.fusion_hidden_dim = (
+            max(32, self.hidden_dim)
+            if fusion_hidden_dim is None
+            else max(8, int(fusion_hidden_dim))
+        )
+        self.decoder_hidden_dim = (
+            max(48, self.hidden_dim * 2)
+            if decoder_hidden_dim is None
+            else max(8, int(decoder_hidden_dim))
+        )
+
+        self.register_buffer(
+            "sensor_coords_local",
+            torch.tensor(MODEL_SENSOR_COORDS_CM[: self.num_sensors], dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "sensor_dirs_local",
+            torch.tensor(MODEL_SENSOR_DIRS_LOCAL[: self.num_sensors], dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "write_fractions",
+            torch.linspace(0.08, 0.92, self.map_ray_write_samples, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "query_fractions",
+            torch.linspace(0.05, 1.00, self.query_ray_samples, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "sensor_ids",
+            torch.arange(self.num_sensors, dtype=torch.long),
+            persistent=False,
+        )
+
+        self.sensor_embedding = nn.Embedding(self.num_sensors, self.sensor_embed_dim)
+        self.map_stem = nn.Conv2d(self.map_channels, self.hidden_dim, kernel_size=3, padding=1)
+        self.map_stem_norm = nn.GroupNorm(1, self.hidden_dim)
+        self.map_blocks = nn.ModuleList(
+            [MapResidualBlock(self.hidden_dim, 2 ** min(i, 2), dropout) for i in range(self.num_layers + 1)]
+        )
+        self.map_head = nn.Sequential(
+            nn.Conv2d(self.hidden_dim, self.fusion_hidden_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(1, self.fusion_hidden_dim),
+            nn.GELU(),
+        )
+        query_in_dim = (
+            2 * self.fusion_hidden_dim
+            + self.sensor_embed_dim
+            + 8
+        )
+        self.query_decoder = nn.Sequential(
+            nn.Linear(query_in_dim, self.decoder_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.decoder_hidden_dim, self.decoder_hidden_dim),
+            nn.GELU(),
+        )
+        self.safe_type_decoder = nn.Sequential(
+            nn.Linear(self.decoder_hidden_dim + 3, self.decoder_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.decoder_hidden_dim, self.decoder_hidden_dim),
+            nn.GELU(),
+        )
+        self.obstacle_head = nn.Linear(self.decoder_hidden_dim, 1)
+        self.safe_type_head = nn.Linear(self.decoder_hidden_dim, 1)
+
+    def _gather_last_valid(self, values: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        batch_idx = torch.arange(values.shape[0], device=values.device)
+        last_idx = lengths.to(device=values.device).clamp_min(1) - 1
+        return values[batch_idx, last_idx]
+
+    def _xy_to_grid_indices(self, xy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        gx = torch.floor((xy[..., 0] + self.map_half_extent_cm) / self.map_cell_size_cm).long()
+        gy = torch.floor((xy[..., 1] + self.map_half_extent_cm) / self.map_cell_size_cm).long()
+        valid = (
+            (gx >= 0)
+            & (gx < self.map_size)
+            & (gy >= 0)
+            & (gy < self.map_size)
+        )
+        return gx + gy * self.map_size, valid
+
+    def _scatter_add_channel(
+        self,
+        bev: torch.Tensor,
+        channel_idx: int,
+        xy: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> None:
+        flat_index, in_bounds = self._xy_to_grid_indices(xy)
+        scatter_weights = torch.where(in_bounds, weights, torch.zeros_like(weights))
+        scatter_index = torch.where(in_bounds, flat_index, torch.zeros_like(flat_index))
+        bev[:, channel_idx, :, :].flatten(1).scatter_add_(1, scatter_index, scatter_weights)
+
+    def _gather_map_samples(
+        self,
+        feature_map: torch.Tensor,
+        xy: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        flat_index, in_bounds = self._xy_to_grid_indices(xy)
+        gather_index = torch.where(in_bounds, flat_index, torch.zeros_like(flat_index))
+        flat_map = feature_map.flatten(2)
+        gather = flat_map.gather(2, gather_index.unsqueeze(1).expand(-1, feature_map.shape[1], -1))
+        gather = gather * in_bounds.unsqueeze(1).to(dtype=gather.dtype)
+        return gather, in_bounds
+
+    def _parse_inputs(
+        self,
+        x: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        del lengths
+        pose = x[:, :, : self.pose_dim]
+        dist = x[:, :, self.pose_dim : self.pose_dim + self.num_sensors]
+        hit = x[:, :, self.pose_dim + self.num_sensors : self.pose_dim + 2 * self.num_sensors]
+        age = x[:, :, -1]
+        pose_origin = pose[:, :, :3]
+        pose_basis = pose[:, :, 3:].reshape(x.shape[0], x.shape[1], 3, 3)
+        return pose_origin, pose_basis, dist, hit, age, x
+
+    def _build_bev(
+        self,
+        pose_origin: torch.Tensor,
+        pose_basis: torch.Tensor,
+        dist: torch.Tensor,
+        hit: torch.Tensor,
+        age: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, time_steps = dist.shape[:2]
+        sensor_count = dist.shape[2]
+        time_mask = (
+            torch.arange(time_steps, device=dist.device).unsqueeze(0) < lengths.to(device=dist.device).unsqueeze(1)
+        )
+        valid_rays = time_mask.unsqueeze(-1).expand(-1, -1, sensor_count).to(dtype=dist.dtype)
+
+        current_origin = self._gather_last_valid(pose_origin, lengths)
+        current_basis = self._gather_last_valid(pose_basis, lengths)
+        inv_current_basis = current_basis.transpose(1, 2)
+        current_dist = self._gather_last_valid(dist, lengths).clamp(min=0.0, max=self.max_range_cm)
+        current_hit = self._gather_last_valid(hit, lengths)
+
+        sensor_coords = self.sensor_coords_local.view(1, 1, sensor_count, 3).to(dtype=dist.dtype)
+        sensor_dirs = self.sensor_dirs_local.view(1, 1, sensor_count, 3).to(dtype=dist.dtype)
+        pose_basis_exp = pose_basis.unsqueeze(2)
+
+        origin_world = pose_origin.unsqueeze(2) + torch.matmul(pose_basis_exp, sensor_coords.unsqueeze(-1)).squeeze(-1)
+        dir_world = torch.matmul(pose_basis_exp, sensor_dirs.unsqueeze(-1)).squeeze(-1)
+
+        rel_origin = origin_world - current_origin[:, None, None, :]
+        origin_now = torch.matmul(inv_current_basis[:, None, None, :, :], rel_origin.unsqueeze(-1)).squeeze(-1)
+        dir_now = torch.matmul(inv_current_basis[:, None, None, :, :], dir_world.unsqueeze(-1)).squeeze(-1)
+        ranges = dist.clamp(min=0.0, max=self.max_range_cm)
+        endpoint_now = origin_now + dir_now * ranges.unsqueeze(-1)
+
+        age_clamped = torch.clamp(age, min=0.0)
+        age_scale = torch.maximum(
+            age_clamped.max(dim=1, keepdim=True).values,
+            torch.ones((batch_size, 1), device=age.device, dtype=age.dtype),
+        )
+        recency = torch.exp(-2.0 * age_clamped / age_scale) * time_mask.to(dtype=age.dtype)
+
+        bev = dist.new_zeros((batch_size, self.map_channels, self.map_size, self.map_size))
+
+        write_fracs = self.write_fractions.to(device=dist.device, dtype=dist.dtype).view(1, 1, 1, -1, 1)
+        free_points = origin_now.unsqueeze(3) + dir_now.unsqueeze(3) * (ranges.unsqueeze(-1).unsqueeze(-1) * write_fracs)
+        free_xy = free_points[..., :2].reshape(batch_size, -1, 2)
+        free_weights = (
+            valid_rays.unsqueeze(-1).expand(-1, -1, -1, self.map_ray_write_samples) * (1.0 / float(self.map_ray_write_samples))
+        ).reshape(batch_size, -1)
+        free_recent = (
+            recency.unsqueeze(-1)
+            .unsqueeze(-1)
+            .expand(-1, -1, sensor_count, self.map_ray_write_samples)
+            * (1.0 / float(self.map_ray_write_samples))
+        ).reshape(batch_size, -1)
+        self._scatter_add_channel(bev, 0, free_xy, free_weights)
+        self._scatter_add_channel(bev, 1, free_xy, free_recent)
+
+        hit_weights = (valid_rays * hit).reshape(batch_size, -1)
+        hit_recent = (recency.unsqueeze(-1) * valid_rays * hit).reshape(batch_size, -1)
+        hit_xy = endpoint_now[..., :2].reshape(batch_size, -1, 2)
+        hit_heights = (endpoint_now[..., 2] * valid_rays * hit).reshape(batch_size, -1)
+        self._scatter_add_channel(bev, 2, hit_xy, hit_weights)
+        self._scatter_add_channel(bev, 3, hit_xy, hit_recent)
+        self._scatter_add_channel(bev, 4, hit_xy, hit_heights)
+
+        return bev, current_dist, current_hit
+
+    def _encode_map(self, bev: torch.Tensor) -> torch.Tensor:
+        h = F.gelu(self.map_stem_norm(self.map_stem(bev)))
+        for block in self.map_blocks:
+            h = block(h)
+        return self.map_head(h)
+
+    def _decode_queries(
+        self,
+        encoded_map: torch.Tensor,
+        current_dist: torch.Tensor,
+        current_hit: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = encoded_map.shape[0]
+        sensor_coords_xy = self.sensor_coords_local[:, :2].to(device=encoded_map.device, dtype=encoded_map.dtype)
+        sensor_dirs_xy = self.sensor_dirs_local[:, :2].to(device=encoded_map.device, dtype=encoded_map.dtype)
+        query_fracs = self.query_fractions.to(device=encoded_map.device, dtype=encoded_map.dtype).view(1, 1, -1, 1)
+
+        query_ranges = current_dist.clamp(min=0.0, max=self.max_range_cm)
+        query_points = (
+            sensor_coords_xy.view(1, self.num_sensors, 1, 2)
+            + sensor_dirs_xy.view(1, self.num_sensors, 1, 2) * query_ranges.unsqueeze(-1).unsqueeze(-1) * query_fracs
+        )
+        flat_query_points = query_points.reshape(batch_size, -1, 2)
+        gathered, in_bounds = self._gather_map_samples(encoded_map, flat_query_points)
+        gathered = gathered.view(batch_size, encoded_map.shape[1], self.num_sensors, self.query_ray_samples)
+        gathered = gathered.permute(0, 2, 3, 1).contiguous()
+        in_bounds = in_bounds.view(batch_size, self.num_sensors, self.query_ray_samples)
+
+        valid_count_raw = in_bounds.sum(dim=2, keepdim=True)
+        valid_count = valid_count_raw.clamp_min(1)
+        query_mean = (gathered * in_bounds.unsqueeze(-1).to(dtype=gathered.dtype)).sum(dim=2) / valid_count.to(
+            dtype=gathered.dtype
+        )
+        query_max = gathered.masked_fill(~in_bounds.unsqueeze(-1), -1e9).max(dim=2).values
+        no_valid = valid_count_raw.squeeze(-1) <= 0
+        query_max = torch.where(no_valid.unsqueeze(-1), torch.zeros_like(query_max), query_max)
+
+        sensor_embed = self.sensor_embedding(self.sensor_ids.to(device=encoded_map.device)).unsqueeze(0)
+        sensor_embed = sensor_embed.expand(batch_size, -1, -1).to(dtype=encoded_map.dtype)
+        endpoint_local = (
+            self.sensor_coords_local.to(device=encoded_map.device, dtype=encoded_map.dtype).unsqueeze(0)
+            + self.sensor_dirs_local.to(device=encoded_map.device, dtype=encoded_map.dtype).unsqueeze(0)
+            * query_ranges.unsqueeze(-1)
+        )
+        decoder_in = torch.cat(
+            [
+                query_mean,
+                query_max,
+                sensor_embed,
+                (query_ranges / self.max_range_cm).unsqueeze(-1),
+                current_hit.unsqueeze(-1),
+                endpoint_local,
+                self.sensor_dirs_local.to(device=encoded_map.device, dtype=encoded_map.dtype).unsqueeze(0).expand(
+                    batch_size, -1, -1
+                ),
+            ],
+            dim=-1,
+        )
+        decoded = self.query_decoder(decoder_in)
+        obstacle_logits = self.obstacle_head(decoded).squeeze(-1)
+        safe_hidden = self.safe_type_decoder(
+            torch.cat(
+                [
+                    decoded,
+                    (query_ranges / self.max_range_cm).unsqueeze(-1),
+                    current_hit.unsqueeze(-1),
+                    endpoint_local[:, :, 2:3],
+                ],
+                dim=-1,
+            )
+        )
+        ground_none_logits = self.safe_type_head(safe_hidden).squeeze(-1)
+        return obstacle_logits, ground_none_logits
+
+    def _forward_details(self, x: torch.Tensor, lengths: torch.Tensor) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+        pose_origin, pose_basis, dist, hit, age, _ = self._parse_inputs(x, lengths)
+        bev, current_dist, current_hit = self._build_bev(pose_origin, pose_basis, dist, hit, age, lengths)
+        encoded_map = self._encode_map(bev)
+        obstacle_logits, ground_none_logits = self._decode_queries(encoded_map, current_dist, current_hit)
+        class_logits = obstacle_first_binary_logits_to_class_logits(obstacle_logits, ground_none_logits)
+        return {
+            "class_logits": class_logits,
+            "obstacle_logits": obstacle_logits,
+            "ground_none_logits": ground_none_logits,
+            "aux_obstacle_logits": [],
+        }
+
+    def forward_with_training_details(self, x: torch.Tensor, lengths: torch.Tensor) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+        return self._forward_details(x, lengths)
+
+    def forward_with_aux(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        details = self._forward_details(x, lengths)
+        return details["class_logits"], details["obstacle_logits"], details["ground_none_logits"]
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        class_logits, _, _ = self.forward_with_aux(x, lengths)
+        return class_logits
 
 
 class GRULidarClassifier(nn.Module):
@@ -1204,15 +1730,21 @@ def infer_checkpoint_model_type(
     cfg_type = str(model_config.get("model_type", "")).strip()
     if state_dict:
         state_keys = list(state_dict.keys())
+        if any(key.startswith("map_stem.") or key.startswith("map_blocks.") for key in state_keys):
+            return "obstacle_first_ego_map_cnn"
         if any(key.startswith("encoder_blocks.") or key.startswith("downsample_blocks.") for key in state_keys):
             return "obstacle_first_tsunet"
         if any(key.startswith("blocks.") for key in state_keys):
             return "obstacle_first_causal_tscnn"
-    if cfg_type in {"obstacle_first_tsunet", "obstacle_first_causal_tscnn"}:
+    if cfg_type in {
+        "obstacle_first_ego_map_cnn",
+        "obstacle_first_tsunet",
+        "obstacle_first_causal_tscnn",
+    }:
         return cfg_type
     raise ValueError(
         f"Checkpoint model_type={cfg_type!r} is not supported by this build. "
-        "Supported types: obstacle_first_causal_tscnn, obstacle_first_tsunet."
+        "Supported types: obstacle_first_causal_tscnn, obstacle_first_ego_map_cnn, obstacle_first_tsunet."
     )
 
 
@@ -1239,6 +1771,15 @@ def build_lidar_model_from_config(
         return GRULidarClassifier(**common_kwargs)
     if resolved_model_type == "obstacle_first_causal_tscnn":
         return LegacyCausalTSCNNClassifier(**common_kwargs)
+    if resolved_model_type == "obstacle_first_ego_map_cnn":
+        return EgocentricMapLidarClassifier(
+            **common_kwargs,
+            map_half_extent_cm=float(model_config.get("map_half_extent_cm", 3000.0)),
+            map_cell_size_cm=float(model_config.get("map_cell_size_cm", 100.0)),
+            map_ray_write_samples=int(model_config.get("map_ray_write_samples", 8)),
+            query_ray_samples=int(model_config.get("query_ray_samples", 8)),
+            max_range_cm=float(model_config.get("no_hit_range_cm", DEFAULT_LIDAR_MAX_RANGE_CM)),
+        )
     raise ValueError(f"Unsupported resolved model_type={resolved_model_type!r}")
 
 
@@ -1305,6 +1846,7 @@ class GRULidarInferencer:
         input_dim: int,
         max_history: int = 64,
         binary_obstacle_only: bool = False,
+        no_hit_range_cm: float = DEFAULT_LIDAR_MAX_RANGE_CM,
     ):
         self.model = model.eval()
         self.stats = stats
@@ -1313,22 +1855,42 @@ class GRULidarInferencer:
         self.input_dim = int(input_dim)
         self.max_history = int(max_history)
         self.binary_obstacle_only = bool(binary_obstacle_only)
+        self.no_hit_range_cm = float(no_hit_range_cm)
+        self.pose_dim = int(self.stats.pose_mean.shape[0])
+        self.base_input_dim = int(self.pose_dim + 2 * self.num_sensors)
+        self.include_relative_age_feature = bool(self.input_dim == self.base_input_dim + 1)
 
-    def featurize_timestep(self, pose_xyzyaw: np.ndarray, lidar_cm: np.ndarray) -> np.ndarray:
-        return featurize_timestep(pose_xyzyaw, lidar_cm, self.stats)
+    def featurize_timestep(
+        self,
+        pose_values: np.ndarray,
+        lidar_cm: np.ndarray,
+        basis: np.ndarray | None = None,
+    ) -> np.ndarray:
+        return featurize_timestep(
+            pose_values,
+            lidar_cm,
+            self.stats,
+            basis=basis,
+            no_hit_range_cm=self.no_hit_range_cm,
+        )
 
     def _prepare_history_tensor(self, feature_history: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
         if feature_history.ndim != 2:
             raise ValueError("feature_history must be shape [T, F]")
-        if feature_history.shape[1] != self.input_dim:
-            raise ValueError(f"feature_history feature dim {feature_history.shape[1]} != expected {self.input_dim}")
         if feature_history.shape[0] < 1:
             raise ValueError("feature_history must have at least 1 timestep")
 
-        if self.max_history > 0 and feature_history.shape[0] > self.max_history:
-            feature_history = feature_history[-self.max_history :]
+        feat = feature_history.astype(np.float32, copy=False)
+        if feat.shape[1] == self.base_input_dim and self.include_relative_age_feature:
+            ages = np.arange(feat.shape[0] - 1, -1, -1, dtype=np.float32)[:, None]
+            feat = np.concatenate([feat, ages], axis=1)
+        if feat.shape[1] != self.input_dim:
+            raise ValueError(f"feature_history feature dim {feat.shape[1]} != expected {self.input_dim}")
 
-        x = torch.from_numpy(feature_history.astype(np.float32)).unsqueeze(0).to(self.device)
+        if self.max_history > 0 and feat.shape[0] > self.max_history:
+            feat = feat[-self.max_history :]
+
+        x = torch.from_numpy(feat).unsqueeze(0).to(self.device)
         lengths = torch.tensor([x.shape[1]], dtype=torch.long, device=self.device)
         return x, lengths
 
@@ -1367,8 +1929,8 @@ class GRULidarInferencer:
         return pred
 
     def predict_current_from_history(self, pose_history: np.ndarray, lidar_cm_history: np.ndarray) -> np.ndarray:
-        if pose_history.ndim != 2 or pose_history.shape[1] != 4:
-            raise ValueError("pose_history must be shape [T,4] for x,y,z,yaw")
+        if pose_history.ndim != 2 or pose_history.shape[1] not in {3, 4, 12}:
+            raise ValueError("pose_history must be shape [T,3], [T,4], or [T,12]")
         if lidar_cm_history.ndim != 2 or lidar_cm_history.shape[1] != self.num_sensors:
             raise ValueError(f"lidar_cm_history must be shape [T,{self.num_sensors}]")
         if pose_history.shape[0] != lidar_cm_history.shape[0]:
@@ -1432,6 +1994,7 @@ def load_gru_lidar_inferencer(
         input_dim=int(cfg["input_dim"]),
         max_history=int(max_history),
         binary_obstacle_only=bool(ckpt.get("meta", {}).get("binary_obstacle_only", False)),
+        no_hit_range_cm=float(ckpt.get("meta", {}).get("no_hit_range_cm", DEFAULT_LIDAR_MAX_RANGE_CM)),
     )
 
 
@@ -1889,11 +2452,15 @@ def build_loaders(
     pin_memory: bool,
     prefetch_factor: int,
     max_history: int,
+    min_history: int,
     histories_per_target: int,
     exclude_after_teleport_steps: int,
     history_step_min: int,
     history_step_max: int,
     obstacle_oversample_target_frac: float,
+    feature_mode: str,
+    include_relative_age_feature: bool,
+    no_hit_range_cm: float,
     seed: int,
 ) -> tuple[DataLoader, DataLoader, dict]:
     log(f"Scanning data directory: {data_dir}")
@@ -1956,17 +2523,24 @@ def build_loaders(
             val_worlds = [train_worlds[0]]
             val_files = [Path(f"{train_files[0].name}::val_fallback")]
     log("Computing normalization stats from training worlds")
-    stats = compute_norm_stats(train_worlds)
+    stats = compute_norm_stats(train_worlds, feature_mode)
 
     log("Converting worlds to model features")
-    train_feats, train_targets = zip(*(world_to_features(w, stats) for w in train_worlds))
-    val_feats, val_targets = zip(*(world_to_features(w, stats) for w in val_worlds))
+    train_feats, train_targets = zip(
+        *(world_to_features(w, stats, feature_mode, no_hit_range_cm=no_hit_range_cm) for w in train_worlds)
+    )
+    val_feats, val_targets = zip(
+        *(world_to_features(w, stats, feature_mode, no_hit_range_cm=no_hit_range_cm) for w in val_worlds)
+    )
     train_teleports = [w.teleport_flag for w in train_worlds]
     val_teleports = [w.teleport_flag for w in val_worlds]
 
+    history_min_label = int(max(min_history, 1))
+    history_max_label = "unbounded" if int(max_history) <= 0 else str(int(max_history))
     log(
         "Constructing sequence-piece datasets "
-        f"(sampled histories_per_target={histories_per_target} "
+        f"(history_len={history_min_label}..{history_max_label} "
+        f"sampled histories_per_target={histories_per_target} "
         f"history_step_range={max(1, int(history_step_min))}..{max(int(history_step_min), int(history_step_max))})"
     )
     train_ds = SequencePieceDataset(
@@ -1974,10 +2548,12 @@ def build_loaders(
         list(train_targets),
         train_teleports,
         max_history=max_history,
+        min_history=min_history,
         histories_per_target=histories_per_target,
         exclude_after_teleport_steps=exclude_after_teleport_steps,
         history_step_min=history_step_min,
         history_step_max=history_step_max,
+        include_relative_age_feature=include_relative_age_feature,
         seed=seed,
     )
     val_ds = SequencePieceDataset(
@@ -1985,10 +2561,12 @@ def build_loaders(
         list(val_targets),
         val_teleports,
         max_history=max_history,
+        min_history=min_history,
         histories_per_target=histories_per_target,
         exclude_after_teleport_steps=exclude_after_teleport_steps,
         history_step_min=history_step_min,
         history_step_max=history_step_max,
+        include_relative_age_feature=include_relative_age_feature,
         seed=seed + 1,
     )
     log(f"Dataset samples -> train={len(train_ds)} val={len(val_ds)}")
@@ -2053,8 +2631,13 @@ def build_loaders(
         "num_train_samples": len(train_ds),
         "num_val_samples": len(val_ds),
         "num_sensors": int(train_worlds[0].lidar_cm.shape[1]),
-        "input_dim": int(train_feats[0].shape[1]),
+        "input_dim": int(train_feats[0].shape[1] + (1 if include_relative_age_feature else 0)),
         "num_classes": 3,
+        "min_history": int(max(min_history, 1)),
+        "max_history": int(max_history) if int(max_history) > 0 else 0,
+        "feature_mode": feature_mode,
+        "include_relative_age_feature": bool(include_relative_age_feature),
+        "no_hit_range_cm": float(no_hit_range_cm),
         "histories_per_target": int(histories_per_target),
         "exclude_after_teleport_steps": int(exclude_after_teleport_steps),
         "history_step_min": int(max(history_step_min, 1)),
@@ -2090,6 +2673,16 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--output", type=Path, default=Path("runs/gru_lidar_classifier.pt"))
     parser.add_argument("--eval-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--model-arch",
+        type=str,
+        choices=(
+            "obstacle_first_ego_map_cnn",
+            "obstacle_first_tsunet",
+            "obstacle_first_causal_tscnn",
+        ),
+        default="obstacle_first_ego_map_cnn",
+    )
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--hidden-dim", type=int, default=64)
@@ -2104,10 +2697,12 @@ def main() -> None:
     parser.add_argument("--amp", type=str, choices=("auto", "on", "off"), default="off")
     parser.add_argument("--val-fraction", type=float, default=0.25)
     parser.add_argument("--max-history", type=int, default=64)
+    parser.add_argument("--min-history", type=int, default=8)
     parser.add_argument("--histories-per-target", type=int, default=3)
     parser.add_argument("--exclude-after-teleport-steps", type=int, default=1)
-    parser.add_argument("--history-step-min", type=int, default=1)
-    parser.add_argument("--history-step-max", type=int, default=4)
+    parser.add_argument("--history-step-min", type=int, default=4)
+    parser.add_argument("--history-step-max", type=int, default=16)
+    parser.add_argument("--no-hit-range-cm", type=float, default=DEFAULT_LIDAR_MAX_RANGE_CM)
     parser.add_argument("--obstacle-oversample-target-frac", type=float, default=0.50)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--log-every-batches", type=int, default=25)
@@ -2130,6 +2725,10 @@ def main() -> None:
     parser.add_argument("--sweep-obstacle-logit-bias-max", type=float, default=1.0)
     parser.add_argument("--sweep-obstacle-logit-bias-step", type=float, default=0.1)
     args = parser.parse_args()
+    if args.min_history < 1:
+        raise SystemExit("--min-history must be >= 1")
+    if args.max_history > 0 and args.min_history > args.max_history:
+        raise SystemExit("--min-history cannot exceed --max-history")
 
     report_base = args.eval_checkpoint if args.eval_checkpoint is not None else args.output
     report_base.parent.mkdir(parents=True, exist_ok=True)
@@ -2162,6 +2761,29 @@ def main() -> None:
         f"pin_memory={loader_pin_memory} amp={amp_enabled}"
     )
     binary_obstacle_only_mode = bool(args.binary_obstacle_only)
+    preloaded_eval_ckpt: dict | None = None
+    if args.eval_checkpoint is not None:
+        preloaded_eval_ckpt = load_checkpoint_for_device(args.eval_checkpoint, device, device_kind)
+        preloaded_model_config = dict(preloaded_eval_ckpt["model_config"])
+        resolved_eval_model_type = infer_checkpoint_model_type(
+            preloaded_model_config,
+            preloaded_eval_ckpt.get("model_state_dict"),
+        )
+        default_eval_feature_mode = (
+            EGO_MAP_FEATURE_MODE if resolved_eval_model_type == "obstacle_first_ego_map_cnn" else LEGACY_FEATURE_MODE
+        )
+        feature_mode = str(preloaded_eval_ckpt.get("meta", {}).get("feature_mode", default_eval_feature_mode))
+        include_relative_age_feature = bool(
+            preloaded_eval_ckpt.get("meta", {}).get(
+                "include_relative_age_feature",
+                resolved_eval_model_type == "obstacle_first_ego_map_cnn",
+            )
+        )
+        no_hit_range_cm = float(preloaded_eval_ckpt.get("meta", {}).get("no_hit_range_cm", args.no_hit_range_cm))
+    else:
+        feature_mode = EGO_MAP_FEATURE_MODE if args.model_arch == "obstacle_first_ego_map_cnn" else LEGACY_FEATURE_MODE
+        include_relative_age_feature = bool(args.model_arch == "obstacle_first_ego_map_cnn")
+        no_hit_range_cm = float(args.no_hit_range_cm)
 
     effective_obstacle_oversample_target_frac = (
         0.0 if binary_obstacle_only_mode else args.obstacle_oversample_target_frac
@@ -2174,11 +2796,15 @@ def main() -> None:
         pin_memory=loader_pin_memory,
         prefetch_factor=args.prefetch_factor,
         max_history=args.max_history,
+        min_history=args.min_history,
         histories_per_target=args.histories_per_target,
         exclude_after_teleport_steps=args.exclude_after_teleport_steps,
         history_step_min=args.history_step_min,
         history_step_max=args.history_step_max,
         obstacle_oversample_target_frac=effective_obstacle_oversample_target_frac,
+        feature_mode=feature_mode,
+        include_relative_age_feature=include_relative_age_feature,
+        no_hit_range_cm=no_hit_range_cm,
         seed=args.seed,
     )
     if len(train_loader.dataset) == 0:
@@ -2195,7 +2821,8 @@ def main() -> None:
     )
     log(
         "History sampling: "
-        f"length<= {args.max_history} sampled={meta['histories_per_target']} "
+        f"length={meta['min_history']}..{('unbounded' if int(meta['max_history']) <= 0 else meta['max_history'])} "
+        f"sampled={meta['histories_per_target']} "
         f"step_range={meta['history_step_min']}..{meta['history_step_max']}"
     )
     log(
@@ -2214,44 +2841,97 @@ def main() -> None:
     log(f"Using device: {device} ({device_kind})")
     if args.eval_checkpoint is not None:
         log(f"Eval-only mode: loading checkpoint {args.eval_checkpoint}")
-        ckpt = load_checkpoint_for_device(args.eval_checkpoint, device, device_kind)
+        ckpt = preloaded_eval_ckpt if preloaded_eval_ckpt is not None else load_checkpoint_for_device(
+            args.eval_checkpoint,
+            device,
+            device_kind,
+        )
         model_config = dict(ckpt["model_config"])
         model_config["model_type"] = infer_checkpoint_model_type(model_config, ckpt.get("model_state_dict"))
         model = build_lidar_model_from_config(model_config, ckpt.get("model_state_dict")).to(device)
         load_model_state_with_compat(model, ckpt["model_state_dict"], log)
         binary_obstacle_only_mode = bool(model_config.get("binary_obstacle_only", binary_obstacle_only_mode))
     else:
-        model = GRULidarClassifier(
-            input_dim=meta["input_dim"],
-            hidden_dim=args.hidden_dim,
-            num_layers=args.num_layers,
-            num_sensors=meta["num_sensors"],
-            num_classes=meta["num_classes"],
-            dropout=args.dropout,
-        ).to(device)
+        if args.model_arch == "obstacle_first_ego_map_cnn":
+            model = EgocentricMapLidarClassifier(
+                input_dim=meta["input_dim"],
+                hidden_dim=args.hidden_dim,
+                num_layers=args.num_layers,
+                num_sensors=meta["num_sensors"],
+                num_classes=meta["num_classes"],
+                dropout=args.dropout,
+                max_range_cm=no_hit_range_cm,
+            ).to(device)
+        elif args.model_arch == "obstacle_first_causal_tscnn":
+            model = LegacyCausalTSCNNClassifier(
+                input_dim=meta["input_dim"],
+                hidden_dim=args.hidden_dim,
+                num_layers=args.num_layers,
+                num_sensors=meta["num_sensors"],
+                num_classes=meta["num_classes"],
+                dropout=args.dropout,
+            ).to(device)
+        else:
+            model = GRULidarClassifier(
+                input_dim=meta["input_dim"],
+                hidden_dim=args.hidden_dim,
+                num_layers=args.num_layers,
+                num_sensors=meta["num_sensors"],
+                num_classes=meta["num_classes"],
+                dropout=args.dropout,
+            ).to(device)
         model_config = {
             "model_type": model.model_type,
-            "architecture_revision": 2,
+            "architecture_revision": 3,
             "input_dim": meta["input_dim"],
             "hidden_dim": args.hidden_dim,
             "num_layers": args.num_layers,
             "num_sensors": meta["num_sensors"],
             "num_classes": meta["num_classes"],
             "dropout": args.dropout,
-            "region_sensor_groups": model.region_sensor_groups,
-            "fusion_hidden_dim": int(model.fusion_hidden_dim),
-            "attention_ff_dim": int(model.attention_ff_dim),
-            "attention_heads": int(max(model.region_attention_heads.values(), default=1)),
-            "region_attention_heads": model.region_attention_heads,
-            "sensor_embed_dim": int(model.sensor_embed_dim),
-            "decoder_hidden_dim": int(model.decoder_hidden_dim),
-            "obstacle_context_dim": int(model.obstacle_context_dim),
-            "aux_decoder_levels": int(model.aux_decoder_levels),
+            "feature_mode": meta["feature_mode"],
+            "include_relative_age_feature": bool(meta["include_relative_age_feature"]),
+            "no_hit_range_cm": float(meta["no_hit_range_cm"]),
+            "region_sensor_groups": getattr(model, "region_sensor_groups", {}),
+            "fusion_hidden_dim": int(getattr(model, "fusion_hidden_dim", args.hidden_dim)),
+            "attention_ff_dim": int(getattr(model, "attention_ff_dim", args.hidden_dim)),
+            "attention_heads": int(max(getattr(model, "region_attention_heads", {}).values(), default=1)),
+            "region_attention_heads": getattr(model, "region_attention_heads", {}),
+            "sensor_embed_dim": int(getattr(model, "sensor_embed_dim", max(4, min(16, args.hidden_dim // 4)))),
+            "decoder_hidden_dim": int(getattr(model, "decoder_hidden_dim", max(48, args.hidden_dim))),
+            "obstacle_context_dim": int(getattr(model, "obstacle_context_dim", 0)),
+            "aux_decoder_levels": int(getattr(model, "aux_decoder_levels", 0)),
             "binary_obstacle_only": bool(binary_obstacle_only_mode),
         }
+        if model.model_type == "obstacle_first_ego_map_cnn":
+            model_config.update(
+                {
+                    "map_half_extent_cm": float(model.map_half_extent_cm),
+                    "map_cell_size_cm": float(model.map_cell_size_cm),
+                    "map_ray_write_samples": int(model.map_ray_write_samples),
+                    "query_ray_samples": int(model.query_ray_samples),
+                }
+            )
     param_count = sum(p.numel() for p in model.parameters())
     log(f"Model initialized: type={model_config['model_type']} params={param_count}")
-    if model_config["model_type"] == "obstacle_first_tsunet":
+    log(
+        "Feature pipeline: "
+        f"mode={meta['feature_mode']} age_feature={bool(meta['include_relative_age_feature'])} "
+        f"no_hit_range_cm={meta['no_hit_range_cm']:.1f}"
+    )
+    if model_config["model_type"] == "obstacle_first_ego_map_cnn":
+        log(
+            "Egocentric map CNN layout: "
+            f"map={getattr(model, 'map_size', 'n/a')}x{getattr(model, 'map_size', 'n/a')} "
+            f"cell_cm={model_config.get('map_cell_size_cm', 'n/a')} "
+            f"half_extent_cm={model_config.get('map_half_extent_cm', 'n/a')} "
+            f"write_samples={model_config.get('map_ray_write_samples', 'n/a')} "
+            f"query_samples={model_config.get('query_ray_samples', 'n/a')} "
+            f"hidden={model_config['hidden_dim']} "
+            f"fusion={model_config['fusion_hidden_dim']} "
+            f"decoder_hidden={model_config['decoder_hidden_dim']}"
+        )
+    elif model_config["model_type"] == "obstacle_first_tsunet":
         log(
             "Time-Sensor U-Net layout: "
             f"groups={model_config['region_sensor_groups']} "
@@ -2396,11 +3076,15 @@ def main() -> None:
                 "num_val_worlds": meta["num_val_worlds"],
                 "num_train_samples": meta["num_train_samples"],
                 "num_val_samples": meta["num_val_samples"],
-                "max_history": args.max_history,
+                "min_history": meta["min_history"],
+                "max_history": meta["max_history"],
                 "histories_per_target": args.histories_per_target,
                 "exclude_after_teleport_steps": args.exclude_after_teleport_steps,
                 "history_step_min": args.history_step_min,
                 "history_step_max": args.history_step_max,
+                "feature_mode": meta["feature_mode"],
+                "include_relative_age_feature": bool(meta["include_relative_age_feature"]),
+                "no_hit_range_cm": float(meta["no_hit_range_cm"]),
                 "obstacle_oversample_target_frac": effective_obstacle_oversample_target_frac,
                 "sequence_sampling": meta["sequence_sampling"],
                 "train_teleport_rows": meta["train_teleport_rows"],
@@ -2508,11 +3192,15 @@ def main() -> None:
                     "meta": {
                         "train_files": meta["train_files"],
                         "val_files": meta["val_files"],
-                        "max_history": args.max_history,
+                        "min_history": meta["min_history"],
+                        "max_history": meta["max_history"],
                         "histories_per_target": args.histories_per_target,
                         "exclude_after_teleport_steps": args.exclude_after_teleport_steps,
                         "history_step_min": args.history_step_min,
                         "history_step_max": args.history_step_max,
+                        "feature_mode": meta["feature_mode"],
+                        "include_relative_age_feature": bool(meta["include_relative_age_feature"]),
+                        "no_hit_range_cm": float(meta["no_hit_range_cm"]),
                         "obstacle_oversample_target_frac": effective_obstacle_oversample_target_frac,
                         "sequence_sampling": meta["sequence_sampling"],
                         "class_weighting": "inactive_factorized_reference_only",

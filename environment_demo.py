@@ -959,10 +959,14 @@ def view_environment(
         feature_t = None
         if model_inferencer is not None and not model_inferencer_failed:
             pose_xyzyaw = np.array(
-                [rover_state.x, rover_state.y, float(pose.origin[2]), rover_state.yaw_deg],
+                [float(pose.origin[0]), float(pose.origin[1]), float(pose.origin[2])],
                 dtype=np.float32,
             )
-            feature_t = model_inferencer.featurize_timestep(pose_xyzyaw, scan.distances_cm.astype(np.float32))
+            feature_t = model_inferencer.featurize_timestep(
+                pose_xyzyaw,
+                scan.distances_cm.astype(np.float32),
+                basis=pose.basis.astype(np.float32),
+            )
             try:
                 history_for_pred = np.asarray([*model_feature_history, feature_t], dtype=np.float32)
                 if getattr(model_inferencer, "binary_obstacle_only", False):
