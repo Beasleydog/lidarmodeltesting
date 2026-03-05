@@ -464,7 +464,6 @@ class SequencePieceDataset(Dataset):
         exclude_after_teleport_steps: int = 1,
         history_step_min: int = 1,
         history_step_max: int = 4,
-        include_relative_age_feature: bool = False,
         seed: int = 0,
     ):
         self.features_by_world = features_by_world
@@ -474,7 +473,6 @@ class SequencePieceDataset(Dataset):
         self.exclude_after_teleport_steps = int(max(exclude_after_teleport_steps, 0))
         self.history_step_min = int(max(history_step_min, 1))
         self.history_step_max = int(max(history_step_max, self.history_step_min))
-        self.include_relative_age_feature = bool(include_relative_age_feature)
         self.index: list[tuple[int, np.ndarray, int]] = []
         self.sample_has_obstacle_target: list[bool] = []
         rng = np.random.default_rng(seed)
@@ -588,9 +586,6 @@ class SequencePieceDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         wi, time_indices, end = self.index[idx]
         x = self.features_by_world[wi][time_indices]
-        if self.include_relative_age_feature:
-            ages = (int(end) - time_indices.astype(np.int64)).astype(np.float32)[:, None]
-            x = np.concatenate([x, ages], axis=1)
         y = self.targets_by_world[wi][end]
         return torch.from_numpy(x), torch.from_numpy(y)
 
@@ -866,14 +861,19 @@ class EgocentricMapLidarClassifier(nn.Module):
         self.num_layers = int(max(num_layers, 1))
         self.num_sensors = int(num_sensors)
         self.num_classes = int(num_classes)
-        self.expects_relative_age_feature = True
-        self.age_feature_dim = 1
-        self.pose_dim = int(self.input_dim - 2 * self.num_sensors - self.age_feature_dim)
+        self.pose_dim = int(self.input_dim - 2 * self.num_sensors)
+        # Legacy compatibility: older checkpoints may include one trailing feature.
+        self.legacy_extra_feature_dim = 0
+        if self.pose_dim == POSE_FEATURE_DIM_EGO_MAP + 1:
+            self.pose_dim -= 1
+            self.legacy_extra_feature_dim = 1
         if self.pose_dim != POSE_FEATURE_DIM_EGO_MAP:
             raise ValueError(
-                f"obstacle_first_ego_map_cnn expects input_dim=12+2*num_sensors+1; "
+                "obstacle_first_ego_map_cnn expects input_dim=12+2*num_sensors "
+                "(or +1 for legacy compatibility); "
                 f"got input_dim={self.input_dim} for num_sensors={self.num_sensors}"
             )
+        self.zero_bev_channels: tuple[int, ...] = ()
 
         self.map_half_extent_cm = float(max(map_half_extent_cm, max_range_cm))
         self.map_cell_size_cm = float(max(map_cell_size_cm, 10.0))
@@ -1001,15 +1001,14 @@ class EgocentricMapLidarClassifier(nn.Module):
         self,
         x: torch.Tensor,
         lengths: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         del lengths
         pose = x[:, :, : self.pose_dim]
         dist = x[:, :, self.pose_dim : self.pose_dim + self.num_sensors]
         hit = x[:, :, self.pose_dim + self.num_sensors : self.pose_dim + 2 * self.num_sensors]
-        age = x[:, :, -1]
         pose_origin = pose[:, :, :3]
         pose_basis = pose[:, :, 3:].reshape(x.shape[0], x.shape[1], 3, 3)
-        return pose_origin, pose_basis, dist, hit, age, x
+        return pose_origin, pose_basis, dist, hit
 
     def _build_bev(
         self,
@@ -1017,7 +1016,6 @@ class EgocentricMapLidarClassifier(nn.Module):
         pose_basis: torch.Tensor,
         dist: torch.Tensor,
         hit: torch.Tensor,
-        age: torch.Tensor,
         lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, time_steps = dist.shape[:2]
@@ -1046,12 +1044,13 @@ class EgocentricMapLidarClassifier(nn.Module):
         ranges = dist.clamp(min=0.0, max=self.max_range_cm)
         endpoint_now = origin_now + dir_now * ranges.unsqueeze(-1)
 
-        age_clamped = torch.clamp(age, min=0.0)
-        age_scale = torch.maximum(
-            age_clamped.max(dim=1, keepdim=True).values,
-            torch.ones((batch_size, 1), device=age.device, dtype=age.dtype),
+        time_idx = torch.arange(time_steps, device=dist.device).unsqueeze(0)
+        time_offset = (lengths.to(device=dist.device).unsqueeze(1) - 1 - time_idx).clamp_min(0).to(dtype=dist.dtype)
+        history_scale = torch.maximum(
+            (lengths.to(device=dist.device).unsqueeze(1) - 1).to(dtype=dist.dtype),
+            torch.ones((batch_size, 1), device=dist.device, dtype=dist.dtype),
         )
-        recency = torch.exp(-2.0 * age_clamped / age_scale) * time_mask.to(dtype=age.dtype)
+        recency = torch.exp(-2.0 * time_offset / history_scale) * time_mask.to(dtype=dist.dtype)
 
         bev = dist.new_zeros((batch_size, self.map_channels, self.map_size, self.map_size))
 
@@ -1077,6 +1076,10 @@ class EgocentricMapLidarClassifier(nn.Module):
         self._scatter_add_channel(bev, 2, hit_xy, hit_weights)
         self._scatter_add_channel(bev, 3, hit_xy, hit_recent)
         self._scatter_add_channel(bev, 4, hit_xy, hit_heights)
+        if self.zero_bev_channels:
+            for channel_idx in self.zero_bev_channels:
+                if 0 <= int(channel_idx) < self.map_channels:
+                    bev[:, int(channel_idx), :, :] = 0.0
 
         return bev, current_dist, current_hit
 
@@ -1155,8 +1158,8 @@ class EgocentricMapLidarClassifier(nn.Module):
         return obstacle_logits, ground_none_logits
 
     def _forward_details(self, x: torch.Tensor, lengths: torch.Tensor) -> dict[str, torch.Tensor | list[torch.Tensor]]:
-        pose_origin, pose_basis, dist, hit, age, _ = self._parse_inputs(x, lengths)
-        bev, current_dist, current_hit = self._build_bev(pose_origin, pose_basis, dist, hit, age, lengths)
+        pose_origin, pose_basis, dist, hit = self._parse_inputs(x, lengths)
+        bev, current_dist, current_hit = self._build_bev(pose_origin, pose_basis, dist, hit, lengths)
         encoded_map = self._encode_map(bev)
         obstacle_logits, ground_none_logits = self._decode_queries(encoded_map, current_dist, current_hit)
         class_logits = obstacle_first_binary_logits_to_class_logits(obstacle_logits, ground_none_logits)
@@ -1858,7 +1861,6 @@ class GRULidarInferencer:
         self.no_hit_range_cm = float(no_hit_range_cm)
         self.pose_dim = int(self.stats.pose_mean.shape[0])
         self.base_input_dim = int(self.pose_dim + 2 * self.num_sensors)
-        self.include_relative_age_feature = bool(self.input_dim == self.base_input_dim + 1)
 
     def featurize_timestep(
         self,
@@ -1881,10 +1883,12 @@ class GRULidarInferencer:
             raise ValueError("feature_history must have at least 1 timestep")
 
         feat = feature_history.astype(np.float32, copy=False)
-        if feat.shape[1] == self.base_input_dim and self.include_relative_age_feature:
-            ages = np.arange(feat.shape[0] - 1, -1, -1, dtype=np.float32)[:, None]
-            feat = np.concatenate([feat, ages], axis=1)
-        if feat.shape[1] != self.input_dim:
+        # Legacy compatibility: older checkpoints may expect one trailing feature.
+        if feat.shape[1] == self.base_input_dim and self.input_dim == self.base_input_dim + 1:
+            feat = np.concatenate([feat, np.zeros((feat.shape[0], 1), dtype=np.float32)], axis=1)
+        elif feat.shape[1] == self.base_input_dim + 1 and self.input_dim == self.base_input_dim:
+            feat = feat[:, : self.base_input_dim]
+        elif feat.shape[1] != self.input_dim:
             raise ValueError(f"feature_history feature dim {feat.shape[1]} != expected {self.input_dim}")
 
         if self.max_history > 0 and feat.shape[0] > self.max_history:
@@ -2459,7 +2463,6 @@ def build_loaders(
     history_step_max: int,
     obstacle_oversample_target_frac: float,
     feature_mode: str,
-    include_relative_age_feature: bool,
     no_hit_range_cm: float,
     seed: int,
 ) -> tuple[DataLoader, DataLoader, dict]:
@@ -2553,7 +2556,6 @@ def build_loaders(
         exclude_after_teleport_steps=exclude_after_teleport_steps,
         history_step_min=history_step_min,
         history_step_max=history_step_max,
-        include_relative_age_feature=include_relative_age_feature,
         seed=seed,
     )
     val_ds = SequencePieceDataset(
@@ -2566,7 +2568,6 @@ def build_loaders(
         exclude_after_teleport_steps=exclude_after_teleport_steps,
         history_step_min=history_step_min,
         history_step_max=history_step_max,
-        include_relative_age_feature=include_relative_age_feature,
         seed=seed + 1,
     )
     log(f"Dataset samples -> train={len(train_ds)} val={len(val_ds)}")
@@ -2631,12 +2632,11 @@ def build_loaders(
         "num_train_samples": len(train_ds),
         "num_val_samples": len(val_ds),
         "num_sensors": int(train_worlds[0].lidar_cm.shape[1]),
-        "input_dim": int(train_feats[0].shape[1] + (1 if include_relative_age_feature else 0)),
+        "input_dim": int(train_feats[0].shape[1]),
         "num_classes": 3,
         "min_history": int(max(min_history, 1)),
         "max_history": int(max_history) if int(max_history) > 0 else 0,
         "feature_mode": feature_mode,
-        "include_relative_age_feature": bool(include_relative_age_feature),
         "no_hit_range_cm": float(no_hit_range_cm),
         "histories_per_target": int(histories_per_target),
         "exclude_after_teleport_steps": int(exclude_after_teleport_steps),
@@ -2684,7 +2684,7 @@ def main() -> None:
         default="obstacle_first_ego_map_cnn",
     )
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--num-layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.35)
@@ -2773,16 +2773,9 @@ def main() -> None:
             EGO_MAP_FEATURE_MODE if resolved_eval_model_type == "obstacle_first_ego_map_cnn" else LEGACY_FEATURE_MODE
         )
         feature_mode = str(preloaded_eval_ckpt.get("meta", {}).get("feature_mode", default_eval_feature_mode))
-        include_relative_age_feature = bool(
-            preloaded_eval_ckpt.get("meta", {}).get(
-                "include_relative_age_feature",
-                resolved_eval_model_type == "obstacle_first_ego_map_cnn",
-            )
-        )
         no_hit_range_cm = float(preloaded_eval_ckpt.get("meta", {}).get("no_hit_range_cm", args.no_hit_range_cm))
     else:
         feature_mode = EGO_MAP_FEATURE_MODE if args.model_arch == "obstacle_first_ego_map_cnn" else LEGACY_FEATURE_MODE
-        include_relative_age_feature = bool(args.model_arch == "obstacle_first_ego_map_cnn")
         no_hit_range_cm = float(args.no_hit_range_cm)
 
     effective_obstacle_oversample_target_frac = (
@@ -2803,7 +2796,6 @@ def main() -> None:
         history_step_max=args.history_step_max,
         obstacle_oversample_target_frac=effective_obstacle_oversample_target_frac,
         feature_mode=feature_mode,
-        include_relative_age_feature=include_relative_age_feature,
         no_hit_range_cm=no_hit_range_cm,
         seed=args.seed,
     )
@@ -2890,7 +2882,6 @@ def main() -> None:
             "num_classes": meta["num_classes"],
             "dropout": args.dropout,
             "feature_mode": meta["feature_mode"],
-            "include_relative_age_feature": bool(meta["include_relative_age_feature"]),
             "no_hit_range_cm": float(meta["no_hit_range_cm"]),
             "region_sensor_groups": getattr(model, "region_sensor_groups", {}),
             "fusion_hidden_dim": int(getattr(model, "fusion_hidden_dim", args.hidden_dim)),
@@ -2916,7 +2907,7 @@ def main() -> None:
     log(f"Model initialized: type={model_config['model_type']} params={param_count}")
     log(
         "Feature pipeline: "
-        f"mode={meta['feature_mode']} age_feature={bool(meta['include_relative_age_feature'])} "
+        f"mode={meta['feature_mode']} "
         f"no_hit_range_cm={meta['no_hit_range_cm']:.1f}"
     )
     if model_config["model_type"] == "obstacle_first_ego_map_cnn":
@@ -3083,7 +3074,6 @@ def main() -> None:
                 "history_step_min": args.history_step_min,
                 "history_step_max": args.history_step_max,
                 "feature_mode": meta["feature_mode"],
-                "include_relative_age_feature": bool(meta["include_relative_age_feature"]),
                 "no_hit_range_cm": float(meta["no_hit_range_cm"]),
                 "obstacle_oversample_target_frac": effective_obstacle_oversample_target_frac,
                 "sequence_sampling": meta["sequence_sampling"],
@@ -3199,7 +3189,6 @@ def main() -> None:
                         "history_step_min": args.history_step_min,
                         "history_step_max": args.history_step_max,
                         "feature_mode": meta["feature_mode"],
-                        "include_relative_age_feature": bool(meta["include_relative_age_feature"]),
                         "no_hit_range_cm": float(meta["no_hit_range_cm"]),
                         "obstacle_oversample_target_frac": effective_obstacle_oversample_target_frac,
                         "sequence_sampling": meta["sequence_sampling"],

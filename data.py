@@ -42,14 +42,14 @@ from environment_demo import (
 
 # ===== Data Config =====
 SHOW_VIEWER = False
-DATA_DIR = Path("data")
+DATA_DIR = Path("evaldata")
 WORLDS_TO_GENERATE = 3000
 TIMESTEPS_PER_WORLD = 300
 LOG_EVERY_N_STEPS = 1
 BASE_RANDOM_SEED: int | None = None
 VIEWER_PLAYBACK_SLEEP_S = 0.04
 HOLD_VIEWER_AFTER_PLAYBACK = False
-NUM_WORKERS = 0  # Use >1 to generate worlds in parallel. If <=0, auto-selects CPU-based worker count.
+NUM_WORKERS = 1  # Use >1 to generate worlds in parallel. If <=0, auto-selects CPU-based worker count.
 
 # Motion model control
 MAX_MOVE_CM_PER_STEP = float(ROVER_MOVE_STEP_CM)

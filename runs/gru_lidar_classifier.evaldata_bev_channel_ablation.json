@@ -1,0 +1,124 @@
+{
+  "checkpoint": "runs\\gru_lidar_classifier.pt",
+  "data_dir": "evaldata",
+  "num_world_files": 12,
+  "num_worlds_loaded": 12,
+  "num_samples": 8632,
+  "feature_mode": "ego_map_raw",
+  "include_relative_age_feature_column": true,
+  "binary_obstacle_only": true,
+  "history": {
+    "min_history": 8,
+    "max_history": 64,
+    "histories_per_target": 3,
+    "history_step_min": 4,
+    "history_step_max": 16
+  },
+  "results": [
+    {
+      "name": "baseline",
+      "channels_zeroed": [],
+      "overall_accuracy": 0.98711361282233,
+      "per_class_recall": [
+        0.9949855411308681,
+        0.9258971291866028
+      ],
+      "confusion_matrix": [
+        [
+          129372,
+          652
+        ],
+        [
+          1239,
+          15481
+        ]
+      ]
+    },
+    {
+      "name": "zero_recency_weighted_free_space_ch1",
+      "channels_zeroed": [
+        1
+      ],
+      "overall_accuracy": 0.986220901706373,
+      "per_class_recall": [
+        0.9941703070202424,
+        0.9244019138755981
+      ],
+      "confusion_matrix": [
+        [
+          129266,
+          758
+        ],
+        [
+          1264,
+          15456
+        ]
+      ]
+    },
+    {
+      "name": "zero_recency_weighted_hit_endpoint_count_ch3",
+      "channels_zeroed": [
+        3
+      ],
+      "overall_accuracy": 0.9855598866052445,
+      "per_class_recall": [
+        0.9952085768781148,
+        0.9105263157894737
+      ],
+      "confusion_matrix": [
+        [
+          129401,
+          623
+        ],
+        [
+          1496,
+          15224
+        ]
+      ]
+    },
+    {
+      "name": "zero_hit_endpoint_height_sum_ch4",
+      "channels_zeroed": [
+        4
+      ],
+      "overall_accuracy": 0.8959071580439405,
+      "per_class_recall": [
+        0.999084784347505,
+        0.09354066985645933
+      ],
+      "confusion_matrix": [
+        [
+          129905,
+          119
+        ],
+        [
+          15156,
+          1564
+        ]
+      ]
+    },
+    {
+      "name": "zero_all_three_1_3_4",
+      "channels_zeroed": [
+        1,
+        3,
+        4
+      ],
+      "overall_accuracy": 0.8862168129531701,
+      "per_class_recall": [
+        1.0,
+        0.001375598086124402
+      ],
+      "confusion_matrix": [
+        [
+          130024,
+          0
+        ],
+        [
+          16697,
+          23
+        ]
+      ]
+    }
+  ]
+}
