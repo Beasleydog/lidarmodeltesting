@@ -61,4 +61,3 @@ def ingest_lidar(
         del _FEATURE_HISTORY[:-_INFERENCER.max_history]
 
     return output
-
