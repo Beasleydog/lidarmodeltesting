@@ -464,6 +464,7 @@ class SequencePieceDataset(Dataset):
         exclude_after_teleport_steps: int = 1,
         history_step_min: int = 1,
         history_step_max: int = 4,
+        lidar_offset_max_cm: float = 0.0,
         seed: int = 0,
     ):
         self.features_by_world = features_by_world
@@ -473,8 +474,18 @@ class SequencePieceDataset(Dataset):
         self.exclude_after_teleport_steps = int(max(exclude_after_teleport_steps, 0))
         self.history_step_min = int(max(history_step_min, 1))
         self.history_step_max = int(max(history_step_max, self.history_step_min))
+        self.lidar_offset_max_cm = float(max(lidar_offset_max_cm, 0.0))
         self.index: list[tuple[int, np.ndarray, int]] = []
         self.sample_has_obstacle_target: list[bool] = []
+        self._offset_rng = np.random.default_rng(seed + 10_000_019)
+
+        if not features_by_world or not targets_by_world:
+            raise ValueError("SequencePieceDataset requires non-empty features/targets")
+        self.num_sensors = int(targets_by_world[0].shape[1])
+        self.dist_feature_start = int(features_by_world[0].shape[1] - 2 * self.num_sensors)
+        self.dist_feature_end = int(self.dist_feature_start + self.num_sensors)
+        if self.dist_feature_start < 0 or self.dist_feature_end > int(features_by_world[0].shape[1]):
+            raise ValueError("Could not infer lidar distance feature slice from provided tensors")
         rng = np.random.default_rng(seed)
 
         for wi, feat in enumerate(features_by_world):
@@ -586,6 +597,10 @@ class SequencePieceDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         wi, time_indices, end = self.index[idx]
         x = self.features_by_world[wi][time_indices]
+        if self.lidar_offset_max_cm > 0.0:
+            offset_cm = float(self._offset_rng.uniform(0.0, self.lidar_offset_max_cm))
+            x = x.copy()
+            x[:, self.dist_feature_start : self.dist_feature_end] += np.float32(offset_cm)
         y = self.targets_by_world[wi][end]
         return torch.from_numpy(x), torch.from_numpy(y)
 
@@ -2462,6 +2477,7 @@ def build_loaders(
     history_step_min: int,
     history_step_max: int,
     obstacle_oversample_target_frac: float,
+    train_lidar_offset_max_cm: float,
     feature_mode: str,
     no_hit_range_cm: float,
     seed: int,
@@ -2546,6 +2562,14 @@ def build_loaders(
         f"sampled histories_per_target={histories_per_target} "
         f"history_step_range={max(1, int(history_step_min))}..{max(int(history_step_min), int(history_step_max))})"
     )
+    effective_train_lidar_offset_max_cm = float(max(train_lidar_offset_max_cm, 0.0))
+    if effective_train_lidar_offset_max_cm > 0.0 and feature_mode != EGO_MAP_FEATURE_MODE:
+        log(
+            "Training lidar offset augmentation requested, but disabled because "
+            f"feature_mode={feature_mode!r} is not {EGO_MAP_FEATURE_MODE!r}."
+        )
+        effective_train_lidar_offset_max_cm = 0.0
+
     train_ds = SequencePieceDataset(
         list(train_feats),
         list(train_targets),
@@ -2556,6 +2580,7 @@ def build_loaders(
         exclude_after_teleport_steps=exclude_after_teleport_steps,
         history_step_min=history_step_min,
         history_step_max=history_step_max,
+        lidar_offset_max_cm=effective_train_lidar_offset_max_cm,
         seed=seed,
     )
     val_ds = SequencePieceDataset(
@@ -2568,6 +2593,7 @@ def build_loaders(
         exclude_after_teleport_steps=exclude_after_teleport_steps,
         history_step_min=history_step_min,
         history_step_max=history_step_max,
+        lidar_offset_max_cm=0.0,
         seed=seed + 1,
     )
     log(f"Dataset samples -> train={len(train_ds)} val={len(val_ds)}")
@@ -2642,6 +2668,7 @@ def build_loaders(
         "exclude_after_teleport_steps": int(exclude_after_teleport_steps),
         "history_step_min": int(max(history_step_min, 1)),
         "history_step_max": int(max(history_step_max, max(history_step_min, 1))),
+        "train_lidar_offset_max_cm": float(effective_train_lidar_offset_max_cm),
         "sequence_sampling": "sampled_per_target_variable_step",
         "obstacle_oversample_target_frac": float(obstacle_oversample_target_frac),
         "train_obstacle_target_samples": int(oversample_meta["obstacle_samples"]),
@@ -2702,6 +2729,7 @@ def main() -> None:
     parser.add_argument("--exclude-after-teleport-steps", type=int, default=1)
     parser.add_argument("--history-step-min", type=int, default=4)
     parser.add_argument("--history-step-max", type=int, default=16)
+    parser.add_argument("--train-lidar-offset-max-cm", type=float, default=300.0)
     parser.add_argument("--no-hit-range-cm", type=float, default=DEFAULT_LIDAR_MAX_RANGE_CM)
     parser.add_argument("--obstacle-oversample-target-frac", type=float, default=0.50)
     parser.add_argument("--seed", type=int, default=7)
@@ -2795,6 +2823,7 @@ def main() -> None:
         history_step_min=args.history_step_min,
         history_step_max=args.history_step_max,
         obstacle_oversample_target_frac=effective_obstacle_oversample_target_frac,
+        train_lidar_offset_max_cm=args.train_lidar_offset_max_cm,
         feature_mode=feature_mode,
         no_hit_range_cm=no_hit_range_cm,
         seed=args.seed,
@@ -2816,6 +2845,10 @@ def main() -> None:
         f"length={meta['min_history']}..{('unbounded' if int(meta['max_history']) <= 0 else meta['max_history'])} "
         f"sampled={meta['histories_per_target']} "
         f"step_range={meta['history_step_min']}..{meta['history_step_max']}"
+    )
+    log(
+        "Training lidar offset augmentation: "
+        f"max_cm={meta['train_lidar_offset_max_cm']:.1f} (uniform in [0,max] per sampled history)"
     )
     log(
         "Obstacle-target sample mix: "
@@ -3073,6 +3106,7 @@ def main() -> None:
                 "exclude_after_teleport_steps": args.exclude_after_teleport_steps,
                 "history_step_min": args.history_step_min,
                 "history_step_max": args.history_step_max,
+                "train_lidar_offset_max_cm": float(meta["train_lidar_offset_max_cm"]),
                 "feature_mode": meta["feature_mode"],
                 "no_hit_range_cm": float(meta["no_hit_range_cm"]),
                 "obstacle_oversample_target_frac": effective_obstacle_oversample_target_frac,
@@ -3188,6 +3222,7 @@ def main() -> None:
                         "exclude_after_teleport_steps": args.exclude_after_teleport_steps,
                         "history_step_min": args.history_step_min,
                         "history_step_max": args.history_step_max,
+                        "train_lidar_offset_max_cm": float(meta["train_lidar_offset_max_cm"]),
                         "feature_mode": meta["feature_mode"],
                         "no_hit_range_cm": float(meta["no_hit_range_cm"]),
                         "obstacle_oversample_target_frac": effective_obstacle_oversample_target_frac,
