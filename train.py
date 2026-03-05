@@ -2096,73 +2096,75 @@ def run_epoch(
             if amp_enabled
             else nullcontext()
         )
-        with amp_context:
-            details = model.forward_with_training_details(x, lengths)
-            logits = details["class_logits"]
-            obstacle_logits = details["obstacle_logits"]
-            ground_none_logits = details["ground_none_logits"]
-            aux_obstacle_logits = details["aux_obstacle_logits"]
-            obstacle_targets = (y == 1).float()
-            effective_obstacle_pos_weight = 1.0 if binary_obstacle_only else float(obstacle_pos_weight)
-            pos_weight_t = torch.tensor(
-                effective_obstacle_pos_weight,
-                device=obstacle_logits.device,
-                dtype=obstacle_logits.dtype,
-            )
-            if binary_obstacle_only:
-                obstacle_loss = F.binary_cross_entropy_with_logits(
-                    obstacle_logits,
-                    obstacle_targets,
-                    reduction="mean",
+        grad_context = nullcontext() if is_train else torch.inference_mode()
+        with grad_context:
+            with amp_context:
+                details = model.forward_with_training_details(x, lengths)
+                logits = details["class_logits"]
+                obstacle_logits = details["obstacle_logits"]
+                ground_none_logits = details["ground_none_logits"]
+                aux_obstacle_logits = details["aux_obstacle_logits"]
+                obstacle_targets = (y == 1).float()
+                effective_obstacle_pos_weight = 1.0 if binary_obstacle_only else float(obstacle_pos_weight)
+                pos_weight_t = torch.tensor(
+                    effective_obstacle_pos_weight,
+                    device=obstacle_logits.device,
+                    dtype=obstacle_logits.dtype,
                 )
-            else:
-                obstacle_loss = balanced_hard_obstacle_bce_loss(
-                    obstacle_logits,
-                    obstacle_targets,
-                    pos_weight=pos_weight_t,
-                    hard_fraction=hard_example_fraction,
-                )
-            aux_loss_terms: list[torch.Tensor] = []
-            for aux_logits in aux_obstacle_logits:
                 if binary_obstacle_only:
-                    aux_loss_terms.append(
-                        F.binary_cross_entropy_with_logits(
-                            aux_logits,
-                            obstacle_targets,
-                            reduction="mean",
-                        )
+                    obstacle_loss = F.binary_cross_entropy_with_logits(
+                        obstacle_logits,
+                        obstacle_targets,
+                        reduction="mean",
                     )
                 else:
-                    aux_loss_terms.append(
-                        balanced_hard_obstacle_bce_loss(
-                            aux_logits,
-                            obstacle_targets,
-                            pos_weight=pos_weight_t,
-                            hard_fraction=hard_example_fraction,
-                        )
+                    obstacle_loss = balanced_hard_obstacle_bce_loss(
+                        obstacle_logits,
+                        obstacle_targets,
+                        pos_weight=pos_weight_t,
+                        hard_fraction=hard_example_fraction,
                     )
-            if aux_loss_terms:
-                obstacle_aux_loss = torch.stack(aux_loss_terms).mean()
-            else:
-                obstacle_aux_loss = obstacle_loss.new_zeros(())
-            safe_mask = y != 1
-            if safe_mask.any():
-                ground_none_targets = (y[safe_mask] == 0).float()
-                safe_type_loss = F.binary_cross_entropy_with_logits(
-                    ground_none_logits[safe_mask],
-                    ground_none_targets,
-                    reduction="mean",
-                )
-            else:
-                safe_type_loss = obstacle_loss.new_zeros(())
-            if binary_obstacle_only:
-                loss = obstacle_loss + (float(obstacle_aux_weight) * obstacle_aux_loss)
-            else:
-                loss = (
-                    (float(obstacle_primary_loss_weight) * obstacle_loss)
-                    + (float(obstacle_aux_weight) * obstacle_aux_loss)
-                    + (float(safe_type_loss_weight) * safe_type_loss)
-                )
+                aux_loss_terms: list[torch.Tensor] = []
+                for aux_logits in aux_obstacle_logits:
+                    if binary_obstacle_only:
+                        aux_loss_terms.append(
+                            F.binary_cross_entropy_with_logits(
+                                aux_logits,
+                                obstacle_targets,
+                                reduction="mean",
+                            )
+                        )
+                    else:
+                        aux_loss_terms.append(
+                            balanced_hard_obstacle_bce_loss(
+                                aux_logits,
+                                obstacle_targets,
+                                pos_weight=pos_weight_t,
+                                hard_fraction=hard_example_fraction,
+                            )
+                        )
+                if aux_loss_terms:
+                    obstacle_aux_loss = torch.stack(aux_loss_terms).mean()
+                else:
+                    obstacle_aux_loss = obstacle_loss.new_zeros(())
+                safe_mask = y != 1
+                if safe_mask.any():
+                    ground_none_targets = (y[safe_mask] == 0).float()
+                    safe_type_loss = F.binary_cross_entropy_with_logits(
+                        ground_none_logits[safe_mask],
+                        ground_none_targets,
+                        reduction="mean",
+                    )
+                else:
+                    safe_type_loss = obstacle_loss.new_zeros(())
+                if binary_obstacle_only:
+                    loss = obstacle_loss + (float(obstacle_aux_weight) * obstacle_aux_loss)
+                else:
+                    loss = (
+                        (float(obstacle_primary_loss_weight) * obstacle_loss)
+                        + (float(obstacle_aux_weight) * obstacle_aux_loss)
+                        + (float(safe_type_loss_weight) * safe_type_loss)
+                    )
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
