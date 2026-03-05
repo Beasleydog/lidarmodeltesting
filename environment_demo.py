@@ -75,6 +75,11 @@ OBSTACLE_MAX_OVERLAP_RATIO = 0.32
 OBSTACLE_MAX_ATTEMPTS_FACTOR = 35
 OBSTACLE_EDGE_START_FRAC = 0.78
 OBSTACLE_SIDE_EXPONENT = 0.22
+OBSTACLE_CRATER_PROB = 0.30
+CRATER_RADIUS_SCALE_MIN = 0.85
+CRATER_RADIUS_SCALE_MAX = 1.60
+CRATER_DEPTH_RADIUS_MULT_MIN = 0.50
+CRATER_DEPTH_RADIUS_MULT_MAX = 0.80
 # Ranges for dataset world randomization (used by data.py).
 WORLDGEN_OBSTACLE_COUNT_RANGE = (70, 140)
 WORLDGEN_TERRAIN_HEIGHT_SCALE_RANGE_CM = (300.0, 900.0)
@@ -299,6 +304,11 @@ def generate_environment(
     obstacle_max_attempts_factor: int = OBSTACLE_MAX_ATTEMPTS_FACTOR,
     obstacle_edge_start_frac: float = OBSTACLE_EDGE_START_FRAC,
     obstacle_side_exponent: float = OBSTACLE_SIDE_EXPONENT,
+    obstacle_crater_prob: float = OBSTACLE_CRATER_PROB,
+    crater_radius_scale_min: float = CRATER_RADIUS_SCALE_MIN,
+    crater_radius_scale_max: float = CRATER_RADIUS_SCALE_MAX,
+    crater_depth_radius_mult_min: float = CRATER_DEPTH_RADIUS_MULT_MIN,
+    crater_depth_radius_mult_max: float = CRATER_DEPTH_RADIUS_MULT_MAX,
 ) -> Environment:
     rng = np.random.default_rng(seed)
     obstacle_count = int(max(obstacle_count, 0))
@@ -317,6 +327,11 @@ def generate_environment(
     obstacle_max_attempts_factor = int(max(obstacle_max_attempts_factor, 1))
     obstacle_edge_start_frac = float(np.clip(obstacle_edge_start_frac, 0.0, 0.98))
     obstacle_side_exponent = float(max(obstacle_side_exponent, 0.05))
+    obstacle_crater_prob = float(np.clip(obstacle_crater_prob, 0.0, 1.0))
+    crater_radius_scale_min = float(min(crater_radius_scale_min, crater_radius_scale_max))
+    crater_radius_scale_max = float(max(crater_radius_scale_min, crater_radius_scale_max))
+    crater_depth_radius_mult_min = float(min(crater_depth_radius_mult_min, crater_depth_radius_mult_max))
+    crater_depth_radius_mult_max = float(max(crater_depth_radius_mult_min, crater_depth_radius_mult_max))
 
     axis = np.linspace(-world_size / 2.0, world_size / 2.0, size)
     x, y = np.meshgrid(axis, axis)
@@ -334,46 +349,68 @@ def generate_environment(
 
     placed = 0
     attempts = 0
-    max_attempts = obstacle_count * obstacle_max_attempts_factor
+    # Draw obstacle type per intended placement so successful placements stay near the requested mix.
+    obstacle_is_crater = rng.random(obstacle_count) < obstacle_crater_prob
 
-    while placed < obstacle_count and attempts < max_attempts:
-        attempts += 1
-        center_x = rng.uniform(-0.45 * world_size, 0.45 * world_size)
-        center_y = rng.uniform(-0.45 * world_size, 0.45 * world_size)
-        radius = rng.uniform(radius_min_frac * world_size, radius_max_frac * world_size)
-        vertices = int(rng.integers(5, 9))
-        if rng.random() < obstacle_tall_prob:
-            obstacle_height = rng.uniform(obstacle_tall_min_cm, obstacle_tall_max_cm)
-        else:
-            obstacle_height = rng.uniform(obstacle_height_min_cm, obstacle_height_max_cm)
+    for is_crater in obstacle_is_crater:
+        for _ in range(obstacle_max_attempts_factor):
+            attempts += 1
+            center_x = rng.uniform(-0.45 * world_size, 0.45 * world_size)
+            center_y = rng.uniform(-0.45 * world_size, 0.45 * world_size)
+            radius = rng.uniform(radius_min_frac * world_size, radius_max_frac * world_size)
+            if rng.random() < obstacle_tall_prob:
+                obstacle_height = rng.uniform(obstacle_tall_min_cm, obstacle_tall_max_cm)
+            else:
+                obstacle_height = rng.uniform(obstacle_height_min_cm, obstacle_height_max_cm)
 
-        poly = random_polygon(rng, center_x, center_y, radius, vertices)
-        mask = rasterize_polygon(poly, x, y)
-        mask_area = int(mask.sum())
-        if mask_area < 4:
-            continue
+            if is_crater:
+                crater_radius = radius * rng.uniform(crater_radius_scale_min, crater_radius_scale_max)
+                crater_radius = max(float(crater_radius), 1e-6)
+                dx = (x - center_x) / crater_radius
+                dy = (y - center_y) / crater_radius
+                d_full = np.sqrt(dx * dx + dy * dy)
+                mask = d_full <= 1.0
+            else:
+                vertices = int(rng.integers(5, 9))
+                poly = random_polygon(rng, center_x, center_y, radius, vertices)
+                mask = rasterize_polygon(poly, x, y)
+            mask_area = int(mask.sum())
+            if mask_area < 4:
+                continue
 
-        overlap_ratio = float((mask & occupancy_core).sum()) / float(mask_area)
-        if overlap_ratio > obstacle_max_overlap_ratio:
-            continue
+            overlap_ratio = float((mask & occupancy_core).sum()) / float(mask_area)
+            if overlap_ratio > obstacle_max_overlap_ratio:
+                continue
 
-        # Steeper edge-band profile so rocks rise abruptly near the perimeter.
-        dx = (x[mask] - center_x) / (radius + 1e-8)
-        dy = (y[mask] - center_y) / (radius + 1e-8)
-        d = np.sqrt(dx * dx + dy * dy)
-        edge_band = np.clip(
-            (1.0 - d) / (1.0 - obstacle_edge_start_frac + 1e-8),
-            0.0,
-            1.0,
-        )
-        profile = edge_band ** obstacle_side_exponent
-        roughness = rng.uniform(0.80, 1.22, size=profile.shape)
-        z[mask] += obstacle_height * profile * roughness
-        occupancy_core |= mask
-        placed += 1
+            if is_crater:
+                d = d_full[mask]
+                # Smooth hemispherical bowl profile ("semicircle" cross-section).
+                profile = np.sqrt(np.clip(1.0 - d * d, 0.0, 1.0))
+                roughness = rng.uniform(0.93, 1.07, size=profile.shape)
+                crater_depth = crater_radius * rng.uniform(
+                    crater_depth_radius_mult_min,
+                    crater_depth_radius_mult_max,
+                )
+                z[mask] -= crater_depth * profile * roughness
+            else:
+                # Steeper edge-band profile so rocks rise abruptly near the perimeter.
+                dx = (x[mask] - center_x) / (radius + 1e-8)
+                dy = (y[mask] - center_y) / (radius + 1e-8)
+                d = np.sqrt(dx * dx + dy * dy)
+                edge_band = np.clip(
+                    (1.0 - d) / (1.0 - obstacle_edge_start_frac + 1e-8),
+                    0.0,
+                    1.0,
+                )
+                profile = edge_band ** obstacle_side_exponent
+                roughness = rng.uniform(0.80, 1.22, size=profile.shape)
+                z[mask] += obstacle_height * profile * roughness
+            occupancy_core |= mask
+            placed += 1
+            break
 
     deformation = z - z_base
-    occupancy = deformation > DEFORMATION_EPS_CM
+    occupancy = np.abs(deformation) > DEFORMATION_EPS_CM
     return Environment(x=x, y=y, z=z, z_base=z_base, occupancy=occupancy)
 
 
@@ -701,7 +738,7 @@ def cast_lidar_ray(
         d0v = d00 * (1.0 - tx) + d10 * tx
         d1v = d01 * (1.0 - tx) + d11 * tx
         deformation_cm = d0v * (1.0 - ty) + d1v * ty
-        return bool(deformation_cm > DEFORMATION_EPS_CM)
+        return bool(abs(deformation_cm) > DEFORMATION_EPS_CM)
 
     ray_points = start[None, :] + distance_samples_cm[:, None] * direction[None, :]
     heights = sample_height_bilinear_many(env, ray_points[:, 0], ray_points[:, 1], sampler)

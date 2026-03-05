@@ -350,7 +350,7 @@ def _is_state_on_obstacle(
     probes = np.vstack((center, footprint_world, mids))
     hit_count = 0
     for px, py in probes:
-        if _deformation_at_xy_cm(deformation_grid, sampler, float(px), float(py)) >= deformation_threshold_cm:
+        if abs(_deformation_at_xy_cm(deformation_grid, sampler, float(px), float(py))) >= deformation_threshold_cm:
             hit_count += 1
             if hit_count >= TELEPORT_MIN_PROBE_HITS:
                 return True
@@ -730,8 +730,11 @@ def generate_world_dataset(
 
     sampler = build_height_sampler(env)
     deformation_grid = env.z - env.z_base
-    positive_deformation = deformation_grid[deformation_grid > DEFORMATION_EPS_CM]
-    world_obstacle_p90_cm = float(np.quantile(positive_deformation, 0.90)) if positive_deformation.size > 0 else 0.0
+    abs_deformation = np.abs(deformation_grid)
+    nontrivial_deformation = abs_deformation[abs_deformation > DEFORMATION_EPS_CM]
+    world_obstacle_p90_cm = (
+        float(np.quantile(nontrivial_deformation, 0.90)) if nontrivial_deformation.size > 0 else 0.0
+    )
     teleport_deformation_threshold_cm = max(
         TELEPORT_MIN_DEFORMATION_CM,
         TELEPORT_MIN_DEFORMATION_WORLD_P90_RATIO * world_obstacle_p90_cm,
