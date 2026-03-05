@@ -465,6 +465,10 @@ class SequencePieceDataset(Dataset):
         history_step_min: int = 1,
         history_step_max: int = 4,
         lidar_offset_max_cm: float = 0.0,
+        diversity_max_per_signature: int = 0,
+        diversity_ref_samples: int = 50_000,
+        diversity_quant_scale: float = 0.20,
+        diversity_min_step: float = 0.05,
         seed: int = 0,
     ):
         self.features_by_world = features_by_world
@@ -477,6 +481,14 @@ class SequencePieceDataset(Dataset):
         self.lidar_offset_max_cm = float(max(lidar_offset_max_cm, 0.0))
         self.index: list[tuple[int, np.ndarray, int]] = []
         self.sample_has_obstacle_target: list[bool] = []
+        self.diversity_stats: dict[str, int | float] = {
+            "enabled": 0,
+            "before": 0,
+            "after": 0,
+            "kept_fraction": 1.0,
+            "unique_signatures_kept": 0,
+            "max_per_signature": int(max(diversity_max_per_signature, 0)),
+        }
         self._offset_rng = np.random.default_rng(seed + 10_000_019)
 
         if not features_by_world or not targets_by_world:
@@ -523,6 +535,83 @@ class SequencePieceDataset(Dataset):
                     )
                     self.index.append((wi, time_indices, end))
                     self.sample_has_obstacle_target.append(bool(np.any(self.targets_by_world[wi][end] == 1)))
+
+        self._apply_diversity_filter(
+            max_per_signature=int(max(diversity_max_per_signature, 0)),
+            ref_samples=int(max(diversity_ref_samples, 1)),
+            quant_scale=float(max(diversity_quant_scale, 1e-6)),
+            min_step=float(max(diversity_min_step, 1e-6)),
+            rng=rng,
+        )
+
+    def _estimate_signature_quant_step(
+        self,
+        ref_samples: int,
+        quant_scale: float,
+        min_step: float,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        total = len(self.index)
+        sample_n = min(int(max(ref_samples, 1)), total)
+        if sample_n <= 0:
+            return np.full((self.features_by_world[0].shape[1],), float(min_step), dtype=np.float32)
+        pick = rng.choice(total, size=sample_n, replace=False)
+        sampled_end_feat = np.empty((sample_n, self.features_by_world[0].shape[1]), dtype=np.float32)
+        for i, idx in enumerate(pick.tolist()):
+            wi, _, end = self.index[int(idx)]
+            sampled_end_feat[i] = self.features_by_world[wi][end]
+        feat_std = sampled_end_feat.std(axis=0, dtype=np.float64)
+        quant_step = np.maximum(feat_std * float(quant_scale), float(min_step)).astype(np.float32)
+        return quant_step
+
+    def _apply_diversity_filter(
+        self,
+        max_per_signature: int,
+        ref_samples: int,
+        quant_scale: float,
+        min_step: float,
+        rng: np.random.Generator,
+    ) -> None:
+        before = len(self.index)
+        self.diversity_stats["before"] = int(before)
+        if max_per_signature <= 0 or before <= 1:
+            self.diversity_stats["after"] = int(before)
+            self.diversity_stats["kept_fraction"] = 1.0
+            return
+
+        quant_step = self._estimate_signature_quant_step(ref_samples, quant_scale, min_step, rng)
+        order = rng.permutation(before)
+        keep_mask = np.zeros((before,), dtype=bool)
+        signature_counts: dict[bytes, int] = {}
+
+        for idx in order.tolist():
+            wi, time_indices, end = self.index[int(idx)]
+            end_feat = self.features_by_world[wi][end]
+            quantized = np.rint(end_feat / quant_step).astype(np.int32, copy=False)
+            hist_len = int(time_indices.shape[0])
+            signature = quantized.tobytes() + int(hist_len).to_bytes(2, byteorder="little", signed=False)
+            current = int(signature_counts.get(signature, 0))
+            if current >= max_per_signature:
+                continue
+            keep_mask[int(idx)] = True
+            signature_counts[signature] = current + 1
+
+        kept_indices = np.flatnonzero(keep_mask).tolist()
+        self.index = [self.index[int(i)] for i in kept_indices]
+        self.sample_has_obstacle_target = [self.sample_has_obstacle_target[int(i)] for i in kept_indices]
+        after = len(self.index)
+        self.diversity_stats.update(
+            {
+                "enabled": 1,
+                "after": int(after),
+                "kept_fraction": float(after) / float(max(before, 1)),
+                "unique_signatures_kept": int(len(signature_counts)),
+                "max_per_signature": int(max_per_signature),
+                "ref_samples": int(ref_samples),
+                "quant_scale": float(quant_scale),
+                "min_step": float(min_step),
+            }
+        )
 
     @staticmethod
     def _max_history_length_for_end(end: int, max_history: int, step_min: int) -> int:
@@ -2480,6 +2569,10 @@ def build_loaders(
     history_step_max: int,
     obstacle_oversample_target_frac: float,
     train_lidar_offset_max_cm: float,
+    train_diversity_max_per_signature: int,
+    train_diversity_ref_samples: int,
+    train_diversity_quant_scale: float,
+    train_diversity_min_step: float,
     feature_mode: str,
     no_hit_range_cm: float,
     seed: int,
@@ -2583,6 +2676,10 @@ def build_loaders(
         history_step_min=history_step_min,
         history_step_max=history_step_max,
         lidar_offset_max_cm=effective_train_lidar_offset_max_cm,
+        diversity_max_per_signature=int(max(train_diversity_max_per_signature, 0)),
+        diversity_ref_samples=int(max(train_diversity_ref_samples, 1)),
+        diversity_quant_scale=float(max(train_diversity_quant_scale, 1e-6)),
+        diversity_min_step=float(max(train_diversity_min_step, 1e-6)),
         seed=seed,
     )
     val_ds = SequencePieceDataset(
@@ -2596,9 +2693,19 @@ def build_loaders(
         history_step_min=history_step_min,
         history_step_max=history_step_max,
         lidar_offset_max_cm=0.0,
+        diversity_max_per_signature=0,
         seed=seed + 1,
     )
     log(f"Dataset samples -> train={len(train_ds)} val={len(val_ds)}")
+    if int(train_ds.diversity_stats.get("enabled", 0)) == 1:
+        log(
+            "Train diversity filter enabled: "
+            f"before={int(train_ds.diversity_stats['before'])} "
+            f"after={int(train_ds.diversity_stats['after'])} "
+            f"kept_frac={float(train_ds.diversity_stats['kept_fraction']):.3f} "
+            f"unique={int(train_ds.diversity_stats['unique_signatures_kept'])} "
+            f"max_per_signature={int(train_ds.diversity_stats['max_per_signature'])}"
+        )
 
     train_sample_weights, oversample_meta = compute_obstacle_oversample_weights(
         train_ds,
@@ -2679,6 +2786,15 @@ def build_loaders(
         "train_sampled_obstacle_target_fraction": float(oversample_meta["sampled_obstacle_fraction"]),
         "train_teleport_rows": int(np.sum([int(np.sum(w > 0)) for w in train_teleports])),
         "val_teleport_rows": int(np.sum([int(np.sum(w > 0)) for w in val_teleports])),
+        "train_diversity_enabled": bool(int(train_ds.diversity_stats.get("enabled", 0)) == 1),
+        "train_diversity_before": int(train_ds.diversity_stats.get("before", len(train_ds))),
+        "train_diversity_after": int(train_ds.diversity_stats.get("after", len(train_ds))),
+        "train_diversity_kept_fraction": float(train_ds.diversity_stats.get("kept_fraction", 1.0)),
+        "train_diversity_unique_signatures": int(train_ds.diversity_stats.get("unique_signatures_kept", 0)),
+        "train_diversity_max_per_signature": int(train_ds.diversity_stats.get("max_per_signature", 0)),
+        "train_diversity_ref_samples": int(train_ds.diversity_stats.get("ref_samples", train_diversity_ref_samples)),
+        "train_diversity_quant_scale": float(train_ds.diversity_stats.get("quant_scale", train_diversity_quant_scale)),
+        "train_diversity_min_step": float(train_ds.diversity_stats.get("min_step", train_diversity_min_step)),
         "train_class_counts": np.bincount(
             np.concatenate([t.reshape(-1) for t in train_targets]),
             minlength=3,
@@ -2732,6 +2848,10 @@ def main() -> None:
     parser.add_argument("--history-step-min", type=int, default=4)
     parser.add_argument("--history-step-max", type=int, default=16)
     parser.add_argument("--train-lidar-offset-max-cm", type=float, default=300.0)
+    parser.add_argument("--train-diversity-max-per-signature", type=int, default=2)
+    parser.add_argument("--train-diversity-ref-samples", type=int, default=50000)
+    parser.add_argument("--train-diversity-quant-scale", type=float, default=0.20)
+    parser.add_argument("--train-diversity-min-step", type=float, default=0.05)
     parser.add_argument("--no-hit-range-cm", type=float, default=DEFAULT_LIDAR_MAX_RANGE_CM)
     parser.add_argument("--obstacle-oversample-target-frac", type=float, default=0.50)
     parser.add_argument("--seed", type=int, default=7)
@@ -2826,6 +2946,10 @@ def main() -> None:
         history_step_max=args.history_step_max,
         obstacle_oversample_target_frac=effective_obstacle_oversample_target_frac,
         train_lidar_offset_max_cm=args.train_lidar_offset_max_cm,
+        train_diversity_max_per_signature=args.train_diversity_max_per_signature,
+        train_diversity_ref_samples=args.train_diversity_ref_samples,
+        train_diversity_quant_scale=args.train_diversity_quant_scale,
+        train_diversity_min_step=args.train_diversity_min_step,
         feature_mode=feature_mode,
         no_hit_range_cm=no_hit_range_cm,
         seed=args.seed,
@@ -2852,6 +2976,16 @@ def main() -> None:
         "Training lidar offset augmentation: "
         f"max_cm={meta['train_lidar_offset_max_cm']:.1f} (uniform in [0,max] per sampled history)"
     )
+    if bool(meta.get("train_diversity_enabled", False)):
+        log(
+            "Training diversity pruning: "
+            f"before={meta['train_diversity_before']} after={meta['train_diversity_after']} "
+            f"kept_frac={meta['train_diversity_kept_fraction']:.3f} "
+            f"unique={meta['train_diversity_unique_signatures']} "
+            f"max_per_signature={meta['train_diversity_max_per_signature']}"
+        )
+    else:
+        log("Training diversity pruning: disabled")
     log(
         "Obstacle-target sample mix: "
         f"natural={meta['train_obstacle_target_fraction']:.3f} "
@@ -3109,6 +3243,15 @@ def main() -> None:
                 "history_step_min": args.history_step_min,
                 "history_step_max": args.history_step_max,
                 "train_lidar_offset_max_cm": float(meta["train_lidar_offset_max_cm"]),
+                "train_diversity_enabled": bool(meta.get("train_diversity_enabled", False)),
+                "train_diversity_before": int(meta.get("train_diversity_before", meta["num_train_samples"])),
+                "train_diversity_after": int(meta.get("train_diversity_after", meta["num_train_samples"])),
+                "train_diversity_kept_fraction": float(meta.get("train_diversity_kept_fraction", 1.0)),
+                "train_diversity_unique_signatures": int(meta.get("train_diversity_unique_signatures", 0)),
+                "train_diversity_max_per_signature": int(meta.get("train_diversity_max_per_signature", 0)),
+                "train_diversity_ref_samples": int(meta.get("train_diversity_ref_samples", 0)),
+                "train_diversity_quant_scale": float(meta.get("train_diversity_quant_scale", 0.0)),
+                "train_diversity_min_step": float(meta.get("train_diversity_min_step", 0.0)),
                 "feature_mode": meta["feature_mode"],
                 "no_hit_range_cm": float(meta["no_hit_range_cm"]),
                 "obstacle_oversample_target_frac": effective_obstacle_oversample_target_frac,
@@ -3225,6 +3368,15 @@ def main() -> None:
                         "history_step_min": args.history_step_min,
                         "history_step_max": args.history_step_max,
                         "train_lidar_offset_max_cm": float(meta["train_lidar_offset_max_cm"]),
+                        "train_diversity_enabled": bool(meta.get("train_diversity_enabled", False)),
+                        "train_diversity_before": int(meta.get("train_diversity_before", meta["num_train_samples"])),
+                        "train_diversity_after": int(meta.get("train_diversity_after", meta["num_train_samples"])),
+                        "train_diversity_kept_fraction": float(meta.get("train_diversity_kept_fraction", 1.0)),
+                        "train_diversity_unique_signatures": int(meta.get("train_diversity_unique_signatures", 0)),
+                        "train_diversity_max_per_signature": int(meta.get("train_diversity_max_per_signature", 0)),
+                        "train_diversity_ref_samples": int(meta.get("train_diversity_ref_samples", 0)),
+                        "train_diversity_quant_scale": float(meta.get("train_diversity_quant_scale", 0.0)),
+                        "train_diversity_min_step": float(meta.get("train_diversity_min_step", 0.0)),
                         "feature_mode": meta["feature_mode"],
                         "no_hit_range_cm": float(meta["no_hit_range_cm"]),
                         "obstacle_oversample_target_frac": effective_obstacle_oversample_target_frac,
