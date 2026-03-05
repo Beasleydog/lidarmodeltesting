@@ -2713,7 +2713,7 @@ def main() -> None:
         default="obstacle_first_ego_map_cnn",
     )
     parser.add_argument("--epochs", type=int, default=40)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=288)
     parser.add_argument("--hidden-dim", type=int, default=96)
     parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.40)
