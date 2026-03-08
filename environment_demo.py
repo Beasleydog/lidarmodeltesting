@@ -1,1196 +1,291 @@
-from dataclasses import dataclass
-import json
-from pathlib import Path
-import time
+from __future__ import annotations
 
+import csv
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+import glfw
+import mujoco
 import numpy as np
 
-# ===== Config =====
-GRID_SIZE = 60
-OBSTACLE_COUNT = 220
-SEED = 67
+from physics_sim import LIDAR_CLASS_NONE, MujocoRoverWorld, SimConfig, WorldConfig
 
-# Rover LIDAR sensor coordinates from documentation (assumed centimeters).
-# Format: (x, y, z) relative to rover origin.
-LIDAR_SENSOR_COORDS_CM = np.array(
-    [
-        (250.0, 245.0, 50.0),
-        (325.0, 75.0, 130.0),
-        (325.0, 0.0, 130.0),
-        (325.0, -75.0, 130.0),
-        (250.0, -245.0, 50.0),
-        (325.0, 75.0, 130.0),
-        (325.0, -75.0, 130.0),
-        (40.0, 235.0, 100.0),
-        (40.0, -235.0, 100.0),
-        (-215.0, 270.0, 70.0),
-        (-320.0, 80.0, 10.0),
-        (-320.0, -50.0, 10.0),
-        (-215.0, -215.0, 70.0),
-        (325.0, 75.0, 130.0),
-        (325.0, -75.0, 130.0),
-        (250.0, 245.0, 50.0),
-        (250.0, -245.0, 50.0),
-    ],
-    dtype=float,
-)
-ROVER_X_MIN_CM = float(LIDAR_SENSOR_COORDS_CM[:, 0].min())
-ROVER_X_MAX_CM = float(LIDAR_SENSOR_COORDS_CM[:, 0].max())
-ROVER_Y_MIN_CM = float(LIDAR_SENSOR_COORDS_CM[:, 1].min())
-ROVER_Y_MAX_CM = float(LIDAR_SENSOR_COORDS_CM[:, 1].max())
-ROVER_LENGTH_CM = ROVER_X_MAX_CM - ROVER_X_MIN_CM
-ROVER_WIDTH_CM = ROVER_Y_MAX_CM - ROVER_Y_MIN_CM
-ROVER_SPAN_CM = max(ROVER_LENGTH_CM, ROVER_WIDTH_CM)
-ROVER_FOOTPRINT_LOCAL = np.array(
-    [
-        [ROVER_X_MIN_CM, ROVER_Y_MIN_CM],
-        [ROVER_X_MAX_CM, ROVER_Y_MIN_CM],
-        [ROVER_X_MAX_CM, ROVER_Y_MAX_CM],
-        [ROVER_X_MIN_CM, ROVER_Y_MAX_CM],
-    ],
-    dtype=float,
-)
-ROVER_FOOTPRINT_CENTER_LOCAL = ROVER_FOOTPRINT_LOCAL.mean(axis=0)
-WORLD_SIZE_MULTIPLIER = 60.0
-WORLD_SIZE_CM = ROVER_SPAN_CM * WORLD_SIZE_MULTIPLIER
-
-# Terrain smoothness controls
-NOISE_OCTAVES = 5
-NOISE_BASE_CELLS = 2
-NOISE_PERSISTENCE = 0.62
-TERRAIN_HEIGHT_SCALE_CM = 520.0
-DEMO_TERRAIN_HEIGHT_SCALE_MULTIPLIER = 0.5
-TERRAIN_VERTICAL_EXAGGERATION = 3.4
-TERRAIN_SMOOTHING_PASSES = 2
-TERRAIN_SMOOTHING_BLEND = 0.65
-LIDAR_RANGE_CM = 1000.0
-OBSTACLE_RADIUS_MIN_FRAC = 0.015
-OBSTACLE_RADIUS_MAX_FRAC = 0.022
-OBSTACLE_HEIGHT_MIN_CM = 110.0
-OBSTACLE_HEIGHT_MAX_CM = 320.0
-OBSTACLE_TALL_MIN_CM = 300.0
-OBSTACLE_TALL_MAX_CM = 520.0
-OBSTACLE_TALL_PROB = 0.30
-OBSTACLE_MAX_OVERLAP_RATIO = 0.32
-OBSTACLE_MAX_ATTEMPTS_FACTOR = 35
-OBSTACLE_EDGE_START_FRAC = 0.78
-OBSTACLE_SIDE_EXPONENT = 0.22
-OBSTACLE_CRATER_PROB = 0.30
-CRATER_RADIUS_SCALE_MIN = 0.85
-CRATER_RADIUS_SCALE_MAX = 1.60
-CRATER_DEPTH_RADIUS_MULT_MIN = 0.50
-CRATER_DEPTH_RADIUS_MULT_MAX = 0.80
-# Ranges for dataset world randomization (used by data.py).
-WORLDGEN_OBSTACLE_COUNT_RANGE = (70, 140)
-WORLDGEN_TERRAIN_HEIGHT_SCALE_RANGE_CM = (300.0, 900.0)
-WORLDGEN_NOISE_OCTAVES_RANGE = (3, 6)
-WORLDGEN_NOISE_BASE_CELLS_RANGE = (1, 5)
-WORLDGEN_NOISE_PERSISTENCE_RANGE = (0.35, 0.72)
-WORLDGEN_OBSTACLE_RADIUS_MIN_FRAC_RANGE = (0.009, 0.020)
-WORLDGEN_OBSTACLE_RADIUS_MAX_FRAC_RANGE = (0.018, 0.040)
-WORLDGEN_OBSTACLE_HEIGHT_RANGE_CM = (70.0, 420.0)
-WORLDGEN_OBSTACLE_TALL_HEIGHT_RANGE_CM = (220.0, 700.0)
-WORLDGEN_OBSTACLE_TALL_PROB_RANGE = (0.12, 0.48)
-WORLDGEN_OBSTACLE_MAX_OVERLAP_RATIO_RANGE = (0.12, 0.48)
-WORLDGEN_OBSTACLE_EDGE_START_FRAC_RANGE = (0.58, 0.88)
-WORLDGEN_OBSTACLE_SIDE_EXPONENT_RANGE = (0.14, 0.52)
-OCCUPANCY_OVERLAY_OFFSET_CM = 10.0
-OCCUPANCY_FREE_COLOR = "#2f8f5b"
-OCCUPANCY_OCCUPIED_COLOR = "#ff2b2b"
-OCCUPANCY_FREE_OPACITY = 0.08
-OCCUPANCY_OCCUPIED_OPACITY = 0.45
-OCCUPANCY_MAP_CLEARANCE_CM = 900.0
-DEFORMATION_EPS_CM = 1e-6
-OCCUPIED_MARKER_SIZE = 5.0
-ROVER_MOVE_STEP_CM = 60.0
-ROVER_TURN_STEP_DEG = 2.0
-ROVER_COARSE_MOVE_STEP_CM = 140.0
-ROVER_COARSE_TURN_STEP_DEG = 6.0
-LIDAR_SAMPLE_STEP_CM = 25.0
-LIDAR_OBSTACLE_COLOR = "#ff2b2b"
-LIDAR_GROUND_COLOR = "#2b7bff"
-LIDAR_CLEAR_COLOR = "#32d14f"
-LIDAR_CLASS_GROUND = 0
-LIDAR_CLASS_OBSTACLE = 1
-LIDAR_CLASS_NONE = 2
-TERRAIN_CMAP = ["#ffffff", "#f3f3f3", "#d8d8d8", "#b88e62", "#915a2b", "#5a2a10"]
-USE_MODEL_LIDAR_CLASSIFIER = True
-MODEL_LIDAR_CHECKPOINT_PATH = "runs/gru_lidar_classifier.pt"
-MODEL_LIDAR_MAX_HISTORY = 64
-MODEL_LIDAR_HISTORY_PUSH_EVERY_TICKS = 5
-MODEL_LIDAR_USE_CALIBRATED_BIAS = True
-MODEL_LIDAR_DEFAULT_OBSTACLE_BIAS = 0.3
-MODEL_LIDAR_BIAS_SELECTION = "best_by_accuracy"
-MODEL_PREDICTED_OBSTACLE_MARKER_HEIGHT_CM = 220.0
-MODEL_PREDICTED_OBSTACLE_MARKERS_PERSIST = True
-
-# (yaw_deg, pitch_deg) in rover frame where +X is forward, +Y is left, +Z is up.
-# Positive yaw rotates CCW from +X toward +Y. Negative pitch points downward.
-LIDAR_YAW_PITCH_DEG = np.array(
-    [
-        (30.0, 0.0),     # 0
-        (20.0, -20.0),   # 1
-        (0.0, 0.0),      # 2
-        (-20.0, -20.0),  # 3
-        (-30.0, 0.0),    # 4
-        (0.0, -25.0),    # 5
-        (0.0, -25.0),    # 6
-        (90.0, -20.0),   # 7
-        (-90.0, -20.0),  # 8
-        (140.0, 0.0),    # 9
-        (180.0, 0.0),    # 10
-        (180.0, 0.0),    # 11
-        (-140.0, 0.0),   # 12
-        (20.0, -10.0),   # 13
-        (-20.0, -10.0),  # 14
-        (15.0, 0.0),     # 15
-        (-15.0, 0.0),    # 16
-    ],
-    dtype=float,
-)
-
-@dataclass
-class Environment:
-    x: np.ndarray
-    y: np.ndarray
-    z: np.ndarray
-    z_base: np.ndarray
-    occupancy: np.ndarray
+SHOW_LIDAR = True
+WINDOW_WIDTH = 1600
+WINDOW_HEIGHT = 900
+CAMERA_DISTANCE = 4.8
+CAMERA_AZIMUTH_DEG = 135.0
+CAMERA_ELEVATION_DEG = -24.0
+CAMERA_LOOKAT_Z_OFFSET_M = 1.4
+CAMERA_AUTO_VISIBILITY_FRAMES = 24
+STATUS_EVERY_S = 0.2
+SCENE_MAX_GEOMS = 20000
+LOG_DIR = Path('logs')
 
 
 @dataclass
-class RoverState:
-    x: float = 0.0
-    y: float = 0.0
-    yaw_deg: float = 0.0
-
-
-@dataclass(frozen=True)
-class RoverPose:
-    origin: np.ndarray
-    basis: np.ndarray
-    center: np.ndarray
-
-
-@dataclass(frozen=True)
-class LidarScan:
-    distances_cm: np.ndarray
-    class_ids: np.ndarray
-    hit_types: np.ndarray
-    start_points: np.ndarray
-    end_points: np.ndarray
-
-
-@dataclass(frozen=True)
-class HeightSampler:
-    x0: float
-    x1: float
-    y0: float
-    y1: float
-    dx: float
-    dy: float
-    max_ix: int
-    max_iy: int
-
-
-def resize_bilinear(grid: np.ndarray, out_size: int) -> np.ndarray:
-    h, w = grid.shape
-    y = np.linspace(0, h - 1, out_size)
-    x = np.linspace(0, w - 1, out_size)
-
-    x0 = np.floor(x).astype(int)
-    x1 = np.clip(x0 + 1, 0, w - 1)
-    y0 = np.floor(y).astype(int)
-    y1 = np.clip(y0 + 1, 0, h - 1)
-
-    wx = x - x0
-    wy = y - y0
-
-    top = (1 - wx)[None, :] * grid[y0[:, None], x0[None, :]] + wx[None, :] * grid[
-        y0[:, None], x1[None, :]
-    ]
-    bottom = (1 - wx)[None, :] * grid[y1[:, None], x0[None, :]] + wx[None, :] * grid[
-        y1[:, None], x1[None, :]
-    ]
-    return (1 - wy)[:, None] * top + wy[:, None] * bottom
-
-
-def generate_smooth_heightmap(
-    size: int,
-    rng: np.random.Generator,
-    octaves: int = NOISE_OCTAVES,
-    base_cells: int = NOISE_BASE_CELLS,
-    persistence: float = NOISE_PERSISTENCE,
-    height_scale: float = TERRAIN_HEIGHT_SCALE_CM,
-) -> np.ndarray:
-    z = np.zeros((size, size), dtype=float)
-    amplitude = 1.0
-    amplitude_sum = 0.0
-    cells = base_cells
-
-    for _ in range(octaves):
-        coarse = rng.random((cells + 1, cells + 1))
-        z += amplitude * resize_bilinear(coarse, size)
-        amplitude_sum += amplitude
-        amplitude *= persistence
-        cells *= 2
-
-    z /= max(amplitude_sum, 1e-8)
-    z = (z - z.min()) / (z.max() - z.min() + 1e-8)
-    for _ in range(TERRAIN_SMOOTHING_PASSES):
-        z = (1.0 - TERRAIN_SMOOTHING_BLEND) * z + TERRAIN_SMOOTHING_BLEND * _blur_heightmap(z)
-    return (z - 0.5) * 2.0 * height_scale
-
-
-def _blur_heightmap(grid: np.ndarray) -> np.ndarray:
-    padded = np.pad(grid, 1, mode="edge")
-    return (
-        padded[:-2, :-2]
-        + 2.0 * padded[:-2, 1:-1]
-        + padded[:-2, 2:]
-        + 2.0 * padded[1:-1, :-2]
-        + 4.0 * padded[1:-1, 1:-1]
-        + 2.0 * padded[1:-1, 2:]
-        + padded[2:, :-2]
-        + 2.0 * padded[2:, 1:-1]
-        + padded[2:, 2:]
-    ) / 16.0
-
-
-def random_polygon(
-    rng: np.random.Generator,
-    center_x: float,
-    center_y: float,
-    radius: float,
-    vertices: int,
-) -> np.ndarray:
-    angles = np.sort(rng.uniform(0.0, 2.0 * np.pi, size=vertices))
-    radii = radius * rng.uniform(0.6, 1.0, size=vertices)
-    px = center_x + radii * np.cos(angles)
-    py = center_y + radii * np.sin(angles)
-    return np.column_stack((px, py))
-
-
-def rasterize_polygon(poly: np.ndarray, x_grid: np.ndarray, y_grid: np.ndarray) -> np.ndarray:
-    inside = np.zeros_like(x_grid, dtype=bool)
-    x0, y0 = poly[-1]
-
-    for x1, y1 in poly:
-        crosses = (y1 > y_grid) != (y0 > y_grid)
-        x_cross = (x0 - x1) * (y_grid - y1) / (y0 - y1 + 1e-12) + x1
-        inside ^= crosses & (x_grid < x_cross)
-        x0, y0 = x1, y1
-
-    return inside
-
-
-def generate_environment(
-    size: int = GRID_SIZE,
-    world_size: float = WORLD_SIZE_CM,
-    obstacle_count: int = OBSTACLE_COUNT,
-    seed: int = SEED,
-    noise_octaves: int = NOISE_OCTAVES,
-    noise_base_cells: int = NOISE_BASE_CELLS,
-    noise_persistence: float = NOISE_PERSISTENCE,
-    terrain_height_scale_cm: float = TERRAIN_HEIGHT_SCALE_CM,
-    obstacle_radius_min_frac: float = OBSTACLE_RADIUS_MIN_FRAC,
-    obstacle_radius_max_frac: float = OBSTACLE_RADIUS_MAX_FRAC,
-    obstacle_height_min_cm: float = OBSTACLE_HEIGHT_MIN_CM,
-    obstacle_height_max_cm: float = OBSTACLE_HEIGHT_MAX_CM,
-    obstacle_tall_min_cm: float = OBSTACLE_TALL_MIN_CM,
-    obstacle_tall_max_cm: float = OBSTACLE_TALL_MAX_CM,
-    obstacle_tall_prob: float = OBSTACLE_TALL_PROB,
-    obstacle_max_overlap_ratio: float = OBSTACLE_MAX_OVERLAP_RATIO,
-    obstacle_max_attempts_factor: int = OBSTACLE_MAX_ATTEMPTS_FACTOR,
-    obstacle_edge_start_frac: float = OBSTACLE_EDGE_START_FRAC,
-    obstacle_side_exponent: float = OBSTACLE_SIDE_EXPONENT,
-    obstacle_crater_prob: float = OBSTACLE_CRATER_PROB,
-    crater_radius_scale_min: float = CRATER_RADIUS_SCALE_MIN,
-    crater_radius_scale_max: float = CRATER_RADIUS_SCALE_MAX,
-    crater_depth_radius_mult_min: float = CRATER_DEPTH_RADIUS_MULT_MIN,
-    crater_depth_radius_mult_max: float = CRATER_DEPTH_RADIUS_MULT_MAX,
-) -> Environment:
-    rng = np.random.default_rng(seed)
-    obstacle_count = int(max(obstacle_count, 0))
-    noise_octaves = int(max(noise_octaves, 1))
-    noise_base_cells = int(max(noise_base_cells, 1))
-    noise_persistence = float(np.clip(noise_persistence, 0.05, 0.95))
-    terrain_height_scale_cm = float(max(terrain_height_scale_cm, 1.0))
-    radius_min_frac = float(min(obstacle_radius_min_frac, obstacle_radius_max_frac))
-    radius_max_frac = float(max(obstacle_radius_min_frac, obstacle_radius_max_frac))
-    obstacle_height_min_cm = float(min(obstacle_height_min_cm, obstacle_height_max_cm))
-    obstacle_height_max_cm = float(max(obstacle_height_min_cm, obstacle_height_max_cm))
-    obstacle_tall_min_cm = float(min(obstacle_tall_min_cm, obstacle_tall_max_cm))
-    obstacle_tall_max_cm = float(max(obstacle_tall_min_cm, obstacle_tall_max_cm))
-    obstacle_tall_prob = float(np.clip(obstacle_tall_prob, 0.0, 1.0))
-    obstacle_max_overlap_ratio = float(np.clip(obstacle_max_overlap_ratio, 0.0, 1.0))
-    obstacle_max_attempts_factor = int(max(obstacle_max_attempts_factor, 1))
-    obstacle_edge_start_frac = float(np.clip(obstacle_edge_start_frac, 0.0, 0.98))
-    obstacle_side_exponent = float(max(obstacle_side_exponent, 0.05))
-    obstacle_crater_prob = float(np.clip(obstacle_crater_prob, 0.0, 1.0))
-    crater_radius_scale_min = float(min(crater_radius_scale_min, crater_radius_scale_max))
-    crater_radius_scale_max = float(max(crater_radius_scale_min, crater_radius_scale_max))
-    crater_depth_radius_mult_min = float(min(crater_depth_radius_mult_min, crater_depth_radius_mult_max))
-    crater_depth_radius_mult_max = float(max(crater_depth_radius_mult_min, crater_depth_radius_mult_max))
-
-    axis = np.linspace(-world_size / 2.0, world_size / 2.0, size)
-    x, y = np.meshgrid(axis, axis)
-
-    z_base = generate_smooth_heightmap(
-        size=size,
-        rng=rng,
-        octaves=noise_octaves,
-        base_cells=noise_base_cells,
-        persistence=noise_persistence,
-        height_scale=terrain_height_scale_cm,
-    )
-    z = z_base.copy()
-    occupancy_core = np.zeros((size, size), dtype=bool)
-
-    placed = 0
-    attempts = 0
-    # Draw obstacle type per intended placement so successful placements stay near the requested mix.
-    obstacle_is_crater = rng.random(obstacle_count) < obstacle_crater_prob
-
-    for is_crater in obstacle_is_crater:
-        for _ in range(obstacle_max_attempts_factor):
-            attempts += 1
-            center_x = rng.uniform(-0.45 * world_size, 0.45 * world_size)
-            center_y = rng.uniform(-0.45 * world_size, 0.45 * world_size)
-            radius = rng.uniform(radius_min_frac * world_size, radius_max_frac * world_size)
-            if rng.random() < obstacle_tall_prob:
-                obstacle_height = rng.uniform(obstacle_tall_min_cm, obstacle_tall_max_cm)
-            else:
-                obstacle_height = rng.uniform(obstacle_height_min_cm, obstacle_height_max_cm)
-
-            if is_crater:
-                crater_radius = radius * rng.uniform(crater_radius_scale_min, crater_radius_scale_max)
-                crater_radius = max(float(crater_radius), 1e-6)
-                dx = (x - center_x) / crater_radius
-                dy = (y - center_y) / crater_radius
-                d_full = np.sqrt(dx * dx + dy * dy)
-                mask = d_full <= 1.0
-            else:
-                vertices = int(rng.integers(5, 9))
-                poly = random_polygon(rng, center_x, center_y, radius, vertices)
-                mask = rasterize_polygon(poly, x, y)
-            mask_area = int(mask.sum())
-            if mask_area < 4:
-                continue
-
-            overlap_ratio = float((mask & occupancy_core).sum()) / float(mask_area)
-            if overlap_ratio > obstacle_max_overlap_ratio:
-                continue
-
-            if is_crater:
-                d = d_full[mask]
-                # Smooth hemispherical bowl profile ("semicircle" cross-section).
-                profile = np.sqrt(np.clip(1.0 - d * d, 0.0, 1.0))
-                roughness = rng.uniform(0.93, 1.07, size=profile.shape)
-                crater_depth = crater_radius * rng.uniform(
-                    crater_depth_radius_mult_min,
-                    crater_depth_radius_mult_max,
-                )
-                z[mask] -= crater_depth * profile * roughness
-            else:
-                # Steeper edge-band profile so rocks rise abruptly near the perimeter.
-                dx = (x[mask] - center_x) / (radius + 1e-8)
-                dy = (y[mask] - center_y) / (radius + 1e-8)
-                d = np.sqrt(dx * dx + dy * dy)
-                edge_band = np.clip(
-                    (1.0 - d) / (1.0 - obstacle_edge_start_frac + 1e-8),
-                    0.0,
-                    1.0,
-                )
-                profile = edge_band ** obstacle_side_exponent
-                roughness = rng.uniform(0.80, 1.22, size=profile.shape)
-                z[mask] += obstacle_height * profile * roughness
-            occupancy_core |= mask
-            placed += 1
-            break
-
-    deformation = z - z_base
-    occupancy = np.abs(deformation) > DEFORMATION_EPS_CM
-    return Environment(x=x, y=y, z=z, z_base=z_base, occupancy=occupancy)
-
-
-def yaw_pitch_to_direction(yaw_deg: float, pitch_deg: float) -> np.ndarray:
-    yaw = np.deg2rad(yaw_deg)
-    pitch = np.deg2rad(pitch_deg)
-    cp = np.cos(pitch)
-    return np.array(
-        [
-            cp * np.cos(yaw),
-            cp * np.sin(yaw),
-            np.sin(pitch),
-        ],
-        dtype=float,
-    )
-
-
-def snap_point_to_rover_edge(x: float, y: float) -> tuple[float, float]:
-    d_left = abs(x - ROVER_X_MIN_CM)
-    d_right = abs(x - ROVER_X_MAX_CM)
-    d_bottom = abs(y - ROVER_Y_MIN_CM)
-    d_top = abs(y - ROVER_Y_MAX_CM)
-    edge = int(np.argmin([d_left, d_right, d_bottom, d_top]))
-
-    if edge == 0:
-        return ROVER_X_MIN_CM, y
-    if edge == 1:
-        return ROVER_X_MAX_CM, y
-    if edge == 2:
-        return x, ROVER_Y_MIN_CM
-    return x, ROVER_Y_MAX_CM
-
-
-ROVER_EDGE_LOCAL_XY = np.array(
-    [snap_point_to_rover_edge(float(sx), float(sy)) for sx, sy, _ in LIDAR_SENSOR_COORDS_CM],
-    dtype=float,
-)
-
-
-def get_rover_footprint_local() -> np.ndarray:
-    return ROVER_FOOTPRINT_LOCAL.copy()
-
-
-def get_rover_footprint_center_local() -> np.ndarray:
-    return ROVER_FOOTPRINT_CENTER_LOCAL.copy()
-
-
-def get_rover_edge_local_xy() -> np.ndarray:
-    return ROVER_EDGE_LOCAL_XY.copy()
-
-
-def rotate_xy(x: float, y: float, yaw_deg: float) -> tuple[float, float]:
-    yaw = np.deg2rad(yaw_deg)
-    c = float(np.cos(yaw))
-    s = float(np.sin(yaw))
-    return c * x - s * y, s * x + c * y
-
-
-def make_lidar_distance_samples(
-    max_range_cm: float = LIDAR_RANGE_CM,
-    step_cm: float = LIDAR_SAMPLE_STEP_CM,
-) -> np.ndarray:
-    return np.arange(
-        0.0,
-        max_range_cm + step_cm,
-        step_cm,
-        dtype=float,
-    )
-
-
-def lidar_hit_type_to_class_id(hit_type: str) -> int:
-    if hit_type == "ground":
-        return LIDAR_CLASS_GROUND
-    if hit_type == "obstacle":
-        return LIDAR_CLASS_OBSTACLE
-    if hit_type == "none":
-        return LIDAR_CLASS_NONE
-    raise ValueError(f"Unknown lidar hit type: {hit_type}")
-
-
-def lidar_class_id_to_color_hex(class_id: int) -> str:
-    if class_id == LIDAR_CLASS_OBSTACLE:
-        return LIDAR_OBSTACLE_COLOR
-    if class_id == LIDAR_CLASS_GROUND:
-        return LIDAR_GROUND_COLOR
-    return LIDAR_CLEAR_COLOR
-
-
-def build_height_sampler(env: Environment) -> HeightSampler:
-    x_axis = env.x[0]
-    y_axis = env.y[:, 0]
-    return HeightSampler(
-        x0=float(x_axis[0]),
-        x1=float(x_axis[-1]),
-        y0=float(y_axis[0]),
-        y1=float(y_axis[-1]),
-        dx=float(x_axis[1] - x_axis[0]),
-        dy=float(y_axis[1] - y_axis[0]),
-        max_ix=env.z.shape[1] - 2,
-        max_iy=env.z.shape[0] - 2,
-    )
-
-
-def sample_height_bilinear_many(
-    env: Environment,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    sampler: HeightSampler,
-) -> np.ndarray:
-    heights = np.full(xs.shape, np.nan, dtype=float)
-    inside = (
-        (xs >= sampler.x0)
-        & (xs <= sampler.x1)
-        & (ys >= sampler.y0)
-        & (ys <= sampler.y1)
-    )
-    if not np.any(inside):
-        return heights
-
-    fx = (xs[inside] - sampler.x0) / sampler.dx
-    fy = (ys[inside] - sampler.y0) / sampler.dy
-    ix = np.clip(np.floor(fx).astype(np.int32), 0, sampler.max_ix)
-    iy = np.clip(np.floor(fy).astype(np.int32), 0, sampler.max_iy)
-    tx = fx - ix
-    ty = fy - iy
-
-    z00 = env.z[iy, ix]
-    z10 = env.z[iy, ix + 1]
-    z01 = env.z[iy + 1, ix]
-    z11 = env.z[iy + 1, ix + 1]
-    z0v = z00 * (1.0 - tx) + z10 * tx
-    z1v = z01 * (1.0 - tx) + z11 * tx
-    heights[inside] = z0v * (1.0 - ty) + z1v * ty
-    return heights
-
-
-def sample_height_bilinear(
-    env: Environment,
-    x: float,
-    y: float,
-    sampler: HeightSampler,
-) -> float | None:
-    if x < sampler.x0 or x > sampler.x1 or y < sampler.y0 or y > sampler.y1:
-        return None
-
-    fx = (x - sampler.x0) / sampler.dx
-    fy = (y - sampler.y0) / sampler.dy
-    ix = int(np.clip(np.floor(fx), 0, sampler.max_ix))
-    iy = int(np.clip(np.floor(fy), 0, sampler.max_iy))
-    tx = fx - ix
-    ty = fy - iy
-
-    z00 = env.z[iy, ix]
-    z10 = env.z[iy, ix + 1]
-    z01 = env.z[iy + 1, ix]
-    z11 = env.z[iy + 1, ix + 1]
-    z0v = z00 * (1.0 - tx) + z10 * tx
-    z1v = z01 * (1.0 - tx) + z11 * tx
-    return float(z0v * (1.0 - ty) + z1v * ty)
-
-
-def estimate_terrain_normal(
-    env: Environment,
-    x: float,
-    y: float,
-    sampler: HeightSampler,
-) -> np.ndarray:
-    if x < sampler.x0 or x > sampler.x1 or y < sampler.y0 or y > sampler.y1:
-        return np.array([0.0, 0.0, 1.0], dtype=float)
-    fx = (x - sampler.x0) / sampler.dx
-    fy = (y - sampler.y0) / sampler.dy
-    ix = int(np.clip(np.floor(fx), 0, sampler.max_ix))
-    iy = int(np.clip(np.floor(fy), 0, sampler.max_iy))
-    tx = fx - ix
-    ty = fy - iy
-
-    z00 = env.z[iy, ix]
-    z10 = env.z[iy, ix + 1]
-    z01 = env.z[iy + 1, ix]
-    z11 = env.z[iy + 1, ix + 1]
-    dz_dtx = (z10 - z00) * (1.0 - ty) + (z11 - z01) * ty
-    dz_dty = (z01 - z00) * (1.0 - tx) + (z11 - z10) * tx
-    dzdx = dz_dtx / max(sampler.dx, 1e-6)
-    dzdy = dz_dty / max(sampler.dy, 1e-6)
-    normal = np.array([-dzdx, -dzdy, 1.0], dtype=float)
-    norm = float(np.linalg.norm(normal))
-    if norm < 1e-8:
-        return np.array([0.0, 0.0, 1.0], dtype=float)
-    return normal / norm
-
-
-def estimate_rover_body_plane(
-    env: Environment,
-    state: RoverState,
-    sampler: HeightSampler,
-    footprint_local: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    corner_world_xy = np.empty((footprint_local.shape[0], 2), dtype=float)
-    for i, (lx, ly) in enumerate(footprint_local):
-        dx, dy = rotate_xy(float(lx), float(ly), state.yaw_deg)
-        corner_world_xy[i, 0] = state.x + dx
-        corner_world_xy[i, 1] = state.y + dy
-
-    corner_heights = sample_height_bilinear_many(env, corner_world_xy[:, 0], corner_world_xy[:, 1], sampler)
-    if np.any(~np.isfinite(corner_heights)):
-        return None
-
-    corner_points = np.column_stack((corner_world_xy, corner_heights))
-    centroid = corner_points.mean(axis=0)
-    centered = corner_points - centroid
-    _, _, vh = np.linalg.svd(centered, full_matrices=False)
-    terrain_up = vh[-1]
-    if terrain_up[2] < 0.0:
-        terrain_up = -terrain_up
-    norm = float(np.linalg.norm(terrain_up))
-    if norm < 1e-8:
-        return None
-    return corner_points, centroid, terrain_up / norm
-
-
-def build_rover_basis(yaw_deg: float, terrain_up: np.ndarray) -> np.ndarray:
-    yaw = np.deg2rad(yaw_deg)
-    forward_hint = np.array([np.cos(yaw), np.sin(yaw), 0.0], dtype=float)
-    forward = forward_hint - float(np.dot(forward_hint, terrain_up)) * terrain_up
-    f_norm = float(np.linalg.norm(forward))
-    if f_norm < 1e-8:
-        fallback = np.array([1.0, 0.0, 0.0], dtype=float)
-        forward = fallback - float(np.dot(fallback, terrain_up)) * terrain_up
-        f_norm = float(np.linalg.norm(forward))
-        if f_norm < 1e-8:
-            fallback = np.array([0.0, 1.0, 0.0], dtype=float)
-            forward = fallback - float(np.dot(fallback, terrain_up)) * terrain_up
-            f_norm = float(np.linalg.norm(forward))
-    forward /= max(f_norm, 1e-8)
-    left = np.cross(terrain_up, forward)
-    left_norm = float(np.linalg.norm(left))
-    if left_norm < 1e-8:
-        left = np.array([0.0, 1.0, 0.0], dtype=float)
-        left_norm = float(np.linalg.norm(left))
-    left /= max(left_norm, 1e-8)
-    return np.column_stack((forward, left, terrain_up))
-
-
-def clamp_rover_state_xy(state: RoverState, env: Environment, margin_scale: float = 0.7) -> None:
-    margin = ROVER_SPAN_CM * margin_scale
-    state.x = float(np.clip(state.x, float(env.x.min()) + margin, float(env.x.max()) - margin))
-    state.y = float(np.clip(state.y, float(env.y.min()) + margin, float(env.y.max()) - margin))
-
-
-def move_rover_forward(state: RoverState, distance_cm: float) -> None:
-    dx, dy = rotate_xy(distance_cm, 0.0, state.yaw_deg)
-    state.x += dx
-    state.y += dy
-
-
-def turn_rover(state: RoverState, delta_yaw_deg: float) -> None:
-    state.yaw_deg += delta_yaw_deg
-
-
-def compute_rover_pose(
-    env: Environment,
-    state: RoverState,
-    sampler: HeightSampler,
-    footprint_center_local: np.ndarray | None = None,
-    footprint_local: np.ndarray | None = None,
-) -> RoverPose | None:
-    if footprint_center_local is None:
-        footprint_center_local = ROVER_FOOTPRINT_CENTER_LOCAL
-    if footprint_local is None:
-        footprint_local = ROVER_FOOTPRINT_LOCAL
-    center_dx, center_dy = rotate_xy(
-        float(footprint_center_local[0]),
-        float(footprint_center_local[1]),
-        state.yaw_deg,
-    )
-    center_x = state.x + center_dx
-    center_y = state.y + center_dy
-    support_plane = estimate_rover_body_plane(env, state, sampler, footprint_local)
-    if support_plane is None:
-        center_z = sample_height_bilinear(env, center_x, center_y, sampler)
-        if center_z is None:
-            return None
-        terrain_up = estimate_terrain_normal(env, center_x, center_y, sampler)
-    else:
-        _, centroid, terrain_up = support_plane
-        plane_offset = -float(np.dot(terrain_up, centroid))
-        if abs(float(terrain_up[2])) < 1e-8:
-            center_z = float(centroid[2])
-        else:
-            center_z = -(
-                float(terrain_up[0]) * center_x
-                + float(terrain_up[1]) * center_y
-                + plane_offset
-            ) / float(terrain_up[2])
-    rover_basis = build_rover_basis(state.yaw_deg, terrain_up)
-    center_world = np.array([center_x, center_y, center_z], dtype=float)
-    rover_origin = center_world - rover_basis @ np.array(
-        [float(footprint_center_local[0]), float(footprint_center_local[1]), 0.0],
-        dtype=float,
-    )
-    return RoverPose(origin=rover_origin, basis=rover_basis, center=center_world)
-
-
-def cast_lidar_ray(
-    env: Environment,
-    start: np.ndarray,
-    direction: np.ndarray,
-    distance_samples_cm: np.ndarray,
-    sampler: HeightSampler,
-) -> tuple[str, np.ndarray]:
-    def is_deformed_at(x: float, y: float) -> bool:
-        if x < sampler.x0 or x > sampler.x1 or y < sampler.y0 or y > sampler.y1:
-            return False
-        fx = (x - sampler.x0) / sampler.dx
-        fy = (y - sampler.y0) / sampler.dy
-        ix = int(np.clip(np.floor(fx), 0, sampler.max_ix))
-        iy = int(np.clip(np.floor(fy), 0, sampler.max_iy))
-        tx = fx - ix
-        ty = fy - iy
-
-        d00 = env.z[iy, ix] - env.z_base[iy, ix]
-        d10 = env.z[iy, ix + 1] - env.z_base[iy, ix + 1]
-        d01 = env.z[iy + 1, ix] - env.z_base[iy + 1, ix]
-        d11 = env.z[iy + 1, ix + 1] - env.z_base[iy + 1, ix + 1]
-        d0v = d00 * (1.0 - tx) + d10 * tx
-        d1v = d01 * (1.0 - tx) + d11 * tx
-        deformation_cm = d0v * (1.0 - ty) + d1v * ty
-        return bool(abs(deformation_cm) > DEFORMATION_EPS_CM)
-
-    ray_points = start[None, :] + distance_samples_cm[:, None] * direction[None, :]
-    heights = sample_height_bilinear_many(env, ray_points[:, 0], ray_points[:, 1], sampler)
-    in_bounds = ~np.isnan(heights)
-
-    first_oob_idx = int(np.argmax(~in_bounds)) if np.any(~in_bounds) else -1
-    hit_mask = in_bounds & (heights >= ray_points[:, 2])
-    if np.any(hit_mask):
-        hit_idx = int(np.argmax(hit_mask))
-        if first_oob_idx == -1 or hit_idx < first_oob_idx:
-            hit_point = ray_points[hit_idx]
-            hit_type = "obstacle" if is_deformed_at(float(hit_point[0]), float(hit_point[1])) else "ground"
-            return hit_type, hit_point
-
-    if first_oob_idx != -1:
-        return "none", ray_points[first_oob_idx]
-    return "none", ray_points[-1]
-
-
-def run_lidar_scan(
-    env: Environment,
-    pose: RoverPose,
-    sampler: HeightSampler,
-    lidar_distance_samples: np.ndarray,
-    rover_edge_local_xy: np.ndarray | None = None,
-) -> LidarScan:
-    if rover_edge_local_xy is None:
-        rover_edge_local_xy = ROVER_EDGE_LOCAL_XY
-
-    sensor_count = len(LIDAR_SENSOR_COORDS_CM)
-    distances_cm = np.full((sensor_count,), -1.0, dtype=float)
-    class_ids = np.full((sensor_count,), LIDAR_CLASS_NONE, dtype=np.int32)
-    hit_types = np.full((sensor_count,), "none", dtype="<U8")
-    start_points = np.zeros((sensor_count, 3), dtype=float)
-    end_points = np.zeros((sensor_count, 3), dtype=float)
-
-    for i, ((_, _, sz), (sensor_yaw, sensor_pitch)) in enumerate(
-        zip(LIDAR_SENSOR_COORDS_CM, LIDAR_YAW_PITCH_DEG)
-    ):
-        lx, ly = rover_edge_local_xy[i]
-        local_start = np.array([float(lx), float(ly), float(sz)], dtype=float)
-        start = pose.origin + pose.basis @ local_start
-        local_direction = yaw_pitch_to_direction(float(sensor_yaw), float(sensor_pitch))
-        direction = pose.basis @ local_direction
-        direction /= max(float(np.linalg.norm(direction)), 1e-8)
-        hit_type, end = cast_lidar_ray(
-            env,
-            start,
-            direction,
-            lidar_distance_samples,
-            sampler,
-        )
-        hit_types[i] = hit_type
-        class_ids[i] = lidar_hit_type_to_class_id(hit_type)
-        if hit_type != "none":
-            distances_cm[i] = float(np.linalg.norm(end - start))
-        start_points[i] = start
-        end_points[i] = end
-
-    return LidarScan(
-        distances_cm=distances_cm,
-        class_ids=class_ids,
-        hit_types=hit_types,
-        start_points=start_points,
-        end_points=end_points,
-    )
-
-
-def view_environment(
-    env: Environment,
-    playback_controls: list[tuple[str, float | tuple[float, float, float]]] | None = None,
-    playback_sleep_s: float = 0.04,
-    hold_after_playback: bool = True,
-    window_name: str = "Rover Terrain Viewer",
-) -> None:
-    try:
-        import open3d as o3d
-    except ImportError as exc:
-        raise SystemExit("Open3D is required. Install with: pip install open3d") from exc
-
-    def hex_to_rgb01(hex_color: str) -> np.ndarray:
-        value = hex_color.lstrip("#")
-        return np.array(
-            [int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)],
-            dtype=float,
-        ) / 255.0
-
-    def interpolate_cmap(values: np.ndarray, vmin: float, vmax: float, colors: np.ndarray) -> np.ndarray:
-        t = np.clip((values - vmin) / (vmax - vmin + 1e-8), 0.0, 1.0)
-        seg = t * (len(colors) - 1)
-        i0 = np.floor(seg).astype(np.int32)
-        i1 = np.clip(i0 + 1, 0, len(colors) - 1)
-        w = seg - i0
-        return colors[i0] * (1.0 - w)[:, None] + colors[i1] * w[:, None]
-
-    terrain_samples = env.z[~env.occupancy]
-    if terrain_samples.size < 16:
-        terrain_samples = env.z.ravel()
-    z_lo = float(np.percentile(terrain_samples, 2.0))
-    z_hi = float(np.percentile(terrain_samples, 98.0))
-
-    rows, cols = env.z.shape
-    z_vis = env.z * TERRAIN_VERTICAL_EXAGGERATION
-    terrain_vertices = np.column_stack((env.x.ravel(), env.y.ravel(), z_vis.ravel()))
-    cell_ids = (np.arange(rows - 1)[:, None] * cols + np.arange(cols - 1)[None, :]).ravel()
-    v00 = cell_ids
-    v10 = cell_ids + 1
-    v01 = cell_ids + cols
-    v11 = v01 + 1
-    terrain_triangles = np.vstack(
-        (
-            np.column_stack((v00, v10, v11)),
-            np.column_stack((v00, v11, v01)),
-        )
-    ).astype(np.int32)
-
-    terrain_cmap = np.array([hex_to_rgb01(c) for c in TERRAIN_CMAP], dtype=float)
-    terrain_colors = interpolate_cmap(env.z.ravel(), z_lo, z_hi, terrain_cmap)
-    occ_flat = env.occupancy.ravel()
-    occ_color = hex_to_rgb01(OCCUPANCY_OCCUPIED_COLOR)
-    if np.any(occ_flat):
-        terrain_colors[occ_flat] = 0.45 * terrain_colors[occ_flat] + 0.55 * occ_color[None, :]
-
-    terrain_mesh = o3d.geometry.TriangleMesh()
-    terrain_mesh.vertices = o3d.utility.Vector3dVector(terrain_vertices)
-    terrain_mesh.triangles = o3d.utility.Vector3iVector(terrain_triangles)
-    terrain_mesh.vertex_colors = o3d.utility.Vector3dVector(terrain_colors)
-    terrain_mesh.compute_vertex_normals()
-
-    occupied_points = np.column_stack(
-        (
-            env.x[env.occupancy],
-            env.y[env.occupancy],
-            (env.z[env.occupancy] + OCCUPANCY_OVERLAY_OFFSET_CM) * TERRAIN_VERTICAL_EXAGGERATION,
-        )
-    )
-    occupied_cloud = o3d.geometry.PointCloud()
-    if occupied_points.size > 0:
-        occupied_cloud.points = o3d.utility.Vector3dVector(occupied_points)
-        occupied_cloud.colors = o3d.utility.Vector3dVector(
-            np.tile(occ_color[None, :], (occupied_points.shape[0], 1))
-        )
-
-    vis = o3d.visualization.VisualizerWithKeyCallback()
-    if not vis.create_window(window_name=window_name, width=1400, height=900):
-        raise SystemExit("Failed to create Open3D window.")
-
-    render_opt = vis.get_render_option()
-    render_opt.background_color = np.array([0.06, 0.08, 0.10], dtype=float)
-    render_opt.mesh_show_back_face = True
-    render_opt.point_size = float(OCCUPIED_MARKER_SIZE)
-
-    vis.add_geometry(terrain_mesh, reset_bounding_box=True)
-    if occupied_points.size > 0:
-        vis.add_geometry(occupied_cloud, reset_bounding_box=False)
-
-    rover_edge_local_xy = get_rover_edge_local_xy()
-    footprint_local = get_rover_footprint_local()
-    footprint_center_local = get_rover_footprint_center_local()
-    rover_state = RoverState()
-    height_sampler = build_height_sampler(env)
-    lidar_distance_samples = make_lidar_distance_samples()
-    sensor_count = len(LIDAR_SENSOR_COORDS_CM)
-    model_inferencer = None
-    model_inferencer_failed = False
-    model_feature_history: list[np.ndarray] = []
-    model_history_tick_count = 0
-    last_status_len = 0
-    model_obstacle_logit_bias = float(MODEL_LIDAR_DEFAULT_OBSTACLE_BIAS)
-    last_mismatch_signature = None
-    if USE_MODEL_LIDAR_CLASSIFIER:
-        try:
-            from train import load_gru_lidar_inferencer
-
-            model_inferencer = load_gru_lidar_inferencer(
-                MODEL_LIDAR_CHECKPOINT_PATH,
-                max_history=MODEL_LIDAR_MAX_HISTORY,
-            )
-            if getattr(model_inferencer, "binary_obstacle_only", False) and MODEL_LIDAR_USE_CALIBRATED_BIAS:
-                sweep_path = Path(MODEL_LIDAR_CHECKPOINT_PATH).with_suffix(".threshold_sweep.json")
-                if sweep_path.exists():
-                    try:
-                        sweep_payload = json.loads(sweep_path.read_text(encoding="utf-8"))
-                        chosen = sweep_payload.get(str(MODEL_LIDAR_BIAS_SELECTION))
-                        if isinstance(chosen, dict) and "obstacle_logit_bias" in chosen:
-                            model_obstacle_logit_bias = float(chosen["obstacle_logit_bias"])
-                    except Exception as exc:
-                        print(f"Model lidar classifier threshold sweep ignored (read failed): {exc}")
-            print(
-                f"Model lidar classifier enabled: {MODEL_LIDAR_CHECKPOINT_PATH}"
-                f" binary={getattr(model_inferencer, 'binary_obstacle_only', False)}"
-                f" obstacle_bias={model_obstacle_logit_bias:+.3f}"
-            )
-        except Exception as exc:
-            model_inferencer_failed = True
-            print(f"Model lidar classifier disabled (load failed): {exc}")
-
-    rover_poly_points = np.zeros((4, 3), dtype=float)
-    rover_outline_dyn = o3d.geometry.LineSet()
-    rover_outline_dyn.points = o3d.utility.Vector3dVector(rover_poly_points)
-    rover_outline_dyn.lines = o3d.utility.Vector2iVector(
-        np.array([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=np.int32)
-    )
-    rover_outline_dyn.colors = o3d.utility.Vector3dVector(
-        np.tile(np.array([[0.91, 0.94, 1.00]], dtype=float), (4, 1))
-    )
-    vis.add_geometry(rover_outline_dyn, reset_bounding_box=False)
-
-    ray_points = np.zeros((sensor_count * 2, 3), dtype=float)
-    ray_lines = np.column_stack(
-        (np.arange(sensor_count, dtype=np.int32) * 2, np.arange(sensor_count, dtype=np.int32) * 2 + 1)
-    )
-    ray_colors = np.tile(hex_to_rgb01(LIDAR_CLEAR_COLOR)[None, :], (sensor_count, 1))
-    ray_mesh = o3d.geometry.LineSet()
-    ray_mesh.points = o3d.utility.Vector3dVector(ray_points)
-    ray_mesh.lines = o3d.utility.Vector2iVector(ray_lines)
-    ray_mesh.colors = o3d.utility.Vector3dVector(ray_colors)
-    vis.add_geometry(ray_mesh, reset_bounding_box=False)
-    predicted_obstacle_marker_points = np.zeros((0, 3), dtype=float)
-    predicted_obstacle_marker_lines = np.zeros((0, 2), dtype=np.int32)
-    predicted_obstacle_marker_colors = np.zeros((0, 3), dtype=float)
-    predicted_obstacle_marker_mesh = o3d.geometry.LineSet()
-    predicted_obstacle_marker_mesh.points = o3d.utility.Vector3dVector(predicted_obstacle_marker_points)
-    predicted_obstacle_marker_mesh.lines = o3d.utility.Vector2iVector(predicted_obstacle_marker_lines)
-    predicted_obstacle_marker_mesh.colors = o3d.utility.Vector3dVector(predicted_obstacle_marker_colors)
-    vis.add_geometry(predicted_obstacle_marker_mesh, reset_bounding_box=False)
-    persistent_obstacle_marker_keys: set[tuple[float, float, float]] = set()
-    persistent_obstacle_marker_bases: list[np.ndarray] = []
-
-    def draw_dynamic() -> None:
-        nonlocal model_inferencer_failed, model_history_tick_count, last_status_len, last_mismatch_signature
-        pose = compute_rover_pose(env, rover_state, height_sampler, footprint_center_local=footprint_center_local)
-        if pose is None:
+class DriveInput:
+    show_lidar: bool = SHOW_LIDAR
+    respawn_requested: bool = False
+    camera_distance: float = CAMERA_DISTANCE
+    auto_camera_frames_left: int = CAMERA_AUTO_VISIBILITY_FRAMES
+
+    def on_key(self, window, key: int, scancode: int, action: int, mods: int) -> None:
+        del scancode, mods
+        if action != glfw.PRESS:
             return
+        if key == glfw.KEY_ESCAPE:
+            glfw.set_window_should_close(window, True)
+        elif key == glfw.KEY_R:
+            self.respawn_requested = True
+            self.auto_camera_frames_left = CAMERA_AUTO_VISIBILITY_FRAMES
+        elif key == glfw.KEY_L:
+            self.show_lidar = not self.show_lidar
+        elif key in (glfw.KEY_EQUAL, glfw.KEY_KP_ADD, glfw.KEY_PAGE_UP):
+            self.camera_distance = max(1.0, self.camera_distance - 0.5)
+            self.auto_camera_frames_left = 0
+        elif key in (glfw.KEY_MINUS, glfw.KEY_KP_SUBTRACT, glfw.KEY_PAGE_DOWN):
+            self.camera_distance = min(20.0, self.camera_distance + 0.5)
+            self.auto_camera_frames_left = 0
 
-        for i, (lx, ly) in enumerate(footprint_local):
-            local_pt = np.array([float(lx), float(ly), 2.0], dtype=float)
-            rover_poly_points[i] = pose.origin + pose.basis @ local_pt
-        rover_poly_points[:, 2] *= TERRAIN_VERTICAL_EXAGGERATION
-        rover_outline_dyn.points = o3d.utility.Vector3dVector(rover_poly_points)
+    def on_scroll(self, window, xoffset: float, yoffset: float) -> None:
+        del window, xoffset
+        self.camera_distance = float(np.clip(self.camera_distance - 0.5 * yoffset, 1.0, 20.0))
+        self.auto_camera_frames_left = 0
 
-        scan = run_lidar_scan(
-            env,
-            pose,
-            height_sampler,
-            lidar_distance_samples,
-            rover_edge_local_xy=rover_edge_local_xy,
+    def sample_drive(self, window) -> tuple[float, float]:
+        forward = glfw.get_key(window, glfw.KEY_W) == glfw.PRESS or glfw.get_key(window, glfw.KEY_UP) == glfw.PRESS
+        backward = glfw.get_key(window, glfw.KEY_S) == glfw.PRESS or glfw.get_key(window, glfw.KEY_DOWN) == glfw.PRESS
+        left = glfw.get_key(window, glfw.KEY_A) == glfw.PRESS or glfw.get_key(window, glfw.KEY_LEFT) == glfw.PRESS
+        right = glfw.get_key(window, glfw.KEY_D) == glfw.PRESS or glfw.get_key(window, glfw.KEY_RIGHT) == glfw.PRESS
+        throttle = 1.0 if forward and not backward else -1.0 if backward and not forward else 0.0
+        steering = 1.0 if left and not right else -1.0 if right and not left else 0.0
+        return throttle, steering
+
+
+def _configure_camera(cam: mujoco.MjvCamera, world: MujocoRoverWorld, controls: DriveInput) -> None:
+    pose = world.get_pose()
+    cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+    cam.trackbodyid = -1
+    cam.lookat[:] = [
+        float(pose.origin[0] / 100.0),
+        float(pose.origin[1] / 100.0),
+        float(pose.origin[2] / 100.0) + CAMERA_LOOKAT_Z_OFFSET_M,
+    ]
+    cam.distance = controls.camera_distance
+    cam.azimuth = CAMERA_AZIMUTH_DEG
+    cam.elevation = CAMERA_ELEVATION_DEG
+
+
+def _camera_visibility_score(context: mujoco.MjrContext, viewport: mujoco.MjrRect) -> float:
+    rgb = np.zeros((max(viewport.height, 1), max(viewport.width, 1), 3), dtype=np.uint8)
+    depth = np.zeros((max(viewport.height, 1), max(viewport.width, 1)), dtype=np.float32)
+    mujoco.mjr_readPixels(rgb, depth, viewport, context)
+    return float(rgb.mean())
+
+
+def _append_lidar_overlay(scene: mujoco.MjvScene, scan) -> None:
+    palette = {
+        0: np.array([0.16, 0.47, 1.0, 1.0], dtype=np.float32),
+        1: np.array([1.0, 0.18, 0.18, 1.0], dtype=np.float32),
+        LIDAR_CLASS_NONE: np.array([0.28, 0.84, 0.34, 0.35], dtype=np.float32),
+    }
+    identity = np.eye(3, dtype=np.float64).reshape(-1)
+    zero = np.zeros(3, dtype=np.float64)
+    for idx in range(scan.start_points.shape[0]):
+        if scene.ngeom >= scene.maxgeom:
+            break
+        geom = scene.geoms[scene.ngeom]
+        mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_LINE, np.ones(3, dtype=np.float64), zero, identity, palette[int(scan.class_ids[idx])])
+        mujoco.mjv_connector(
+            geom,
+            mujoco.mjtGeom.mjGEOM_LINE,
+            2.0,
+            (scan.start_points[idx] / 100.0).astype(np.float64),
+            (scan.end_points[idx] / 100.0).astype(np.float64),
         )
-        ray_points[0::2] = scan.start_points
-        ray_points[1::2] = scan.end_points
+        scene.ngeom += 1
 
-        class_ids_for_color = scan.class_ids
-        predicted_obstacle_mask = np.zeros((sensor_count,), dtype=bool)
-        mismatch_summary = ""
-        feature_t = None
-        if model_inferencer is not None and not model_inferencer_failed:
-            pose_xyzyaw = np.array(
-                [float(pose.origin[0]), float(pose.origin[1]), float(pose.origin[2])],
-                dtype=np.float32,
-            )
-            feature_t = model_inferencer.featurize_timestep(
-                pose_xyzyaw,
-                scan.distances_cm.astype(np.float32),
-                basis=pose.basis.astype(np.float32),
-            )
-            try:
-                history_for_pred = np.asarray([*model_feature_history, feature_t], dtype=np.float32)
-                if getattr(model_inferencer, "binary_obstacle_only", False):
-                    pred_obstacle_mask = model_inferencer.predict_current_obstacle_mask_from_feature_history_with_bias(
-                        history_for_pred,
-                        obstacle_logit_bias=model_obstacle_logit_bias,
-                    )
-                    predicted_obstacle_mask = pred_obstacle_mask.astype(bool, copy=False)
-                    actual_obstacle_mask = scan.class_ids.astype(np.int32) == 1
-                    mismatch_mask = pred_obstacle_mask != actual_obstacle_mask
-                    class_ids_for_color = np.where(pred_obstacle_mask, 1, scan.class_ids).astype(np.int32)
-                    mismatch_ids = np.flatnonzero(mismatch_mask)
-                    pred_obstacle_count = int(np.count_nonzero(pred_obstacle_mask))
-                    actual_obstacle_count = int(np.count_nonzero(actual_obstacle_mask))
-                    mismatch_summary = (
-                        f" obstacle_mismatch={int(mismatch_ids.size)}/{sensor_count}"
-                        f" pred_o={pred_obstacle_count} actual_o={actual_obstacle_count}"
-                    )
-                    if mismatch_ids.size > 0:
-                        mismatch_summary += f" ids={mismatch_ids.tolist()}"
-                    mismatch_signature = (
-                        "binary",
-                        int(mismatch_ids.size),
-                        tuple(int(i) for i in mismatch_ids.tolist()),
-                        pred_obstacle_count,
-                        actual_obstacle_count,
-                    )
-                    if mismatch_signature != last_mismatch_signature:
-                        print(
-                            "\n"
-                            f"Model check: obstacle_mismatch={int(mismatch_ids.size)}/{sensor_count}"
-                            f" pred_o={pred_obstacle_count} actual_o={actual_obstacle_count}"
-                            f" bias={model_obstacle_logit_bias:+.3f}"
-                            + (f" ids={mismatch_ids.tolist()}" if mismatch_ids.size > 0 else "")
-                        )
-                        last_mismatch_signature = mismatch_signature
-                else:
-                    model_pred = model_inferencer.predict_current_from_feature_history(history_for_pred)
-                    if model_pred.shape[0] == sensor_count:
-                        class_ids_for_color = model_pred.astype(np.int32)
-                        predicted_obstacle_mask = class_ids_for_color == LIDAR_CLASS_OBSTACLE
-                        mismatch_ids = np.flatnonzero(class_ids_for_color != scan.class_ids.astype(np.int32))
-                        mismatch_summary = f" class_mismatch={int(mismatch_ids.size)}/{sensor_count}"
-                        if mismatch_ids.size > 0:
-                            mismatch_summary += f" ids={mismatch_ids.tolist()}"
-                        mismatch_signature = (
-                            "multiclass",
-                            int(mismatch_ids.size),
-                            tuple(int(i) for i in mismatch_ids.tolist()),
-                        )
-                        if mismatch_signature != last_mismatch_signature:
-                            print(
-                                "\n"
-                                f"Model check: class_mismatch={int(mismatch_ids.size)}/{sensor_count}"
-                                + (f" ids={mismatch_ids.tolist()}" if mismatch_ids.size > 0 else "")
-                            )
-                            last_mismatch_signature = mismatch_signature
-            except Exception as exc:
-                model_inferencer_failed = True
-                print(f"Model lidar classifier disabled (runtime error): {exc}")
 
-        for i, class_id in enumerate(class_ids_for_color):
-            ray_colors[i] = hex_to_rgb01(lidar_class_id_to_color_hex(int(class_id)))
+def _create_window() -> glfw._GLFWwindow:
+    if not glfw.init():
+        raise RuntimeError('Failed to initialize GLFW')
+    glfw.window_hint(glfw.SAMPLES, 4)
+    glfw.window_hint(glfw.VISIBLE, glfw.TRUE)
+    window = glfw.create_window(WINDOW_WIDTH, WINDOW_HEIGHT, 'Lidar Rover Demo', None, None)
+    if window is None:
+        glfw.terminate()
+        raise RuntimeError('Failed to create GLFW window')
+    glfw.make_context_current(window)
+    glfw.swap_interval(1)
+    return window
 
-        if MODEL_PREDICTED_OBSTACLE_MARKERS_PERSIST:
-            for base_point in scan.end_points[predicted_obstacle_mask]:
-                marker_key = tuple(np.round(base_point.astype(float), 1).tolist())
-                if marker_key in persistent_obstacle_marker_keys:
-                    continue
-                persistent_obstacle_marker_keys.add(marker_key)
-                persistent_obstacle_marker_bases.append(np.asarray(base_point, dtype=float).copy())
-            marker_bases = (
-                np.vstack(persistent_obstacle_marker_bases)
-                if persistent_obstacle_marker_bases
-                else np.zeros((0, 3), dtype=float)
-            )
-        else:
-            marker_bases = np.asarray(scan.end_points[predicted_obstacle_mask], dtype=float)
 
-        marker_count = int(marker_bases.shape[0])
-        if marker_count > 0:
-            predicted_obstacle_marker_points = np.repeat(marker_bases, 2, axis=0)
-            predicted_obstacle_marker_points[1::2, 2] += MODEL_PREDICTED_OBSTACLE_MARKER_HEIGHT_CM
-            predicted_obstacle_marker_lines = np.column_stack(
-                (np.arange(marker_count, dtype=np.int32) * 2, np.arange(marker_count, dtype=np.int32) * 2 + 1)
-            )
-            predicted_obstacle_marker_colors = np.tile(
-                hex_to_rgb01(LIDAR_OBSTACLE_COLOR)[None, :],
-                (marker_count, 1),
-            )
-        else:
-            predicted_obstacle_marker_points = np.zeros((0, 3), dtype=float)
-            predicted_obstacle_marker_lines = np.zeros((0, 2), dtype=np.int32)
-            predicted_obstacle_marker_colors = np.zeros((0, 3), dtype=float)
-
-        if model_inferencer is not None and not model_inferencer_failed and feature_t is not None:
-            model_history_tick_count += 1
-            history_push_every = max(1, int(MODEL_LIDAR_HISTORY_PUSH_EVERY_TICKS))
-            if model_history_tick_count % history_push_every == 0:
-                model_feature_history.append(feature_t)
-                if MODEL_LIDAR_MAX_HISTORY > 0 and len(model_feature_history) > MODEL_LIDAR_MAX_HISTORY:
-                    del model_feature_history[:-MODEL_LIDAR_MAX_HISTORY]
-
-        ray_points[:, 2] *= TERRAIN_VERTICAL_EXAGGERATION
-        if predicted_obstacle_marker_points.size > 0:
-            predicted_obstacle_marker_points[:, 2] *= TERRAIN_VERTICAL_EXAGGERATION
-        ray_mesh.points = o3d.utility.Vector3dVector(ray_points)
-        ray_mesh.colors = o3d.utility.Vector3dVector(ray_colors)
-        predicted_obstacle_marker_mesh.points = o3d.utility.Vector3dVector(predicted_obstacle_marker_points)
-        predicted_obstacle_marker_mesh.lines = o3d.utility.Vector2iVector(predicted_obstacle_marker_lines)
-        predicted_obstacle_marker_mesh.colors = o3d.utility.Vector3dVector(predicted_obstacle_marker_colors)
-
-        vis.update_geometry(rover_outline_dyn)
-        vis.update_geometry(ray_mesh)
-        vis.update_geometry(predicted_obstacle_marker_mesh)
-        vis.update_renderer()
-        status_text = f"Pose x={rover_state.x:.0f} y={rover_state.y:.0f} yaw={rover_state.yaw_deg:.1f}{mismatch_summary}"
-        padding = max(0, last_status_len - len(status_text))
-        print(status_text + (" " * padding), end="\r")
-        last_status_len = len(status_text)
-
-    def move_forward(distance_cm: float) -> None:
-        move_rover_forward(rover_state, distance_cm)
-        clamp_rover_state_xy(rover_state, env)
-        draw_dynamic()
-
-    def turn(delta_deg: float) -> None:
-        turn_rover(rover_state, delta_deg)
-        draw_dynamic()
-
-    def teleport_pose(x: float, y: float, yaw_deg: float) -> None:
-        rover_state.x = float(x)
-        rover_state.y = float(y)
-        rover_state.yaw_deg = float(yaw_deg)
-        clamp_rover_state_xy(rover_state, env)
-        draw_dynamic()
-
-    draw_dynamic()
-    if playback_controls is None:
-        vis.register_key_callback(ord("W"), lambda _: (move_forward(ROVER_MOVE_STEP_CM), False)[1])
-        vis.register_key_callback(ord("S"), lambda _: (move_forward(-ROVER_MOVE_STEP_CM), False)[1])
-        vis.register_key_callback(ord("A"), lambda _: (turn(ROVER_TURN_STEP_DEG), False)[1])
-        vis.register_key_callback(ord("D"), lambda _: (turn(-ROVER_TURN_STEP_DEG), False)[1])
-
-        # Keep a second set of keys for larger jumps when covering ground quickly.
-        vis.register_key_callback(ord("I"), lambda _: (move_forward(ROVER_COARSE_MOVE_STEP_CM), False)[1])
-        vis.register_key_callback(ord("K"), lambda _: (move_forward(-ROVER_COARSE_MOVE_STEP_CM), False)[1])
-        vis.register_key_callback(ord("U"), lambda _: (turn(ROVER_COARSE_TURN_STEP_DEG), False)[1])
-        vis.register_key_callback(ord("O"), lambda _: (turn(-ROVER_COARSE_TURN_STEP_DEG), False)[1])
-
-        print("Open3D controls: WASD fine move/turn, I/K/U/O coarse move/turn, mouse to orbit/pan/zoom")
-        vis.run()
-    else:
-        print("Open3D playback mode: running autonomous trajectory")
-        for cmd, value in playback_controls:
-            if cmd == "move":
-                move_forward(float(value))
-            elif cmd == "turn":
-                turn(float(value))
-            elif cmd == "teleport":
-                try:
-                    px, py, pyaw = value  # type: ignore[misc]
-                    teleport_pose(float(px), float(py), float(pyaw))
-                except Exception:
-                    continue
-            if not vis.poll_events():
-                break
-            if playback_sleep_s > 0.0:
-                time.sleep(playback_sleep_s)
-        if hold_after_playback:
-            print("Playback complete. Close window to continue.")
-            vis.run()
-        else:
-            vis.poll_events()
-    vis.destroy_window()
+def _open_demo_log() -> tuple[Path, object, csv.DictWriter]:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / f'environment_demo_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+    handle = log_path.open('w', newline='', encoding='utf-8')
+    writer = csv.DictWriter(handle, fieldnames=[
+        'sim_time_s',
+        'pose_x_cm',
+        'pose_y_cm',
+        'pose_z_cm',
+        'yaw_deg',
+        'throttle_cmd',
+        'steer_cmd',
+        'speed_cm_s',
+        'near_rocks',
+        'near_bumps',
+        'near_craters',
+        'rock_attempts',
+        'rock_success',
+        'bump_attempts',
+        'bump_success',
+        'crater_attempts',
+        'crater_success',
+        'placed_rocks',
+        'placed_bumps',
+        'placed_craters',
+        'refresh_count',
+        'refresh_skipped_distance_gate',
+        'refresh_force',
+        'refresh_center_x_cm',
+        'refresh_center_y_cm',
+        'refresh_yaw_deg',
+        'refresh_rocks_near_before',
+        'refresh_bumps_near_before',
+        'refresh_craters_near_before',
+        'refresh_rocks_added',
+        'refresh_bumps_added',
+        'refresh_craters_added',
+    ])
+    writer.writeheader()
+    handle.flush()
+    return log_path, handle, writer
 
 
 def main() -> None:
-    env = generate_environment(
-        size=GRID_SIZE,
-        world_size=WORLD_SIZE_CM,
-        obstacle_count=OBSTACLE_COUNT,
-        seed=SEED,
-        terrain_height_scale_cm=TERRAIN_HEIGHT_SCALE_CM * DEMO_TERRAIN_HEIGHT_SCALE_MULTIPLIER,
-    )
-    view_environment(env)
+    controls = DriveInput()
+    window = _create_window()
+    glfw.set_key_callback(window, controls.on_key)
+    glfw.set_scroll_callback(window, controls.on_scroll)
+    print('Controls: hold W/S for full throttle, hold A/D for full steering, mouse wheel or PageUp/PageDown to zoom, R respawn, L toggle lidar, Esc quit')
+    log_path, log_handle, log_writer = _open_demo_log()
+    print(f'Logging demo telemetry to {log_path}')
+    try:
+        with MujocoRoverWorld(gui=True, world_cfg=WorldConfig(), sim_cfg=SimConfig()) as world:
+            cam = mujoco.MjvCamera()
+            opt = mujoco.MjvOption()
+            pert = mujoco.MjvPerturb()
+            scene = mujoco.MjvScene(world.model, maxgeom=SCENE_MAX_GEOMS)
+            context = mujoco.MjrContext(world.model, int(mujoco.mjtFontScale.mjFONTSCALE_150))
+            if world.consume_hfield_render_dirty():
+                mujoco.mjr_uploadHField(world.model, context, 0)
+            _configure_camera(cam, world, controls)
+            last_status_t = 0.0
+            while not glfw.window_should_close(window):
+                step_start = time.perf_counter()
+                glfw.poll_events()
+                throttle, steering = controls.sample_drive(window)
+                if controls.respawn_requested:
+                    world.respawn_random()
+                    controls.respawn_requested = False
+                world.step(throttle, steering)
+                if world.is_invalid():
+                    world.respawn_random()
+                    controls.auto_camera_frames_left = CAMERA_AUTO_VISIBILITY_FRAMES
+                if world.consume_hfield_render_dirty():
+                    mujoco.mjr_uploadHField(world.model, context, 0)
+                pose = world.get_pose()
+                cam.lookat[:] = [
+                    float(pose.origin[0] / 100.0),
+                    float(pose.origin[1] / 100.0),
+                    float(pose.origin[2] / 100.0) + CAMERA_LOOKAT_Z_OFFSET_M,
+                ]
+                cam.distance = controls.camera_distance
+                scan = world.run_lidar_scan()
+                width, height = glfw.get_framebuffer_size(window)
+                viewport = mujoco.MjrRect(0, 0, width, height)
+                mujoco.mjv_updateScene(world.model, world.data, opt, pert, cam, int(mujoco.mjtCatBit.mjCAT_ALL), scene)
+                if controls.show_lidar:
+                    _append_lidar_overlay(scene, scan)
+                mujoco.mjr_render(viewport, scene, context)
+                if controls.auto_camera_frames_left > 0:
+                    visibility = _camera_visibility_score(context, viewport)
+                    if visibility < 4.0:
+                        controls.camera_distance = min(20.0, controls.camera_distance + 0.5)
+                    controls.auto_camera_frames_left -= 1
+                lin_vel, _ = world.get_velocity()
+                speed_cm_s = float(np.linalg.norm(lin_vel[:2]) * 100.0)
+                status_left = 'Drive'
+                status_right = f'throttle={throttle:+.2f} steer={steering:+.2f} speed={speed_cm_s:.1f} cm/s lidar={"on" if controls.show_lidar else "off"}'
+                mujoco.mjr_overlay(
+                    int(mujoco.mjtFontScale.mjFONTSCALE_150),
+                    int(mujoco.mjtGridPos.mjGRID_TOPLEFT),
+                    viewport,
+                    status_left,
+                    status_right,
+                    context,
+                )
+                glfw.swap_buffers(window)
+                now = time.perf_counter()
+                if (now - last_status_t) >= STATUS_EVERY_S:
+                    near_counts = world.hazard_counts_near_pose()
+                    hazard_stats = world.hazard_generation_stats()
+                    refresh = world.hazard_refresh_debug()
+                    log_writer.writerow({
+                        'sim_time_s': float(world.data.time),
+                        'pose_x_cm': float(pose.origin[0]),
+                        'pose_y_cm': float(pose.origin[1]),
+                        'pose_z_cm': float(pose.origin[2]),
+                        'yaw_deg': float(pose.yaw_deg),
+                        'throttle_cmd': float(throttle),
+                        'steer_cmd': float(steering),
+                        'speed_cm_s': speed_cm_s,
+                        'near_rocks': int(near_counts['rocks']),
+                        'near_bumps': int(near_counts['bumps']),
+                        'near_craters': int(near_counts['craters']),
+                        'rock_attempts': int(hazard_stats['rock_attempts']),
+                        'rock_success': int(hazard_stats['rock_success']),
+                        'bump_attempts': int(hazard_stats['bump_attempts']),
+                        'bump_success': int(hazard_stats['bump_success']),
+                        'crater_attempts': int(hazard_stats['crater_attempts']),
+                        'crater_success': int(hazard_stats['crater_success']),
+                        'placed_rocks': int(hazard_stats['placed_rocks']),
+                        'placed_bumps': int(hazard_stats['placed_bumps']),
+                        'placed_craters': int(hazard_stats['placed_craters']),
+                        'refresh_count': int(refresh.refresh_count),
+                        'refresh_skipped_distance_gate': int(refresh.skipped_distance_gate),
+                        'refresh_force': int(refresh.force),
+                        'refresh_center_x_cm': float(refresh.center_x_cm),
+                        'refresh_center_y_cm': float(refresh.center_y_cm),
+                        'refresh_yaw_deg': float(refresh.yaw_deg),
+                        'refresh_rocks_near_before': int(refresh.rocks_near_before),
+                        'refresh_bumps_near_before': int(refresh.bumps_near_before),
+                        'refresh_craters_near_before': int(refresh.craters_near_before),
+                        'refresh_rocks_added': int(refresh.rocks_added),
+                        'refresh_bumps_added': int(refresh.bumps_added),
+                        'refresh_craters_added': int(refresh.craters_added),
+                    })
+                    log_handle.flush()
+                    print(
+                        f'Pose x={pose.origin[0]:.0f} y={pose.origin[1]:.0f} z={pose.origin[2]:.0f} yaw={pose.yaw_deg:.1f} '
+                        f'speed_cm_s={speed_cm_s:.1f} throttle={throttle:+.2f} steer={steering:+.2f}',
+                        end='\r',
+                        flush=True,
+                    )
+                    last_status_t = now
+                remaining = world.sim_cfg.time_step - (time.perf_counter() - step_start)
+                if remaining > 0.0:
+                    time.sleep(remaining)
+            context.free()
+    finally:
+        log_handle.close()
+        glfw.destroy_window(window)
+        glfw.terminate()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

@@ -5,3 +5,4 @@ torch>=2.2
 # Visualization / environment viewer
 open3d
 pyvista>=0.43
+mujoco>=3.3
