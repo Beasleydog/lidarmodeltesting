@@ -992,12 +992,12 @@ class EgocentricMapLidarClassifier(nn.Module):
             else max(2, int(sensor_embed_dim))
         )
         self.fusion_hidden_dim = (
-            max(32, self.hidden_dim)
+            max(24, self.hidden_dim)
             if fusion_hidden_dim is None
             else max(8, int(fusion_hidden_dim))
         )
         self.decoder_hidden_dim = (
-            max(48, self.hidden_dim * 2)
+            max(32, int(round(self.hidden_dim * 1.5)))
             if decoder_hidden_dim is None
             else max(8, int(decoder_hidden_dim))
         )
@@ -1324,7 +1324,7 @@ class GRULidarClassifier(nn.Module):
         for ordered_idx, sensor_id in enumerate(self.sensor_order_list):
             self.sensor_restore_list[int(sensor_id)] = int(ordered_idx)
         self.fusion_hidden_dim = (
-            max(48, self.hidden_dim)
+            max(32, self.hidden_dim)
             if fusion_hidden_dim is None
             else max(8, int(fusion_hidden_dim))
         )
@@ -1335,12 +1335,12 @@ class GRULidarClassifier(nn.Module):
         )
         ff_ref = attention_ff_dim if attention_ff_dim is not None else region_context_dim
         self.attention_ff_dim = (
-            max(48, max(self.hidden_dim, self.fusion_hidden_dim))
+            max(32, max(self.hidden_dim, self.fusion_hidden_dim))
             if ff_ref is None
             else max(8, int(ff_ref))
         )
         self.decoder_hidden_dim = (
-            max(48, max(self.hidden_dim, self.fusion_hidden_dim))
+            max(32, max(self.hidden_dim, self.fusion_hidden_dim))
             if decoder_hidden_dim is None
             else max(8, int(decoder_hidden_dim))
         )
@@ -1720,7 +1720,7 @@ class LegacyCausalTSCNNClassifier(GRULidarClassifier):
         for ordered_idx, sensor_id in enumerate(self.sensor_order_list):
             self.sensor_restore_list[int(sensor_id)] = int(ordered_idx)
         self.fusion_hidden_dim = (
-            max(48, self.hidden_dim)
+            max(32, self.hidden_dim)
             if fusion_hidden_dim is None
             else max(8, int(fusion_hidden_dim))
         )
@@ -1731,12 +1731,12 @@ class LegacyCausalTSCNNClassifier(GRULidarClassifier):
         )
         ff_ref = attention_ff_dim if attention_ff_dim is not None else region_context_dim
         self.attention_ff_dim = (
-            max(48, max(self.hidden_dim, self.fusion_hidden_dim))
+            max(32, max(self.hidden_dim, self.fusion_hidden_dim))
             if ff_ref is None
             else max(8, int(ff_ref))
         )
         self.decoder_hidden_dim = (
-            max(48, max(self.hidden_dim, self.fusion_hidden_dim))
+            max(32, max(self.hidden_dim, self.fusion_hidden_dim))
             if decoder_hidden_dim is None
             else max(8, int(decoder_hidden_dim))
         )
@@ -2830,8 +2830,8 @@ def main() -> None:
     )
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch-size", type=int, default=288)
-    parser.add_argument("--hidden-dim", type=int, default=96)
-    parser.add_argument("--num-layers", type=int, default=4)
+    parser.add_argument("--hidden-dim", type=int, default=48)
+    parser.add_argument("--num-layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.40)
     parser.add_argument("--lr", type=float, default=1.2e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
