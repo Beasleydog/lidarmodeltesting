@@ -631,6 +631,7 @@ class MujocoRoverWorld:
             mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, 'wheel_geom_rl'),
             mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, 'wheel_geom_rr'),
         ], dtype=np.int32)
+        self.rover_geom_id_set = self._collect_body_subtree_geom_ids(self.rover_body_id)
         self.steering_actuator_ids = np.array([
             mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, 'steer_act_fl'),
             mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, 'steer_act_fr'),
@@ -679,6 +680,22 @@ class MujocoRoverWorld:
 
     def obstacle_points_xy_cm(self) -> np.ndarray:
         return self._obstacle_points_xy_cm.copy()
+
+    def _collect_body_subtree_geom_ids(self, root_body_id: int) -> set[int]:
+        root_id = int(root_body_id)
+        parent_ids = np.asarray(self.model.body_parentid, dtype=np.int32)
+        geom_body_ids = np.asarray(self.model.geom_bodyid, dtype=np.int32)
+        body_ids: set[int] = set()
+        for body_id in range(int(self.model.nbody)):
+            cursor = int(body_id)
+            while True:
+                if cursor == root_id:
+                    body_ids.add(int(body_id))
+                    break
+                if cursor <= 0 or cursor == int(parent_ids[cursor]):
+                    break
+                cursor = int(parent_ids[cursor])
+        return {int(geom_id) for geom_id, body_id in enumerate(geom_body_ids.tolist()) if int(body_id) in body_ids}
 
     def consume_hfield_render_dirty(self) -> bool:
         dirty = bool(self._hfield_render_dirty)
@@ -1329,27 +1346,43 @@ class MujocoRoverWorld:
         normal = np.zeros(3, dtype=np.float64)
         max_range_m = self.sim_cfg.lidar_range_cm / 100.0
         for idx in range(starts.shape[0]):
-            geomid[0] = -1
-            dist_m = mujoco.mj_ray(
-                self.model,
-                self.data,
-                ray_starts[idx].astype(np.float64),
-                dirs[idx].astype(np.float64),
-                self._geomgroup_all,
-                1,
-                self.rover_body_id,
-                geomid,
-                normal,
-            )
-            if dist_m < 0.0 or dist_m > max_range_m:
+            remaining_m = float(max_range_m)
+            march_start = ray_starts[idx].astype(np.float64).copy()
+            hit_point = None
+            hit_geom = -1
+            while remaining_m > 0.0:
+                geomid[0] = -1
+                dist_m = mujoco.mj_ray(
+                    self.model,
+                    self.data,
+                    march_start,
+                    dirs[idx].astype(np.float64),
+                    self._geomgroup_all,
+                    1,
+                    self.rover_body_id,
+                    geomid,
+                    normal,
+                )
+                if dist_m < 0.0 or dist_m > remaining_m:
+                    hit_geom = -1
+                    break
+                candidate_hit_point = march_start + dirs[idx] * dist_m
+                candidate_geom = int(geomid[0])
+                if candidate_geom in self.rover_geom_id_set:
+                    advance_m = max(float(dist_m) + 0.02, 0.02)
+                    march_start = march_start + dirs[idx].astype(np.float64) * advance_m
+                    remaining_m -= advance_m
+                    continue
+                hit_point = candidate_hit_point
+                hit_geom = candidate_geom
+                break
+            if hit_point is None:
                 continue
-            hit_point = ray_starts[idx] + dirs[idx] * dist_m
             dist_cm = float(np.linalg.norm(hit_point - starts[idx]) * 100.0)
             if dist_cm < 5.0:
                 continue
             distances_cm[idx] = dist_cm
             end_points[idx] = hit_point
-            hit_geom = int(geomid[0])
             if hit_geom in self.rock_geom_id_set:
                 class_ids[idx] = LIDAR_CLASS_OBSTACLE
                 hit_types[idx] = 'obstacle'

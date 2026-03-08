@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 import time
@@ -13,6 +13,8 @@ import numpy as np
 from physics_sim import LIDAR_CLASS_NONE, MujocoRoverWorld, SimConfig, WorldConfig
 
 SHOW_LIDAR = True
+ENABLE_MODEL_INFERENCE = True
+MODEL_INFERENCE_HISTORY_STEP_GAP = 5
 WINDOW_WIDTH = 1600
 WINDOW_HEIGHT = 900
 CAMERA_DISTANCE = 4.8
@@ -109,6 +111,99 @@ def _append_lidar_overlay(scene: mujoco.MjvScene, scan) -> None:
         scene.ngeom += 1
 
 
+def _append_persistent_hit_overlay(scene: mujoco.MjvScene, hit_points_cm: list[np.ndarray]) -> None:
+    if not hit_points_cm:
+        return
+    identity = np.eye(3, dtype=np.float64).reshape(-1)
+    zero = np.zeros(3, dtype=np.float64)
+    color = np.array([1.0, 0.08, 0.08, 1.0], dtype=np.float64)
+    half_height_cm = 45.0
+    for hit_point_cm in hit_points_cm:
+        if scene.ngeom >= scene.maxgeom:
+            break
+        start_pt_cm = np.asarray(hit_point_cm, dtype=np.float64).copy()
+        end_pt_cm = np.asarray(hit_point_cm, dtype=np.float64).copy()
+        start_pt_cm[2] -= half_height_cm
+        end_pt_cm[2] += half_height_cm
+        geom = scene.geoms[scene.ngeom]
+        mujoco.mjv_initGeom(
+            geom,
+            mujoco.mjtGeom.mjGEOM_LINE,
+            np.ones(3, dtype=np.float64),
+            zero,
+            identity,
+            color,
+        )
+        mujoco.mjv_connector(
+            geom,
+            mujoco.mjtGeom.mjGEOM_LINE,
+            3.0,
+            (start_pt_cm / 100.0).astype(np.float64),
+            (end_pt_cm / 100.0).astype(np.float64),
+        )
+        scene.ngeom += 1
+
+
+class DemoInferencer:
+    def __init__(self, history_step_gap: int) -> None:
+        import model as lidar_model
+
+        self._model = lidar_model
+        self.history_step_gap = int(max(history_step_gap, 1))
+        self._sample_counter = 0
+        self._last_obstacle_mask: np.ndarray | None = None
+
+    def reset_history(self) -> None:
+        self._model.reset_history()
+        self._sample_counter = 0
+        self._last_obstacle_mask = None
+
+    def predict_obstacle_mask(
+        self,
+        lidar_cm: np.ndarray,
+        pose_origin_cm: np.ndarray,
+        basis: np.ndarray,
+    ) -> tuple[np.ndarray, bool]:
+        should_sample = (self._sample_counter % self.history_step_gap) == 0 or self._last_obstacle_mask is None
+        self._sample_counter += 1
+        if should_sample:
+            result = self._model.ingest_lidar(
+                lidar_cm=lidar_cm,
+                pose_xyz_cm=pose_origin_cm,
+                basis=basis,
+            )
+            self._last_obstacle_mask = np.asarray(result["obstacle_mask"], dtype=bool)
+        assert self._last_obstacle_mask is not None
+        return self._last_obstacle_mask.copy(), bool(should_sample)
+
+
+def _quantized_hit_key(point_cm: np.ndarray) -> tuple[int, int, int]:
+    scale = 20.0
+    return tuple(int(np.rint(float(v) / scale)) for v in point_cm.tolist())
+
+
+def _capture_inferred_hit_beams(
+    hit_points_cm: list[np.ndarray],
+    seen_keys: set[tuple[int, int, int]],
+    scan,
+    obstacle_mask: np.ndarray,
+) -> int:
+    added = 0
+    valid_hits = np.asarray(scan.distances_cm, dtype=np.float32) >= 0.0
+    for idx in np.flatnonzero(np.asarray(obstacle_mask, dtype=bool) & valid_hits):
+        end_pt_cm = np.asarray(scan.end_points[int(idx)], dtype=np.float32)
+        key = _quantized_hit_key(end_pt_cm)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        hit_points_cm.append(end_pt_cm.copy())
+        added += 1
+        if len(hit_points_cm) > 12000:
+            old_end = hit_points_cm.pop(0)
+            seen_keys.discard(_quantized_hit_key(old_end))
+    return added
+
+
 def _create_window() -> glfw._GLFWwindow:
     if not glfw.init():
         raise RuntimeError('Failed to initialize GLFW')
@@ -172,6 +267,12 @@ def main() -> None:
     glfw.set_key_callback(window, controls.on_key)
     glfw.set_scroll_callback(window, controls.on_scroll)
     print('Controls: hold W/S for full throttle, hold A/D for full steering, mouse wheel or PageUp/PageDown to zoom, R respawn, L toggle lidar, Esc quit')
+    inferencer = DemoInferencer(MODEL_INFERENCE_HISTORY_STEP_GAP) if ENABLE_MODEL_INFERENCE else None
+    if inferencer is not None:
+        print(
+            'Model inference overlay enabled: feeding live pose + lidar into runs/gru_lidar_classifier.pt '
+            f'(history step gap={MODEL_INFERENCE_HISTORY_STEP_GAP})'
+        )
     log_path, log_handle, log_writer = _open_demo_log()
     print(f'Logging demo telemetry to {log_path}')
     try:
@@ -185,6 +286,8 @@ def main() -> None:
                 mujoco.mjr_uploadHField(world.model, context, 0)
             _configure_camera(cam, world, controls)
             last_status_t = 0.0
+            persistent_hit_points_cm: list[np.ndarray] = []
+            persistent_hit_keys: set[tuple[int, int, int]] = set()
             while not glfw.window_should_close(window):
                 step_start = time.perf_counter()
                 glfw.poll_events()
@@ -192,10 +295,14 @@ def main() -> None:
                 if controls.respawn_requested:
                     world.respawn_random()
                     controls.respawn_requested = False
+                    if inferencer is not None:
+                        inferencer.reset_history()
                 world.step(throttle, steering)
                 if world.is_invalid():
                     world.respawn_random()
                     controls.auto_camera_frames_left = CAMERA_AUTO_VISIBILITY_FRAMES
+                    if inferencer is not None:
+                        inferencer.reset_history()
                 if world.consume_hfield_render_dirty():
                     mujoco.mjr_uploadHField(world.model, context, 0)
                 pose = world.get_pose()
@@ -206,11 +313,29 @@ def main() -> None:
                 ]
                 cam.distance = controls.camera_distance
                 scan = world.run_lidar_scan()
+                inferred_obstacle_mask: np.ndarray | None = None
+                added_hit_beams = 0
+                sampled_model_history = False
+                if inferencer is not None:
+                    inferred_obstacle_mask, sampled_model_history = inferencer.predict_obstacle_mask(
+                        lidar_cm=np.asarray(scan.distances_cm, dtype=np.float32),
+                        pose_origin_cm=np.asarray(pose.origin, dtype=np.float32),
+                        basis=np.asarray(pose.basis, dtype=np.float32),
+                    )
+                    if sampled_model_history:
+                        added_hit_beams = _capture_inferred_hit_beams(
+                            persistent_hit_points_cm,
+                            persistent_hit_keys,
+                            scan,
+                            inferred_obstacle_mask,
+                        )
                 width, height = glfw.get_framebuffer_size(window)
                 viewport = mujoco.MjrRect(0, 0, width, height)
                 mujoco.mjv_updateScene(world.model, world.data, opt, pert, cam, int(mujoco.mjtCatBit.mjCAT_ALL), scene)
                 if controls.show_lidar:
                     _append_lidar_overlay(scene, scan)
+                if inferencer is not None:
+                    _append_persistent_hit_overlay(scene, persistent_hit_points_cm)
                 mujoco.mjr_render(viewport, scene, context)
                 if controls.auto_camera_frames_left > 0:
                     visibility = _camera_visibility_score(context, viewport)
@@ -221,6 +346,14 @@ def main() -> None:
                 speed_cm_s = float(np.linalg.norm(lin_vel[:2]) * 100.0)
                 status_left = 'Drive'
                 status_right = f'throttle={throttle:+.2f} steer={steering:+.2f} speed={speed_cm_s:.1f} cm/s lidar={"on" if controls.show_lidar else "off"}'
+                if inferred_obstacle_mask is not None:
+                    predicted_count = int(np.count_nonzero(inferred_obstacle_mask))
+                    status_left = 'Drive + Model'
+                    status_right += (
+                        f' infer_obs={predicted_count}/{len(inferred_obstacle_mask)} '
+                        f'persist={len(persistent_hit_points_cm)} +{added_hit_beams} '
+                        f'sampled={"yes" if sampled_model_history else "no"}'
+                    )
                 mujoco.mjr_overlay(
                     int(mujoco.mjtFontScale.mjFONTSCALE_150),
                     int(mujoco.mjtGridPos.mjGRID_TOPLEFT),
