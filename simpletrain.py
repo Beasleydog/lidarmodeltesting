@@ -286,17 +286,25 @@ def run_epoch(
     epoch_idx: int,
     total_epochs: int,
     phase_name: str,
+    log_every_batches: int,
     class_weights: torch.Tensor | None = None,
     label_smoothing: float = 0.0,
     grad_clip_norm: float = 0.0,
     use_amp: bool = False,
 ) -> tuple[float, float]:
+    def fmt_acc(correct: int, total: int) -> str:
+        if total <= 0:
+            return "n/a"
+        return f"{(correct / total):.3f}"
+
     is_train = optimizer is not None
     model.train(is_train)
     total_loss = 0.0
     total_correct = 0
     total_count = 0
     seen_sequences = 0
+    class_totals = np.zeros((3,), dtype=np.int64)
+    class_correct = np.zeros((3,), dtype=np.int64)
     phase_t0 = perf_counter()
     non_blocking = device_kind == "cuda"
     amp_enabled = bool(use_amp and device_kind == "cuda")
@@ -305,7 +313,8 @@ def run_epoch(
     if class_weights is not None:
         class_weights_t = class_weights.to(device)
 
-    for x, lengths, y in loader:
+    batch_count = len(loader)
+    for batch_idx, (x, lengths, y) in enumerate(loader, start=1):
         x = x.to(device, non_blocking=non_blocking)
         lengths = lengths.to(device, non_blocking=non_blocking)
         y = y.to(device, non_blocking=non_blocking)
@@ -336,9 +345,31 @@ def run_epoch(
         preds = torch.argmax(logits, dim=-1)
         total_correct += int((preds == y).sum().item())
         total_count += int(y.numel())
+        y_flat = y.reshape(-1).detach().cpu().numpy()
+        p_flat = preds.reshape(-1).detach().cpu().numpy()
         batch_sequences = int(y.shape[0])
         total_loss += float(loss.item()) * float(batch_sequences)
         seen_sequences += batch_sequences
+
+        for cls_id in range(3):
+            cls_mask = y_flat == cls_id
+            cls_count = int(np.sum(cls_mask))
+            if cls_count > 0:
+                class_totals[cls_id] += cls_count
+                class_correct[cls_id] += int(np.sum(p_flat[cls_mask] == cls_id))
+
+        if log_every_batches > 0 and (batch_idx % log_every_batches == 0 or batch_idx == batch_count):
+            running_loss = total_loss / max(seen_sequences, 1)
+            running_acc = total_correct / max(total_count, 1)
+            obstacle_acc = fmt_acc(int(class_correct[1]), int(class_totals[1]))
+            ground_acc = fmt_acc(int(class_correct[0]), int(class_totals[0]))
+            nothing_acc = fmt_acc(int(class_correct[2]), int(class_totals[2]))
+            log(
+                f"{phase_name} epoch {epoch_idx:03d}/{total_epochs:03d} "
+                f"batch {batch_idx:04d}/{batch_count:04d} "
+                f"loss={running_loss:.5f} acc={running_acc:.4f} "
+                f"class_acc(o/g/n)={obstacle_acc}/{ground_acc}/{nothing_acc}"
+            )
 
     avg_loss = total_loss / max(seen_sequences, 1)
     acc = total_correct / max(total_count, 1)
@@ -396,6 +427,7 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=-1)
     parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--disable-pin-memory", action="store_true")
+    parser.add_argument("--log-every-batches", type=int, default=100)
     parser.add_argument("--amp", type=str, choices=("auto", "on", "off"), default="off")
     parser.add_argument("--val-fraction", type=float, default=0.25)
     parser.add_argument("--max-history", type=int, default=48)
@@ -704,6 +736,7 @@ def main() -> None:
             epoch,
             args.epochs,
             "train",
+            log_every_batches=args.log_every_batches,
             class_weights=class_weights,
             label_smoothing=args.label_smoothing,
             grad_clip_norm=args.grad_clip_norm,
@@ -718,6 +751,7 @@ def main() -> None:
             epoch,
             args.epochs,
             "val",
+            log_every_batches=args.log_every_batches,
             class_weights=class_weights,
             label_smoothing=0.0,
             grad_clip_norm=0.0,
