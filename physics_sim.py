@@ -94,11 +94,11 @@ class RoverConfig:
     suspension_stiffness: float = 2200.0
     suspension_damping: float = 70.0
     steering_max_deg: float = 32.0
-    steering_joint_damping: float = 30.0
-    steering_joint_frictionloss: float = 0.8
-    steering_servo_kp: float = 9000.0
-    steering_servo_kd: float = 1400.0
-    steering_force_max: float = 16000.0
+    steering_joint_damping: float = 28.0
+    steering_joint_frictionloss: float = 1.6
+    steering_servo_kp: float = 18000.0
+    steering_servo_kd: float = 2400.0
+    steering_force_max: float = 36000.0
     wheel_speed_max_rad_s: float = 22.0
     wheel_velocity_kv: float = 2400.0
     wheel_force_max: float = 80000.0
