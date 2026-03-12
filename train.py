@@ -25,6 +25,7 @@ class WorldData:
     lidar_cm: np.ndarray
     lidar_class: np.ndarray
     teleport_flag: np.ndarray
+    lidar_range_scale: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -100,7 +101,7 @@ def _sensor_dirs_from_yaw_pitch_deg(yaw_pitch_deg: np.ndarray) -> np.ndarray:
 MODEL_SENSOR_DIRS_LOCAL = _sensor_dirs_from_yaw_pitch_deg(MODEL_SENSOR_YAW_PITCH_DEG)
 LEGACY_FEATURE_MODE = "legacy_normalized"
 EGO_MAP_FEATURE_MODE = "ego_map_raw"
-DEFAULT_LIDAR_MAX_RANGE_CM = 1000.0
+DEFAULT_LIDAR_MAX_RANGE_CM = 2000.0
 POSE_FEATURE_DIM_LEGACY = 4
 POSE_FEATURE_DIM_EGO_MAP = 12
 
@@ -240,12 +241,14 @@ def _split_single_world_for_validation(world: WorldData, val_fraction: float) ->
         lidar_cm=world.lidar_cm[:split_idx].copy(),
         lidar_class=world.lidar_class[:split_idx].copy(),
         teleport_flag=world.teleport_flag[:split_idx].copy(),
+        lidar_range_scale=None if world.lidar_range_scale is None else world.lidar_range_scale[:split_idx].copy(),
     )
     val_world = WorldData(
         pose=world.pose[split_idx:].copy(),
         lidar_cm=world.lidar_cm[split_idx:].copy(),
         lidar_class=world.lidar_class[split_idx:].copy(),
         teleport_flag=world.teleport_flag[split_idx:].copy(),
+        lidar_range_scale=None if world.lidar_range_scale is None else world.lidar_range_scale[split_idx:].copy(),
     )
     return train_world, val_world
 
@@ -309,6 +312,78 @@ def pose_array_to_geometry_features(pose: np.ndarray) -> np.ndarray:
     yaw = pose[:, 3]
     basis = _flat_basis_from_yaw_deg(yaw).reshape(-1, 9)
     return np.concatenate([origin, basis], axis=1).astype(np.float32)
+
+
+def _pose_array_to_basis(pose: np.ndarray) -> np.ndarray:
+    pose = np.asarray(pose, dtype=np.float32)
+    if pose.ndim != 2:
+        raise ValueError("pose must be shape [T,P]")
+    if pose.shape[1] == POSE_FEATURE_DIM_EGO_MAP:
+        return pose[:, 3:].reshape(-1, 3, 3).astype(np.float32)
+    if pose.shape[1] == POSE_FEATURE_DIM_LEGACY:
+        return _flat_basis_from_yaw_deg(pose[:, 3]).astype(np.float32)
+    raise ValueError(f"Unsupported pose feature dim {pose.shape[1]}; expected 4 or 12")
+
+
+def _normalize_vectors(v: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    denom = np.linalg.norm(v, axis=-1, keepdims=True)
+    denom = np.maximum(denom, float(eps))
+    return (v / denom).astype(np.float32)
+
+
+def _orthonormalize_basis_columns(basis: np.ndarray) -> np.ndarray:
+    x_axis = _normalize_vectors(basis[:, :, 0])
+    y_guess = basis[:, :, 1] - x_axis * np.sum(basis[:, :, 1] * x_axis, axis=1, keepdims=True)
+    y_small = np.linalg.norm(y_guess, axis=1) < 1e-6
+    if np.any(y_small):
+        z_guess = basis[y_small, :, 2] - x_axis[y_small] * np.sum(
+            basis[y_small, :, 2] * x_axis[y_small],
+            axis=1,
+            keepdims=True,
+        )
+        y_guess[y_small] = np.cross(z_guess, x_axis[y_small], axis=1)
+    y_axis = _normalize_vectors(y_guess)
+    z_axis = _normalize_vectors(np.cross(x_axis, y_axis, axis=1))
+    y_axis = _normalize_vectors(np.cross(z_axis, x_axis, axis=1))
+    return np.stack([x_axis, y_axis, z_axis], axis=2).astype(np.float32)
+
+
+def _compute_lidar_ray_scale(pose: np.ndarray, num_sensors: int, scale_xyz: np.ndarray) -> np.ndarray:
+    basis = _pose_array_to_basis(pose)
+    sensor_dirs = MODEL_SENSOR_DIRS_LOCAL[: int(num_sensors)].astype(np.float32)
+    world_dirs = np.einsum("tij,sj->tsi", basis, sensor_dirs, optimize=True)
+    scaled_world_dirs = world_dirs * np.asarray(scale_xyz, dtype=np.float32).reshape(1, 1, 3)
+    return np.linalg.norm(scaled_world_dirs, axis=2).astype(np.float32)
+
+
+def scale_world_coordinates(world: WorldData, scale_xyz: np.ndarray) -> WorldData:
+    scale_arr = np.asarray(scale_xyz, dtype=np.float32).reshape(3)
+    if np.any(scale_arr <= 0.0):
+        raise ValueError("scale_xyz must contain only positive values")
+
+    pose = np.asarray(world.pose, dtype=np.float32).copy()
+    pose[:, :3] *= scale_arr[None, :]
+
+    basis = _pose_array_to_basis(world.pose)
+    scaled_basis = basis * scale_arr.reshape(1, 3, 1)
+    scaled_basis = _orthonormalize_basis_columns(scaled_basis)
+    if pose.shape[1] == POSE_FEATURE_DIM_EGO_MAP:
+        pose[:, 3:] = scaled_basis.reshape(-1, 9)
+    else:
+        pose[:, 3] = np.rad2deg(np.arctan2(scaled_basis[:, 1, 0], scaled_basis[:, 0, 0])).astype(np.float32)
+
+    lidar_range_scale = _compute_lidar_ray_scale(world.pose, world.lidar_cm.shape[1], scale_arr)
+    lidar_cm = np.asarray(world.lidar_cm, dtype=np.float32).copy()
+    valid = lidar_cm >= 0.0
+    lidar_cm[valid] *= lidar_range_scale[valid]
+
+    return WorldData(
+        pose=pose.astype(np.float32),
+        lidar_cm=lidar_cm.astype(np.float32),
+        lidar_class=world.lidar_class.copy(),
+        teleport_flag=world.teleport_flag.copy(),
+        lidar_range_scale=lidar_range_scale,
+    )
 
 
 def assemble_pose_features(
@@ -376,6 +451,7 @@ def load_world_file(path: Path) -> WorldData:
         lidar_cm=np.asarray(cm_rows, dtype=np.float32),
         lidar_class=np.asarray(cls_rows, dtype=np.int64),
         teleport_flag=np.asarray(teleport_rows, dtype=np.int64),
+        lidar_range_scale=None,
     )
 
 
@@ -415,10 +491,16 @@ def world_to_features(
     no_hit_range_cm: float = DEFAULT_LIDAR_MAX_RANGE_CM,
 ) -> tuple[np.ndarray, np.ndarray]:
     hit = (world.lidar_cm >= 0.0).astype(np.float32)
+    lidar_range_scale = (
+        np.asarray(world.lidar_range_scale, dtype=np.float32)
+        if world.lidar_range_scale is not None
+        else np.ones_like(world.lidar_cm, dtype=np.float32)
+    )
 
     if feature_mode == EGO_MAP_FEATURE_MODE:
         pose = pose_array_to_geometry_features(world.pose)
-        dist = np.where(hit > 0.0, world.lidar_cm, float(no_hit_range_cm)).astype(np.float32)
+        no_hit_dist = float(no_hit_range_cm) * lidar_range_scale
+        dist = np.where(hit > 0.0, world.lidar_cm, no_hit_dist).astype(np.float32)
     else:
         pose_raw = pose_array_to_legacy_xyzyaw(world.pose)
         pose = (pose_raw - stats.pose_mean[None, :]) / stats.pose_std[None, :]
@@ -2573,6 +2655,12 @@ def build_loaders(
     train_diversity_ref_samples: int,
     train_diversity_quant_scale: float,
     train_diversity_min_step: float,
+    train_world_scale_x_min: float,
+    train_world_scale_x_max: float,
+    train_world_scale_y_min: float,
+    train_world_scale_y_max: float,
+    train_world_scale_z_min: float,
+    train_world_scale_z_max: float,
     feature_mode: str,
     no_hit_range_cm: float,
     seed: int,
@@ -2636,6 +2724,43 @@ def build_loaders(
             log("No valid validation worlds found; using first training world for validation.")
             val_worlds = [train_worlds[0]]
             val_files = [Path(f"{train_files[0].name}::val_fallback")]
+
+    scale_bounds = np.asarray(
+        [
+            [float(train_world_scale_x_min), float(train_world_scale_x_max)],
+            [float(train_world_scale_y_min), float(train_world_scale_y_max)],
+            [float(train_world_scale_z_min), float(train_world_scale_z_max)],
+        ],
+        dtype=np.float32,
+    )
+    if np.any(scale_bounds <= 0.0):
+        raise SystemExit("Training world scale bounds must be positive.")
+    if np.any(scale_bounds[:, 0] > scale_bounds[:, 1]):
+        raise SystemExit("Training world scale min bounds cannot exceed max bounds.")
+    scale_aug_enabled = bool(np.any(np.abs(scale_bounds - 1.0) > 1e-6))
+    train_world_scale_factors: list[list[float]] = []
+    if scale_aug_enabled:
+        log(
+            "Applying per-world coordinate scale augmentation to training worlds "
+            f"(x={scale_bounds[0, 0]:.3f}..{scale_bounds[0, 1]:.3f}, "
+            f"y={scale_bounds[1, 0]:.3f}..{scale_bounds[1, 1]:.3f}, "
+            f"z={scale_bounds[2, 0]:.3f}..{scale_bounds[2, 1]:.3f})"
+        )
+        augmented_worlds: list[WorldData] = []
+        for world in train_worlds:
+            scale_xyz = np.asarray(
+                [
+                    rng.uniform(float(scale_bounds[0, 0]), float(scale_bounds[0, 1])),
+                    rng.uniform(float(scale_bounds[1, 0]), float(scale_bounds[1, 1])),
+                    rng.uniform(float(scale_bounds[2, 0]), float(scale_bounds[2, 1])),
+                ],
+                dtype=np.float32,
+            )
+            augmented_worlds.append(scale_world_coordinates(world, scale_xyz))
+            train_world_scale_factors.append([float(v) for v in scale_xyz.tolist()])
+        train_worlds = augmented_worlds
+    else:
+        train_world_scale_factors = [[1.0, 1.0, 1.0] for _ in train_worlds]
     log("Computing normalization stats from training worlds")
     stats = compute_norm_stats(train_worlds, feature_mode)
 
@@ -2795,6 +2920,14 @@ def build_loaders(
         "train_diversity_ref_samples": int(train_ds.diversity_stats.get("ref_samples", train_diversity_ref_samples)),
         "train_diversity_quant_scale": float(train_ds.diversity_stats.get("quant_scale", train_diversity_quant_scale)),
         "train_diversity_min_step": float(train_ds.diversity_stats.get("min_step", train_diversity_min_step)),
+        "train_world_scale_enabled": bool(scale_aug_enabled),
+        "train_world_scale_x_min": float(scale_bounds[0, 0]),
+        "train_world_scale_x_max": float(scale_bounds[0, 1]),
+        "train_world_scale_y_min": float(scale_bounds[1, 0]),
+        "train_world_scale_y_max": float(scale_bounds[1, 1]),
+        "train_world_scale_z_min": float(scale_bounds[2, 0]),
+        "train_world_scale_z_max": float(scale_bounds[2, 1]),
+        "train_world_scale_factors": train_world_scale_factors,
         "train_class_counts": np.bincount(
             np.concatenate([t.reshape(-1) for t in train_targets]),
             minlength=3,
@@ -2852,6 +2985,12 @@ def main() -> None:
     parser.add_argument("--train-diversity-ref-samples", type=int, default=50000)
     parser.add_argument("--train-diversity-quant-scale", type=float, default=0.20)
     parser.add_argument("--train-diversity-min-step", type=float, default=0.05)
+    parser.add_argument("--train-world-scale-x-min", type=float, default=0.80)
+    parser.add_argument("--train-world-scale-x-max", type=float, default=1.25)
+    parser.add_argument("--train-world-scale-y-min", type=float, default=0.80)
+    parser.add_argument("--train-world-scale-y-max", type=float, default=1.25)
+    parser.add_argument("--train-world-scale-z-min", type=float, default=0.80)
+    parser.add_argument("--train-world-scale-z-max", type=float, default=1.25)
     parser.add_argument("--no-hit-range-cm", type=float, default=DEFAULT_LIDAR_MAX_RANGE_CM)
     parser.add_argument("--obstacle-oversample-target-frac", type=float, default=0.50)
     parser.add_argument("--seed", type=int, default=7)
@@ -2950,6 +3089,12 @@ def main() -> None:
         train_diversity_ref_samples=args.train_diversity_ref_samples,
         train_diversity_quant_scale=args.train_diversity_quant_scale,
         train_diversity_min_step=args.train_diversity_min_step,
+        train_world_scale_x_min=args.train_world_scale_x_min,
+        train_world_scale_x_max=args.train_world_scale_x_max,
+        train_world_scale_y_min=args.train_world_scale_y_min,
+        train_world_scale_y_max=args.train_world_scale_y_max,
+        train_world_scale_z_min=args.train_world_scale_z_min,
+        train_world_scale_z_max=args.train_world_scale_z_max,
         feature_mode=feature_mode,
         no_hit_range_cm=no_hit_range_cm,
         seed=args.seed,
@@ -2986,6 +3131,15 @@ def main() -> None:
         )
     else:
         log("Training diversity pruning: disabled")
+    if bool(meta.get("train_world_scale_enabled", False)):
+        log(
+            "Training world scale augmentation: "
+            f"x={meta['train_world_scale_x_min']:.3f}..{meta['train_world_scale_x_max']:.3f} "
+            f"y={meta['train_world_scale_y_min']:.3f}..{meta['train_world_scale_y_max']:.3f} "
+            f"z={meta['train_world_scale_z_min']:.3f}..{meta['train_world_scale_z_max']:.3f}"
+        )
+    else:
+        log("Training world scale augmentation: disabled")
     log(
         "Obstacle-target sample mix: "
         f"natural={meta['train_obstacle_target_fraction']:.3f} "
@@ -3252,6 +3406,13 @@ def main() -> None:
                 "train_diversity_ref_samples": int(meta.get("train_diversity_ref_samples", 0)),
                 "train_diversity_quant_scale": float(meta.get("train_diversity_quant_scale", 0.0)),
                 "train_diversity_min_step": float(meta.get("train_diversity_min_step", 0.0)),
+                "train_world_scale_enabled": bool(meta.get("train_world_scale_enabled", False)),
+                "train_world_scale_x_min": float(meta.get("train_world_scale_x_min", 1.0)),
+                "train_world_scale_x_max": float(meta.get("train_world_scale_x_max", 1.0)),
+                "train_world_scale_y_min": float(meta.get("train_world_scale_y_min", 1.0)),
+                "train_world_scale_y_max": float(meta.get("train_world_scale_y_max", 1.0)),
+                "train_world_scale_z_min": float(meta.get("train_world_scale_z_min", 1.0)),
+                "train_world_scale_z_max": float(meta.get("train_world_scale_z_max", 1.0)),
                 "feature_mode": meta["feature_mode"],
                 "no_hit_range_cm": float(meta["no_hit_range_cm"]),
                 "obstacle_oversample_target_frac": effective_obstacle_oversample_target_frac,
@@ -3377,6 +3538,13 @@ def main() -> None:
                         "train_diversity_ref_samples": int(meta.get("train_diversity_ref_samples", 0)),
                         "train_diversity_quant_scale": float(meta.get("train_diversity_quant_scale", 0.0)),
                         "train_diversity_min_step": float(meta.get("train_diversity_min_step", 0.0)),
+                        "train_world_scale_enabled": bool(meta.get("train_world_scale_enabled", False)),
+                        "train_world_scale_x_min": float(meta.get("train_world_scale_x_min", 1.0)),
+                        "train_world_scale_x_max": float(meta.get("train_world_scale_x_max", 1.0)),
+                        "train_world_scale_y_min": float(meta.get("train_world_scale_y_min", 1.0)),
+                        "train_world_scale_y_max": float(meta.get("train_world_scale_y_max", 1.0)),
+                        "train_world_scale_z_min": float(meta.get("train_world_scale_z_min", 1.0)),
+                        "train_world_scale_z_max": float(meta.get("train_world_scale_z_max", 1.0)),
                         "feature_mode": meta["feature_mode"],
                         "no_hit_range_cm": float(meta["no_hit_range_cm"]),
                         "obstacle_oversample_target_frac": effective_obstacle_oversample_target_frac,

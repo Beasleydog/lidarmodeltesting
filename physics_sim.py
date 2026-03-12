@@ -21,6 +21,7 @@ LIDAR_YAW_PITCH_DEG = np.array([
 LIDAR_CLASS_GROUND = 0
 LIDAR_CLASS_OBSTACLE = 1
 LIDAR_CLASS_NONE = 2
+DEFAULT_LIDAR_RANGE_CM = 1000.0
 WORLD_SIZE_CM = 22000.0
 
 SENSOR_POS_LOCAL_M = LIDAR_SENSOR_COORDS_CM / 100.0
@@ -78,7 +79,7 @@ class WorldConfig:
 
 @dataclass(frozen=True)
 class RoverConfig:
-    chassis_mass_kg: float = 240.0
+    chassis_mass_kg: float = 130.0
     chassis_size_m: tuple[float, float, float] = (3.2, 3.0, 0.34)
     visual_frame_size_m: tuple[float, float, float] = (6.5, 5.15, 1.15)
     visual_frame_offset_m: tuple[float, float, float] = (0.025, 0.125, 0.625)
@@ -87,11 +88,11 @@ class RoverConfig:
     wheel_mass_kg: float = 32.0
     wheelbase_m: float = 5.3
     track_m: float = 4.7
-    suspension_rest_m: float = 0.42
-    suspension_travel_up_m: float = 0.22
-    suspension_travel_down_m: float = 0.18
-    suspension_stiffness: float = 6800.0
-    suspension_damping: float = 1150.0
+    suspension_rest_m: float = 0.5
+    suspension_travel_up_m: float = 0.42
+    suspension_travel_down_m: float = 0.36
+    suspension_stiffness: float = 2200.0
+    suspension_damping: float = 70.0
     steering_max_deg: float = 32.0
     steering_joint_damping: float = 30.0
     steering_joint_frictionloss: float = 0.8
@@ -113,7 +114,7 @@ class SimConfig:
     time_step: float = 1.0 / 120.0
     action_repeat: int = 5
     gravity_m_s2: float = -7.5
-    lidar_range_cm: float = 1000.0
+    lidar_range_cm: float = DEFAULT_LIDAR_RANGE_CM
     settle_steps: int = 80
     ray_start_offset_cm: float = 8.0
 

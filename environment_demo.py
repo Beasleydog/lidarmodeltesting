@@ -14,7 +14,7 @@ from physics_sim import LIDAR_CLASS_NONE, MujocoRoverWorld, SimConfig, WorldConf
 
 SHOW_LIDAR = True
 ENABLE_MODEL_INFERENCE = True
-MODEL_INFERENCE_HISTORY_STEP_GAP = 5
+MODEL_INFERENCE_HISTORY_STEP_GAP = 20
 WINDOW_WIDTH = 1600
 WINDOW_HEIGHT = 900
 CAMERA_DISTANCE = 4.8
@@ -22,6 +22,7 @@ CAMERA_AZIMUTH_DEG = 135.0
 CAMERA_ELEVATION_DEG = -24.0
 CAMERA_LOOKAT_Z_OFFSET_M = 1.4
 CAMERA_AUTO_VISIBILITY_FRAMES = 24
+DEMO_TERRAIN_HEIGHT_SCALE_CM = 1000.0
 STATUS_EVERY_S = 0.2
 SCENE_MAX_GEOMS = 20000
 LOG_DIR = Path('logs')
@@ -276,7 +277,11 @@ def main() -> None:
     log_path, log_handle, log_writer = _open_demo_log()
     print(f'Logging demo telemetry to {log_path}')
     try:
-        with MujocoRoverWorld(gui=True, world_cfg=WorldConfig(), sim_cfg=SimConfig()) as world:
+        with MujocoRoverWorld(
+            gui=True,
+            world_cfg=WorldConfig(terrain_height_scale_cm=DEMO_TERRAIN_HEIGHT_SCALE_CM),
+            sim_cfg=SimConfig(),
+        ) as world:
             cam = mujoco.MjvCamera()
             opt = mujoco.MjvOption()
             pert = mujoco.MjvPerturb()

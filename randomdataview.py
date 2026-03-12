@@ -25,6 +25,10 @@ CAMERA_LOOKAT_Z_OFFSET_M = 1.4
 PLAYBACK_STEP_SECONDS = 0.06
 PATH_COLOR = np.array([0.15, 0.88, 0.55, 1.0], dtype=np.float32)
 TELEPORT_COLOR = np.array([1.0, 0.42, 0.16, 1.0], dtype=np.float32)
+PREDICTED_PATH_COLOR = np.array([0.20, 0.55, 1.0, 1.0], dtype=np.float32)
+DEFAULT_PREDICTED_PATH = Path("world_smartdrive_20260309_183830.txt")
+# DEFAULT_PREDICTED_PATH = "off"
+DISABLED_PATH_VALUES = {"", "none", "off", "false", "0"}
 
 
 @dataclass(frozen=True)
@@ -159,7 +163,14 @@ def _set_world_pose(world: MujocoRoverWorld, frame: ReplayFrame) -> None:
     mujoco.mj_forward(world.model, world.data)
 
 
-def _append_path_overlay(scene: mujoco.MjvScene, data: ReplayData, current_idx: int) -> None:
+def _append_path_overlay(
+    scene: mujoco.MjvScene,
+    data: ReplayData,
+    current_idx: int,
+    *,
+    path_color: np.ndarray = PATH_COLOR,
+    teleport_color: np.ndarray = TELEPORT_COLOR,
+) -> None:
     if current_idx <= 0:
         return
     identity = np.eye(3, dtype=np.float64).reshape(-1)
@@ -170,7 +181,7 @@ def _append_path_overlay(scene: mujoco.MjvScene, data: ReplayData, current_idx: 
             break
         prev_pos = data.frames[idx - 1].origin_cm.astype(np.float64) / 100.0
         curr_pos = data.frames[idx].origin_cm.astype(np.float64) / 100.0
-        color = TELEPORT_COLOR if int(data.frames[idx].teleport_flag) > 0 else PATH_COLOR
+        color = teleport_color if int(data.frames[idx].teleport_flag) > 0 else path_color
         geom = scene.geoms[scene.ngeom]
         mujoco.mjv_initGeom(
             geom,
@@ -228,12 +239,14 @@ class ReplayControls:
         self.camera_distance = float(np.clip(self.camera_distance - 0.6 * yoffset, 4.0, 60.0))
 
 
-def _status_left(data: ReplayData, idx: int) -> str:
+def _status_left(data: ReplayData, idx: int, predicted_path: ReplayData | None) -> str:
     frame = data.frames[idx]
+    predicted_line = f"\npredicted={predicted_path.path.name}" if predicted_path is not None else "\npredicted=off"
     return (
         f"{data.path.name}\n"
         f"frame {idx + 1:03d}/{len(data.frames):03d} timestep={frame.timestep:03d}\n"
         f"x={frame.origin_cm[0]:.0f} y={frame.origin_cm[1]:.0f} z={frame.origin_cm[2]:.0f} yaw={frame.yaw_deg:.1f}"
+        f"{predicted_line}"
     )
 
 
@@ -247,7 +260,7 @@ def _status_right(data: ReplayData, idx: int, controls: ReplayControls, step_sec
     )
 
 
-def replay(data: ReplayData, step_seconds: float) -> None:
+def replay(data: ReplayData, step_seconds: float, predicted_path: ReplayData | None = None) -> None:
     controls = ReplayControls()
     window = _create_window()
     glfw.set_key_callback(window, controls.on_key)
@@ -310,12 +323,20 @@ def replay(data: ReplayData, step_seconds: float) -> None:
                     scene,
                 )
                 _append_path_overlay(scene, data, idx)
+                if predicted_path is not None:
+                    _append_path_overlay(
+                        scene,
+                        predicted_path,
+                        len(predicted_path.frames) - 1,
+                        path_color=PREDICTED_PATH_COLOR,
+                        teleport_color=PREDICTED_PATH_COLOR,
+                    )
                 mujoco.mjr_render(viewport, scene, context)
                 mujoco.mjr_overlay(
                     int(mujoco.mjtFontScale.mjFONTSCALE_150),
                     int(mujoco.mjtGridPos.mjGRID_TOPLEFT),
                     viewport,
-                    _status_left(data, idx),
+                    _status_left(data, idx, predicted_path),
                     _status_right(data, idx, controls, step_seconds),
                     context,
                 )
@@ -331,6 +352,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Replay a random rover data file in the MuJoCo viewer.")
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
     parser.add_argument("--file", type=Path, default=None, help="Optional specific data file to replay.")
+    parser.add_argument(
+        "--predicted-path",
+        type=Path,
+        default=DEFAULT_PREDICTED_PATH,
+        help="Optional predicted path file to overlay. Use 'none' or 'off' to disable it.",
+    )
     parser.add_argument("--seed", type=int, default=None, help="Seed used for random file selection.")
     parser.add_argument("--step-seconds", type=float, default=PLAYBACK_STEP_SECONDS)
     args = parser.parse_args()
@@ -339,7 +366,15 @@ def main() -> None:
     if not target.is_absolute():
         target = target if target.exists() else args.data_dir / target
     data = load_replay_file(target.resolve())
-    replay(data, step_seconds=float(max(args.step_seconds, 0.01)))
+    predicted_path: ReplayData | None = None
+    if args.predicted_path is not None:
+        predicted_target = args.predicted_path
+        if str(predicted_target).strip().lower() not in DISABLED_PATH_VALUES:
+            if not predicted_target.is_absolute():
+                predicted_target = predicted_target if predicted_target.exists() else args.data_dir / predicted_target
+            if predicted_target.exists():
+                predicted_path = load_replay_file(predicted_target.resolve())
+    replay(data, step_seconds=float(max(args.step_seconds, 0.01)), predicted_path=predicted_path)
 
 
 if __name__ == "__main__":
