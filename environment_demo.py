@@ -11,9 +11,11 @@ import mujoco
 import numpy as np
 
 from physics_sim import LIDAR_CLASS_NONE, MujocoRoverWorld, SimConfig, WorldConfig
+from train import load_gru_lidar_inferencer
 
 SHOW_LIDAR = True
 ENABLE_MODEL_INFERENCE = True
+USE_SIMPLE_MODEL_INFERENCE = True
 MODEL_INFERENCE_HISTORY_STEP_GAP = 20
 WINDOW_WIDTH = 1600
 WINDOW_HEIGHT = 900
@@ -26,6 +28,21 @@ DEMO_TERRAIN_HEIGHT_SCALE_CM = 1000.0
 STATUS_EVERY_S = 0.2
 SCENE_MAX_GEOMS = 20000
 LOG_DIR = Path('logs')
+RUNS_DIR = Path('runs')
+SIMPLE_RUNS_DIR = Path('simpleruns')
+LEGACY_MODEL_CHECKPOINT = RUNS_DIR / 'gru_lidar_classifier.pt'
+SIMPLE_MODEL_CHECKPOINT = SIMPLE_RUNS_DIR / 'pose_aligned_beam_transformer.pt'
+MODEL_DEVICE = 'auto'
+MODEL_MAX_HISTORY: int | None = None
+
+
+@dataclass(frozen=True)
+class DemoModelConfig:
+    name: str
+    checkpoint_path: Path
+    history_step_gap: int = MODEL_INFERENCE_HISTORY_STEP_GAP
+    device: str = MODEL_DEVICE
+    max_history: int | None = MODEL_MAX_HISTORY
 
 
 @dataclass
@@ -145,17 +162,21 @@ def _append_persistent_hit_overlay(scene: mujoco.MjvScene, hit_points_cm: list[n
         scene.ngeom += 1
 
 
-class DemoInferencer:
-    def __init__(self, history_step_gap: int) -> None:
-        import model as lidar_model
-
-        self._model = lidar_model
-        self.history_step_gap = int(max(history_step_gap, 1))
+class CheckpointDemoInferencer:
+    def __init__(self, config: DemoModelConfig) -> None:
+        self.config = config
+        self.history_step_gap = int(max(config.history_step_gap, 1))
+        self._inferencer = load_gru_lidar_inferencer(
+            checkpoint_path=config.checkpoint_path,
+            device=config.device,
+            max_history=config.max_history,
+        )
+        self._feature_history: list[np.ndarray] = []
         self._sample_counter = 0
         self._last_obstacle_mask: np.ndarray | None = None
 
     def reset_history(self) -> None:
-        self._model.reset_history()
+        self._feature_history.clear()
         self._sample_counter = 0
         self._last_obstacle_mask = None
 
@@ -168,14 +189,45 @@ class DemoInferencer:
         should_sample = (self._sample_counter % self.history_step_gap) == 0 or self._last_obstacle_mask is None
         self._sample_counter += 1
         if should_sample:
-            result = self._model.ingest_lidar(
+            feature_t = self._inferencer.featurize_timestep(
+                pose_values=pose_origin_cm,
                 lidar_cm=lidar_cm,
-                pose_xyz_cm=pose_origin_cm,
                 basis=basis,
             )
-            self._last_obstacle_mask = np.asarray(result["obstacle_mask"], dtype=bool)
+            history = np.asarray([*self._feature_history, feature_t], dtype=np.float32)
+            if self._inferencer.binary_obstacle_only:
+                obstacle_mask = self._inferencer.predict_current_obstacle_mask_from_feature_history(history)
+            else:
+                class_ids = self._inferencer.predict_current_from_feature_history(history).astype(np.int64)
+                obstacle_mask = class_ids == 1
+            self._last_obstacle_mask = np.asarray(obstacle_mask, dtype=bool)
+            self._feature_history.append(feature_t)
+            if self._inferencer.max_history > 0 and len(self._feature_history) > self._inferencer.max_history:
+                del self._feature_history[:-self._inferencer.max_history]
         assert self._last_obstacle_mask is not None
         return self._last_obstacle_mask.copy(), bool(should_sample)
+
+
+def _selected_model_config() -> DemoModelConfig:
+    if USE_SIMPLE_MODEL_INFERENCE:
+        return DemoModelConfig(
+            name='simple',
+            checkpoint_path=SIMPLE_MODEL_CHECKPOINT,
+        )
+    return DemoModelConfig(
+        name='legacy',
+        checkpoint_path=LEGACY_MODEL_CHECKPOINT,
+    )
+
+
+def _create_demo_inferencer() -> CheckpointDemoInferencer:
+    config = _selected_model_config()
+    if not config.checkpoint_path.exists():
+        raise FileNotFoundError(
+            f'Model inference checkpoint not found: {config.checkpoint_path}. '
+            'Update the top-level inference path toggle/constants before running the demo.'
+        )
+    return CheckpointDemoInferencer(config)
 
 
 def _quantized_hit_key(point_cm: np.ndarray) -> tuple[int, int, int]:
@@ -268,11 +320,13 @@ def main() -> None:
     glfw.set_key_callback(window, controls.on_key)
     glfw.set_scroll_callback(window, controls.on_scroll)
     print('Controls: hold W/S for full throttle, hold A/D for full steering, mouse wheel or PageUp/PageDown to zoom, R respawn, L toggle lidar, Esc quit')
-    inferencer = DemoInferencer(MODEL_INFERENCE_HISTORY_STEP_GAP) if ENABLE_MODEL_INFERENCE else None
+    inferencer = _create_demo_inferencer() if ENABLE_MODEL_INFERENCE else None
     if inferencer is not None:
+        infer_cfg = inferencer.config
         print(
-            'Model inference overlay enabled: feeding live pose + lidar into runs/gru_lidar_classifier.pt '
-            f'(history step gap={MODEL_INFERENCE_HISTORY_STEP_GAP})'
+            'Model inference overlay enabled: '
+            f'backend={infer_cfg.name} checkpoint={infer_cfg.checkpoint_path} '
+            f'(history step gap={infer_cfg.history_step_gap})'
         )
     log_path, log_handle, log_writer = _open_demo_log()
     print(f'Logging demo telemetry to {log_path}')

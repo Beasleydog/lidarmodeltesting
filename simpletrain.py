@@ -408,6 +408,63 @@ def evaluate_detailed(model: nn.Module, loader, device: torch.device) -> dict:
     }
 
 
+def build_training_meta(meta: dict, args: argparse.Namespace, best: dict) -> dict:
+    return {
+        "train_files": meta["train_files"],
+        "val_files": meta["val_files"],
+        "num_train_worlds": meta["num_train_worlds"],
+        "num_val_worlds": meta["num_val_worlds"],
+        "num_train_samples": meta["num_train_samples"],
+        "num_val_samples": meta["num_val_samples"],
+        "min_history": meta["min_history"],
+        "max_history": meta["max_history"],
+        "histories_per_target": args.histories_per_target,
+        "exclude_after_teleport_steps": args.exclude_after_teleport_steps,
+        "history_step_min": args.history_step_min,
+        "history_step_max": args.history_step_max,
+        "train_lidar_offset_max_cm": float(meta["train_lidar_offset_max_cm"]),
+        "train_diversity_enabled": bool(meta.get("train_diversity_enabled", False)),
+        "train_diversity_before": int(meta.get("train_diversity_before", meta["num_train_samples"])),
+        "train_diversity_after": int(meta.get("train_diversity_after", meta["num_train_samples"])),
+        "train_diversity_kept_fraction": float(meta.get("train_diversity_kept_fraction", 1.0)),
+        "train_diversity_unique_signatures": int(meta.get("train_diversity_unique_signatures", 0)),
+        "train_diversity_max_per_signature": int(meta.get("train_diversity_max_per_signature", 0)),
+        "train_diversity_ref_samples": int(meta.get("train_diversity_ref_samples", 0)),
+        "train_diversity_quant_scale": float(meta.get("train_diversity_quant_scale", 0.0)),
+        "train_diversity_min_step": float(meta.get("train_diversity_min_step", 0.0)),
+        "train_world_scale_enabled": bool(meta.get("train_world_scale_enabled", False)),
+        "train_world_scale_x_min": float(meta.get("train_world_scale_x_min", 1.0)),
+        "train_world_scale_x_max": float(meta.get("train_world_scale_x_max", 1.0)),
+        "train_world_scale_y_min": float(meta.get("train_world_scale_y_min", 1.0)),
+        "train_world_scale_y_max": float(meta.get("train_world_scale_y_max", 1.0)),
+        "train_world_scale_z_min": float(meta.get("train_world_scale_z_min", 1.0)),
+        "train_world_scale_z_max": float(meta.get("train_world_scale_z_max", 1.0)),
+        "feature_mode": meta["feature_mode"],
+        "no_hit_range_cm": float(meta["no_hit_range_cm"]),
+        "sequence_sampling": meta["sequence_sampling"],
+        "train_teleport_rows": meta["train_teleport_rows"],
+        "val_teleport_rows": meta["val_teleport_rows"],
+        "train_obstacle_target_samples": meta["train_obstacle_target_samples"],
+        "train_non_obstacle_target_samples": meta["train_non_obstacle_target_samples"],
+        "train_obstacle_target_fraction": meta["train_obstacle_target_fraction"],
+        "train_sampled_obstacle_target_fraction": meta["train_sampled_obstacle_target_fraction"],
+        "train_class_counts": meta["train_class_counts"],
+        "val_class_counts": meta["val_class_counts"],
+        "label_smoothing": args.label_smoothing,
+        "weight_decay": args.weight_decay,
+        "grad_clip_norm": args.grad_clip_norm,
+        "early_stop_patience": int(args.early_stop_patience),
+        "early_stop_min_epochs": int(args.early_stop_min_epochs),
+        "best_epoch": best["epoch"],
+        "best_val_loss": best["val_loss"],
+    }
+
+
+def write_history_json(history_path: Path, history: list[dict]) -> None:
+    with history_path.open("w", encoding="utf-8") as fh:
+        json.dump(history, fh, indent=2)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a pose-aligned transformer lidar classifier.")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
@@ -451,6 +508,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--label-smoothing", type=float, default=0.02)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--early-stop-patience", type=int, default=5)
+    parser.add_argument("--early-stop-min-epochs", type=int, default=8)
     args = parser.parse_args()
 
     report_base = args.eval_checkpoint if args.eval_checkpoint is not None else args.output
@@ -670,6 +729,7 @@ def main() -> None:
     history: list[dict] = []
     metrics_csv_path = args.output.with_suffix(".metrics.csv")
     split_manifest_path = args.output.with_suffix(".split.json")
+    history_path = args.output.with_suffix(".history.json")
     log(f"Output directory ready: {args.output.parent}")
     with split_manifest_path.open("w", encoding="utf-8") as fh:
         json.dump(
@@ -724,6 +784,7 @@ def main() -> None:
         writer.writerow(["epoch", "train_loss", "train_acc", "val_loss", "val_acc", "best_val_loss"])
     log(f"Initialized metrics CSV: {metrics_csv_path}")
 
+    epochs_without_improve = 0
     for epoch in range(1, args.epochs + 1):
         log(f"Epoch {epoch:03d}/{args.epochs:03d} started")
         t0 = perf_counter()
@@ -775,6 +836,7 @@ def main() -> None:
 
         if val_loss < best["val_loss"]:
             best = {"val_loss": val_loss, "epoch": epoch}
+            epochs_without_improve = 0
             log(
                 f"New best validation loss at epoch {epoch:03d}: "
                 f"{best['val_loss']:.6f}. Saving checkpoint -> {args.output}"
@@ -782,52 +844,28 @@ def main() -> None:
             save_checkpoint_for_device(
                 {
                     "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "model_config": model_config,
                     "norm": meta["norm"],
                     "history": history,
-                    "meta": {
-                        "train_files": meta["train_files"],
-                        "val_files": meta["val_files"],
-                        "min_history": meta["min_history"],
-                        "max_history": meta["max_history"],
-                        "histories_per_target": args.histories_per_target,
-                        "exclude_after_teleport_steps": args.exclude_after_teleport_steps,
-                        "history_step_min": args.history_step_min,
-                        "history_step_max": args.history_step_max,
-                        "train_lidar_offset_max_cm": float(meta["train_lidar_offset_max_cm"]),
-                        "train_diversity_enabled": bool(meta.get("train_diversity_enabled", False)),
-                        "train_diversity_before": int(meta.get("train_diversity_before", meta["num_train_samples"])),
-                        "train_diversity_after": int(meta.get("train_diversity_after", meta["num_train_samples"])),
-                        "train_diversity_kept_fraction": float(meta.get("train_diversity_kept_fraction", 1.0)),
-                        "train_diversity_unique_signatures": int(meta.get("train_diversity_unique_signatures", 0)),
-                        "train_diversity_max_per_signature": int(meta.get("train_diversity_max_per_signature", 0)),
-                        "train_diversity_ref_samples": int(meta.get("train_diversity_ref_samples", 0)),
-                        "train_diversity_quant_scale": float(meta.get("train_diversity_quant_scale", 0.0)),
-                        "train_diversity_min_step": float(meta.get("train_diversity_min_step", 0.0)),
-                        "train_world_scale_enabled": bool(meta.get("train_world_scale_enabled", False)),
-                        "train_world_scale_x_min": float(meta.get("train_world_scale_x_min", 1.0)),
-                        "train_world_scale_x_max": float(meta.get("train_world_scale_x_max", 1.0)),
-                        "train_world_scale_y_min": float(meta.get("train_world_scale_y_min", 1.0)),
-                        "train_world_scale_y_max": float(meta.get("train_world_scale_y_max", 1.0)),
-                        "train_world_scale_z_min": float(meta.get("train_world_scale_z_min", 1.0)),
-                        "train_world_scale_z_max": float(meta.get("train_world_scale_z_max", 1.0)),
-                        "feature_mode": meta["feature_mode"],
-                        "no_hit_range_cm": float(meta["no_hit_range_cm"]),
-                        "sequence_sampling": meta["sequence_sampling"],
-                        "label_smoothing": args.label_smoothing,
-                        "weight_decay": args.weight_decay,
-                        "grad_clip_norm": args.grad_clip_norm,
-                        "train_class_counts": meta["train_class_counts"],
-                        "val_class_counts": meta["val_class_counts"],
-                        "best_epoch": best["epoch"],
-                        "best_val_loss": best["val_loss"],
+                    "meta": build_training_meta(meta, args, best),
+                    "run_state": {
+                        "epoch": epoch,
+                        "best": best,
+                        "epochs_without_improve": epochs_without_improve,
+                        "current_lr": current_lr,
                     },
                 },
                 args.output,
                 device_kind,
             )
+            write_history_json(history_path, history)
+        else:
+            epochs_without_improve += 1
         with metrics_csv_path.open("a", encoding="utf-8", newline="") as fh:
             csv.writer(fh).writerow([epoch, train_loss, train_acc, val_loss, val_acc, best["val_loss"]])
+        write_history_json(history_path, history)
 
         log_plain(
             f"epoch {epoch:03d}/{args.epochs:03d} "
@@ -838,11 +876,15 @@ def main() -> None:
             f"time={epoch_s:.2f}s"
         )
         log(f"Epoch {epoch:03d}/{args.epochs:03d} finished")
+        if epoch >= args.early_stop_min_epochs and epochs_without_improve >= args.early_stop_patience:
+            log(
+                f"Early stopping triggered after epoch {epoch:03d}; "
+                f"no val improvement for {epochs_without_improve} epochs."
+            )
+            break
 
     log("Writing final history JSON")
-    history_path = args.output.with_suffix(".history.json")
-    with history_path.open("w", encoding="utf-8") as fh:
-        json.dump(history, fh, indent=2)
+    write_history_json(history_path, history)
     if args.output.exists():
         log("Loading best checkpoint for final validation report")
         ckpt = load_checkpoint_for_device(args.output, device, device_kind)
