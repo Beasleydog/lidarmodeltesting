@@ -13,7 +13,7 @@ import numpy as np
 from physics_sim import LIDAR_CLASS_NONE, MujocoRoverWorld, SimConfig, WorldConfig
 
 DATA_DIR = Path('data')
-WORLDS_TO_GENERATE = 3000
+WORLDS_TO_GENERATE = 1000
 TIMESTEPS_PER_WORLD = 500
 BASE_RANDOM_SEED: int | None = None
 SHOW_VIEWER = False
