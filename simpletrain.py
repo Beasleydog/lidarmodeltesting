@@ -18,7 +18,6 @@ from train import (
     MODEL_SENSOR_COORDS_CM,
     MODEL_SENSOR_DIRS_LOCAL,
     build_loaders,
-    compute_class_weights,
     configure_runtime_for_device,
     load_checkpoint_for_device,
     log,
@@ -124,7 +123,7 @@ class PoseAlignedBeamTransformerClassifier(nn.Module):
             nn.Linear(self.decoder_hidden_dim, self.hidden_dim),
             nn.GELU(),
         )
-        self.decoder = nn.Sequential(
+        self.obstacle_head = nn.Sequential(
             nn.LayerNorm(self.hidden_dim),
             nn.Linear(self.hidden_dim, self.decoder_hidden_dim),
             nn.GELU(),
@@ -132,7 +131,7 @@ class PoseAlignedBeamTransformerClassifier(nn.Module):
             nn.Linear(self.decoder_hidden_dim, self.decoder_hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(self.decoder_hidden_dim, self.num_classes),
+            nn.Linear(self.decoder_hidden_dim, 1),
         )
 
     def _gather_last_valid(self, values: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
@@ -161,6 +160,9 @@ class PoseAlignedBeamTransformerClassifier(nn.Module):
             torch.arange(time_steps, device=dist.device).unsqueeze(0) < lengths.to(device=dist.device).unsqueeze(1)
         )
 
+        current_pose_origin = self._gather_last_valid(pose_origin, lengths)
+        current_pose_basis = self._gather_last_valid(pose_basis, lengths)
+        inv_current_basis = current_pose_basis.transpose(1, 2)
         current_dist = self._gather_last_valid(dist, lengths).clamp(min=0.0, max=self.max_range_cm)
         current_hit = self._gather_last_valid(hit, lengths)
         sensor_coords = self.sensor_coords_local.view(1, 1, sensor_count, 3).to(device=dist.device, dtype=dist.dtype)
@@ -171,6 +173,11 @@ class PoseAlignedBeamTransformerClassifier(nn.Module):
 
         ranges = dist.clamp(min=0.0, max=self.max_range_cm)
         endpoint_world = origin_world + dir_world * ranges.unsqueeze(-1)
+        rel_origin = origin_world - current_pose_origin[:, None, None, :]
+        rel_endpoint = endpoint_world - current_pose_origin[:, None, None, :]
+        origin_current = torch.matmul(inv_current_basis[:, None, None, :, :], rel_origin.unsqueeze(-1)).squeeze(-1)
+        dir_current = torch.matmul(inv_current_basis[:, None, None, :, :], dir_world.unsqueeze(-1)).squeeze(-1)
+        endpoint_current = torch.matmul(inv_current_basis[:, None, None, :, :], rel_endpoint.unsqueeze(-1)).squeeze(-1)
 
         time_idx = torch.arange(time_steps, device=dist.device).unsqueeze(0)
         time_offset = (lengths.to(device=dist.device).unsqueeze(1) - 1 - time_idx).clamp_min(0).to(dtype=dist.dtype)
@@ -182,11 +189,11 @@ class PoseAlignedBeamTransformerClassifier(nn.Module):
 
         token_features = torch.cat(
             [
-                origin_world / self.max_range_cm,
-                dir_world,
+                origin_current / self.max_range_cm,
+                dir_current,
                 hit.unsqueeze(-1),
                 (ranges / self.max_range_cm).unsqueeze(-1),
-                endpoint_world / self.max_range_cm,
+                endpoint_current / self.max_range_cm,
                 age,
             ],
             dim=-1,
@@ -208,25 +215,15 @@ class PoseAlignedBeamTransformerClassifier(nn.Module):
         token_embed = token_embed + self.sensor_embedding(token_sensor_ids) + self.time_mlp(token_age)
         return self.history_encoder(token_embed, src_key_padding_mask=token_mask)
 
-    def _build_queries(
-        self,
-        current_dist: torch.Tensor,
-        current_hit: torch.Tensor,
-        current_pose_origin: torch.Tensor,
-        current_pose_basis: torch.Tensor,
-    ) -> torch.Tensor:
+    def _build_queries(self, current_dist: torch.Tensor, current_hit: torch.Tensor) -> torch.Tensor:
         batch_size = current_dist.shape[0]
         sensor_coords_local = self.sensor_coords_local.to(device=current_dist.device, dtype=current_dist.dtype).unsqueeze(0)
         sensor_dirs_local = self.sensor_dirs_local.to(device=current_dist.device, dtype=current_dist.dtype).unsqueeze(0)
-        sensor_coords = current_pose_origin.unsqueeze(1) + torch.matmul(
-            current_pose_basis.unsqueeze(1), sensor_coords_local.unsqueeze(-1)
-        ).squeeze(-1)
-        sensor_dirs = torch.matmul(current_pose_basis.unsqueeze(1), sensor_dirs_local.unsqueeze(-1)).squeeze(-1)
-        endpoint_local = sensor_coords + sensor_dirs * current_dist.unsqueeze(-1)
+        endpoint_local = sensor_coords_local + sensor_dirs_local * current_dist.unsqueeze(-1)
         query_features = torch.cat(
             [
-                sensor_coords / self.max_range_cm,
-                sensor_dirs,
+                sensor_coords_local.expand(batch_size, -1, -1) / self.max_range_cm,
+                sensor_dirs_local.expand(batch_size, -1, -1),
                 current_hit.unsqueeze(-1),
                 (current_dist / self.max_range_cm).unsqueeze(-1),
                 endpoint_local / self.max_range_cm,
@@ -242,10 +239,8 @@ class PoseAlignedBeamTransformerClassifier(nn.Module):
         token_mask: torch.Tensor,
         current_dist: torch.Tensor,
         current_hit: torch.Tensor,
-        current_pose_origin: torch.Tensor,
-        current_pose_basis: torch.Tensor,
     ) -> torch.Tensor:
-        queries = self._build_queries(current_dist, current_hit, current_pose_origin, current_pose_basis)
+        queries = self._build_queries(current_dist, current_hit)
         attended, _ = self.query_to_history(
             queries,
             encoded_history,
@@ -257,24 +252,30 @@ class PoseAlignedBeamTransformerClassifier(nn.Module):
         history_count = (~token_mask).sum(dim=1, keepdim=True).clamp_min(1).to(dtype=encoded_history.dtype)
         history_global = (history_sum / history_count).unsqueeze(1).expand(-1, self.num_sensors, -1)
         fused = self.fuse(torch.cat([queries, attended, history_global], dim=-1))
-        return self.decoder(fused)
+        obstacle_logits = self.obstacle_head(fused).squeeze(-1)
+        hit_gate = (current_hit * 2.0 - 1.0) * 8.0
+        ground_score = -obstacle_logits + hit_gate
+        obstacle_score = obstacle_logits + hit_gate
+        none_score = -hit_gate
+        class_logits = torch.stack([ground_score, obstacle_score, none_score], dim=-1)
+        return class_logits, obstacle_logits
 
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    def forward_with_aux(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        class_logits, obstacle_logits = self._forward_impl(x, lengths)
+        ground_none_logits = obstacle_logits.new_zeros(obstacle_logits.shape)
+        return class_logits, obstacle_logits, ground_none_logits
+
+    def _forward_impl(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         pose_origin, pose_basis, dist, hit = self._parse_inputs(x)
-        current_pose_origin = self._gather_last_valid(pose_origin, lengths)
-        current_pose_basis = self._gather_last_valid(pose_basis, lengths)
         token_features, token_age, token_sensor_ids, token_mask, current_dist, current_hit = self._build_history_tokens(
             pose_origin, pose_basis, dist, hit, lengths
         )
         encoded = self._encode_history(token_features, token_age, token_sensor_ids, token_mask)
-        return self._decode_queries(
-            encoded,
-            token_mask,
-            current_dist,
-            current_hit,
-            current_pose_origin,
-            current_pose_basis,
-        )
+        return self._decode_queries(encoded, token_mask, current_dist, current_hit)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        class_logits, _ = self._forward_impl(x, lengths)
+        return class_logits
 
 
 def run_epoch(
@@ -287,7 +288,6 @@ def run_epoch(
     total_epochs: int,
     phase_name: str,
     log_every_batches: int,
-    class_weights: torch.Tensor | None = None,
     label_smoothing: float = 0.0,
     grad_clip_norm: float = 0.0,
     use_amp: bool = False,
@@ -299,6 +299,7 @@ def run_epoch(
 
     is_train = optimizer is not None
     model.train(is_train)
+    del label_smoothing
     total_loss = 0.0
     total_correct = 0
     total_count = 0
@@ -308,10 +309,6 @@ def run_epoch(
     phase_t0 = perf_counter()
     non_blocking = device_kind == "cuda"
     amp_enabled = bool(use_amp and device_kind == "cuda")
-
-    class_weights_t = None
-    if class_weights is not None:
-        class_weights_t = class_weights.to(device)
 
     batch_count = len(loader)
     for batch_idx, (x, lengths, y) in enumerate(loader, start=1):
@@ -327,13 +324,16 @@ def run_epoch(
         grad_context = nullcontext() if is_train else torch.inference_mode()
         with grad_context:
             with amp_context:
-                logits = model(x, lengths)
-                loss = F.cross_entropy(
-                    logits.reshape(-1, logits.shape[-1]),
-                    y.reshape(-1),
-                    weight=class_weights_t,
-                    label_smoothing=float(max(label_smoothing, 0.0)),
-                )
+                logits, obstacle_logits, _ = model.forward_with_aux(x, lengths)
+                hit_mask = y != 2
+                obstacle_targets = (y == 1).to(dtype=obstacle_logits.dtype)
+                if hit_mask.any():
+                    loss = F.binary_cross_entropy_with_logits(
+                        obstacle_logits[hit_mask],
+                        obstacle_targets[hit_mask],
+                    )
+                else:
+                    loss = obstacle_logits.new_zeros(())
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -720,11 +720,6 @@ def main() -> None:
         min_lr=1e-5,
     )
     log("Scheduler initialized: ReduceLROnPlateau factor=0.5 patience=2 min_lr=1e-05")
-    class_weights = torch.tensor(
-        compute_class_weights(np.asarray(meta["train_class_counts"], dtype=np.float32)),
-        dtype=torch.float32,
-    )
-
     best = {"val_loss": float("inf"), "epoch": -1}
     history: list[dict] = []
     metrics_csv_path = args.output.with_suffix(".metrics.csv")
@@ -798,7 +793,6 @@ def main() -> None:
             args.epochs,
             "train",
             log_every_batches=args.log_every_batches,
-            class_weights=class_weights,
             label_smoothing=args.label_smoothing,
             grad_clip_norm=args.grad_clip_norm,
             use_amp=amp_enabled,
@@ -813,7 +807,6 @@ def main() -> None:
             args.epochs,
             "val",
             log_every_batches=args.log_every_batches,
-            class_weights=class_weights,
             label_smoothing=0.0,
             grad_clip_norm=0.0,
             use_amp=amp_enabled,

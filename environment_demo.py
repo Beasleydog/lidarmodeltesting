@@ -11,7 +11,16 @@ import mujoco
 import numpy as np
 
 from physics_sim import LIDAR_CLASS_NONE, MujocoRoverWorld, SimConfig, WorldConfig
-from train import load_gru_lidar_inferencer
+from simpletrain import PoseAlignedBeamTransformerClassifier
+from train import (
+    DEFAULT_LIDAR_MAX_RANGE_CM,
+    GRULidarInferencer,
+    NormStats,
+    load_checkpoint_for_device,
+    load_gru_lidar_inferencer,
+    load_model_state_with_compat,
+    select_runtime_device,
+)
 
 SHOW_LIDAR = True
 ENABLE_MODEL_INFERENCE = True
@@ -166,11 +175,7 @@ class CheckpointDemoInferencer:
     def __init__(self, config: DemoModelConfig) -> None:
         self.config = config
         self.history_step_gap = int(max(config.history_step_gap, 1))
-        self._inferencer = load_gru_lidar_inferencer(
-            checkpoint_path=config.checkpoint_path,
-            device=config.device,
-            max_history=config.max_history,
-        )
+        self._inferencer = _load_demo_lidar_inferencer(config)
         self._feature_history: list[np.ndarray] = []
         self._sample_counter = 0
         self._last_obstacle_mask: np.ndarray | None = None
@@ -217,6 +222,60 @@ def _selected_model_config() -> DemoModelConfig:
     return DemoModelConfig(
         name='legacy',
         checkpoint_path=LEGACY_MODEL_CHECKPOINT,
+    )
+
+
+def _load_pose_aligned_transformer_inferencer(config: DemoModelConfig) -> GRULidarInferencer:
+    device_t, device_kind = select_runtime_device(config.device)
+    ckpt = load_checkpoint_for_device(config.checkpoint_path, device_t, device_kind)
+    cfg = dict(ckpt["model_config"])
+    model = PoseAlignedBeamTransformerClassifier(
+        input_dim=int(cfg["input_dim"]),
+        num_sensors=int(cfg["num_sensors"]),
+        num_classes=int(cfg["num_classes"]),
+        hidden_dim=int(cfg["hidden_dim"]),
+        dropout=float(cfg["dropout"]),
+        max_range_cm=float(cfg.get("no_hit_range_cm", DEFAULT_LIDAR_MAX_RANGE_CM)),
+        transformer_layers=int(cfg.get("transformer_layers", 4)),
+        attention_heads=int(cfg.get("attention_heads", 4)),
+        ff_mult=int(cfg.get("ff_mult", 4)),
+        decoder_hidden_dim=int(cfg["decoder_hidden_dim"]),
+    ).to(device_t)
+    load_model_state_with_compat(model, ckpt["model_state_dict"])
+    model.eval()
+
+    norm = ckpt["norm"]
+    stats = NormStats(
+        pose_mean=np.asarray(norm["pose_mean"], dtype=np.float32),
+        pose_std=np.asarray(norm["pose_std"], dtype=np.float32),
+        dist_mean=float(norm["dist_mean"]),
+        dist_std=float(norm["dist_std"]),
+    )
+    max_history = config.max_history
+    if max_history is None:
+        max_history = int(ckpt.get("meta", {}).get("max_history", 64))
+    return GRULidarInferencer(
+        model=model,
+        stats=stats,
+        device=device_t,
+        num_sensors=int(cfg["num_sensors"]),
+        input_dim=int(cfg["input_dim"]),
+        max_history=int(max_history),
+        binary_obstacle_only=bool(ckpt.get("meta", {}).get("binary_obstacle_only", False)),
+        no_hit_range_cm=float(ckpt.get("meta", {}).get("no_hit_range_cm", DEFAULT_LIDAR_MAX_RANGE_CM)),
+    )
+
+
+def _load_demo_lidar_inferencer(config: DemoModelConfig) -> GRULidarInferencer:
+    device_t, device_kind = select_runtime_device(config.device)
+    ckpt = load_checkpoint_for_device(config.checkpoint_path, device_t, device_kind)
+    model_type = str(ckpt.get("model_config", {}).get("model_type", "")).strip()
+    if model_type == "pose_aligned_beam_transformer":
+        return _load_pose_aligned_transformer_inferencer(config)
+    return load_gru_lidar_inferencer(
+        checkpoint_path=config.checkpoint_path,
+        device=config.device,
+        max_history=config.max_history,
     )
 
 

@@ -101,7 +101,7 @@ def _sensor_dirs_from_yaw_pitch_deg(yaw_pitch_deg: np.ndarray) -> np.ndarray:
 MODEL_SENSOR_DIRS_LOCAL = _sensor_dirs_from_yaw_pitch_deg(MODEL_SENSOR_YAW_PITCH_DEG)
 LEGACY_FEATURE_MODE = "legacy_normalized"
 EGO_MAP_FEATURE_MODE = "ego_map_raw"
-DEFAULT_LIDAR_MAX_RANGE_CM = 2000.0
+DEFAULT_LIDAR_MAX_RANGE_CM = 1000.0
 POSE_FEATURE_DIM_LEGACY = 4
 POSE_FEATURE_DIM_EGO_MAP = 12
 
