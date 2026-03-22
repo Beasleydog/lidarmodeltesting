@@ -771,14 +771,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=2e-3)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--history-steps", type=int, default=30)
     parser.add_argument("--val-fraction", type=float, default=0.25)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--workers", type=int, default=-1)
-    parser.add_argument("--base-channels", type=int, default=32)
-    parser.add_argument("--dropout", type=float, default=0.10)
+    parser.add_argument("--base-channels", type=int, default=24)
+    parser.add_argument("--dropout", type=float, default=0.15)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--max-range-cm", type=float, default=DEFAULT_LIDAR_MAX_RANGE_CM)
     parser.add_argument("--xy-offset-max-cm", type=float, default=10000.0)
@@ -887,6 +887,11 @@ def main() -> None:
                 base_channels=args.base_channels,
                 dropout=args.dropout,
             ).to(device)
+            param_count = sum(p.numel() for p in model.parameters())
+            log(
+                f"Model summary: type={model.model_type} base_channels={args.base_channels} "
+                f"dropout={args.dropout:.2f} params={param_count}"
+            )
             optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
