@@ -65,6 +65,9 @@ class ExperimentConfig:
     threshold_sweep_start: float
     threshold_sweep_end: float
     threshold_sweep_step: float
+    loss_type: str = "bce"
+    focal_gamma: float = 0.0
+    label_smoothing: float = 0.0
     temporal_layers: int = 1
     transformer_layers: int = 2
     attention_heads: int = 4
@@ -602,6 +605,106 @@ class TemporalBeamGRUClassifier(nn.Module):
         return self.head(fused).squeeze(-1)
 
 
+class TemporalConvTransformerClassifier(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        num_sensors: int,
+        hidden_dim: int = 96,
+        dropout: float = 0.15,
+        transformer_layers: int = 3,
+        attention_heads: int = 4,
+    ):
+        super().__init__()
+        self.model_type = "real_cleanlog_temporal_conv_transformer"
+        self.in_channels = int(in_channels)
+        self.num_sensors = int(num_sensors)
+        self.hidden_dim = int(hidden_dim)
+        self.transformer_layers = int(max(transformer_layers, 1))
+        self.attention_heads = int(max(attention_heads, 1))
+        if self.hidden_dim % self.attention_heads != 0:
+            raise ValueError("hidden_dim must be divisible by attention_heads")
+
+        sensor_geom = MODEL_SENSOR_YAW_PITCH_DEG[: self.num_sensors].astype(np.float32)
+        sensor_geom_rad = np.deg2rad(sensor_geom)
+        sensor_geom_feats = np.concatenate(
+            [
+                np.sin(sensor_geom_rad[:, :1]),
+                np.cos(sensor_geom_rad[:, :1]),
+                np.sin(sensor_geom_rad[:, 1:2]),
+                np.cos(sensor_geom_rad[:, 1:2]),
+            ],
+            axis=1,
+        ).astype(np.float32)
+        self.register_buffer("sensor_geom_feats", torch.from_numpy(sensor_geom_feats), persistent=False)
+        self.register_buffer("sensor_ids", torch.arange(self.num_sensors, dtype=torch.long), persistent=False)
+
+        self.temporal_in = nn.Sequential(
+            nn.Conv1d(self.in_channels, self.hidden_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8 if self.hidden_dim % 8 == 0 else 1, self.hidden_dim),
+            nn.GELU(),
+        )
+        self.temporal_block1 = nn.Sequential(
+            nn.Conv1d(self.hidden_dim, self.hidden_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8 if self.hidden_dim % 8 == 0 else 1, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.temporal_block2 = nn.Sequential(
+            nn.Conv1d(self.hidden_dim, self.hidden_dim, kernel_size=3, padding=2, dilation=2, bias=False),
+            nn.GroupNorm(8 if self.hidden_dim % 8 == 0 else 1, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.current_mlp = nn.Sequential(
+            nn.Linear(self.in_channels, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.sensor_embedding = nn.Embedding(self.num_sensors, self.hidden_dim)
+        self.sensor_geom_mlp = nn.Sequential(
+            nn.Linear(4, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=self.attention_heads,
+            dim_feedforward=self.hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.beam_encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.transformer_layers)
+        self.head = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim * 2),
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, channels, time_steps, sensor_count = x.shape
+        beam_sequences = x.permute(0, 3, 1, 2).reshape(batch_size * sensor_count, channels, time_steps)
+        temporal = self.temporal_in(beam_sequences)
+        temporal = temporal + self.temporal_block1(temporal)
+        temporal = temporal + self.temporal_block2(temporal)
+        temporal_tokens = temporal[:, :, -1].reshape(batch_size, sensor_count, self.hidden_dim)
+
+        current_features = x[:, :, -1, :].permute(0, 2, 1).reshape(batch_size * sensor_count, channels)
+        current_tokens = self.current_mlp(current_features).reshape(batch_size, sensor_count, self.hidden_dim)
+        beam_embed = self.sensor_embedding(self.sensor_ids.to(device=x.device)).unsqueeze(0).expand(batch_size, -1, -1)
+        geom_embed = self.sensor_geom_mlp(self.sensor_geom_feats.to(device=x.device)).unsqueeze(0).expand(batch_size, -1, -1)
+
+        encoded = self.beam_encoder(temporal_tokens + current_tokens + beam_embed + geom_embed)
+        global_context = encoded.mean(dim=1, keepdim=True).expand(-1, sensor_count, -1)
+        return self.head(torch.cat([encoded, global_context], dim=-1)).squeeze(-1)
+
+
 def build_sampler(dataset: RealLidarSequenceDataset) -> WeightedRandomSampler | None:
     sample_has_obstacle = dataset.current_has_obstacle.astype(np.float32)
     pos = float(sample_has_obstacle.sum())
@@ -634,12 +737,43 @@ def compute_pos_weight(sequences: list[RealSequence], max_weight: float) -> tupl
     return pos_weight, sample_positive_fraction, beam_positive_fraction
 
 
+def compute_experiment_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    pos_weight_t: torch.Tensor,
+    exp: ExperimentConfig,
+    training: bool,
+) -> torch.Tensor:
+    smooth = float(exp.label_smoothing) if training else 0.0
+    if smooth > 0.0:
+        clamped = min(max(smooth, 0.0), 0.49)
+        loss_targets = targets * (1.0 - clamped) + (1.0 - targets) * clamped
+    else:
+        loss_targets = targets
+
+    per_entry = F.binary_cross_entropy_with_logits(
+        logits,
+        loss_targets,
+        pos_weight=pos_weight_t,
+        reduction="none",
+    )
+    if exp.loss_type != "focal":
+        return per_entry.mean()
+
+    gamma = max(float(exp.focal_gamma), 0.0)
+    probs = torch.sigmoid(logits)
+    pt = probs * targets + (1.0 - probs) * (1.0 - targets)
+    focal_weight = torch.pow(torch.clamp(1.0 - pt, min=1e-6), gamma)
+    return (per_entry * focal_weight).mean()
+
+
 def evaluate(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
     device_kind: str,
     pos_weight: float,
+    exp: ExperimentConfig,
     decision_threshold: float = 0.5,
 ) -> dict[str, float | list[list[int]]]:
     model.eval()
@@ -655,7 +789,7 @@ def evaluate(
             x = x.to(device)
             y = y.to(device)
             logits = model(x)
-            loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight_t)
+            loss = compute_experiment_loss(logits, y, pos_weight_t, exp, training=False)
 
             total_loss += float(loss.item()) * float(y.shape[0])
             total_samples += int(y.shape[0])
@@ -807,6 +941,7 @@ def train_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
+    exp: ExperimentConfig,
     device: torch.device,
     device_kind: str,
     epoch_idx: int,
@@ -840,7 +975,7 @@ def train_epoch(
         )
         with amp_context:
             logits = model(x)
-            loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight_t)
+            loss = compute_experiment_loss(logits, y, pos_weight_t, exp, training=True)
 
         optimizer.zero_grad(set_to_none=True)
         if scaler.is_enabled():
@@ -1144,6 +1279,137 @@ def build_experiment_suite() -> list[ExperimentConfig]:
             attention_heads=8,
         ),
         ExperimentConfig(
+            name="conv_unet_large_balanced",
+            model_type="conv_unet",
+            hidden_dim=64,
+            dropout=0.10,
+            lr=1.2e-3,
+            weight_decay=1e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.75,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+        ),
+        ExperimentConfig(
+            name="conv_unet_large_strict",
+            model_type="conv_unet",
+            hidden_dim=64,
+            dropout=0.14,
+            lr=1.2e-3,
+            weight_decay=2.5e-4,
+            pos_weight_scale=0.70,
+            threshold_min_recall=0.38,
+            threshold_sweep_start=0.82,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+        ),
+        ExperimentConfig(
+            name="beam_gru_large",
+            model_type="beam_gru",
+            hidden_dim=128,
+            dropout=0.18,
+            lr=8e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=0.85,
+            threshold_min_recall=0.45,
+            threshold_sweep_start=0.75,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+        ),
+        ExperimentConfig(
+            name="conv_transformer_mid",
+            model_type="conv_transformer",
+            hidden_dim=96,
+            dropout=0.15,
+            lr=1e-3,
+            weight_decay=1e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.70,
+            threshold_sweep_end=0.98,
+            threshold_sweep_step=0.02,
+            transformer_layers=3,
+            attention_heads=4,
+        ),
+        ExperimentConfig(
+            name="conv_transformer_strict",
+            model_type="conv_transformer",
+            hidden_dim=96,
+            dropout=0.18,
+            lr=1e-3,
+            weight_decay=2e-4,
+            pos_weight_scale=0.80,
+            threshold_min_recall=0.45,
+            threshold_sweep_start=0.80,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            transformer_layers=3,
+            attention_heads=4,
+        ),
+        ExperimentConfig(
+            name="conv_transformer_large",
+            model_type="conv_transformer",
+            hidden_dim=128,
+            dropout=0.18,
+            lr=8e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=0.85,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.80,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            transformer_layers=4,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="conv_transformer_large_strict",
+            model_type="conv_transformer",
+            hidden_dim=128,
+            dropout=0.20,
+            lr=8e-4,
+            weight_decay=3e-4,
+            pos_weight_scale=0.70,
+            threshold_min_recall=0.40,
+            threshold_sweep_start=0.85,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            transformer_layers=4,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_xl_balanced",
+            model_type="beam_transformer",
+            hidden_dim=160,
+            dropout=0.18,
+            lr=7e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.80,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            temporal_layers=2,
+            transformer_layers=4,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_xxl_strict",
+            model_type="beam_transformer",
+            hidden_dim=192,
+            dropout=0.22,
+            lr=6e-4,
+            weight_decay=4e-4,
+            pos_weight_scale=0.65,
+            threshold_min_recall=0.35,
+            threshold_sweep_start=0.88,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            temporal_layers=2,
+            transformer_layers=5,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
             name="beam_transformer_large_strict",
             model_type="beam_transformer",
             hidden_dim=128,
@@ -1158,6 +1424,445 @@ def build_experiment_suite() -> list[ExperimentConfig]:
             temporal_layers=2,
             transformer_layers=4,
             attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="conv_unet_focal_balanced",
+            model_type="conv_unet",
+            hidden_dim=32,
+            dropout=0.10,
+            lr=1.5e-3,
+            weight_decay=1.5e-4,
+            pos_weight_scale=0.90,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.70,
+            threshold_sweep_end=0.98,
+            threshold_sweep_step=0.02,
+            loss_type="focal",
+            focal_gamma=1.5,
+        ),
+        ExperimentConfig(
+            name="conv_unet_focal_strict",
+            model_type="conv_unet",
+            hidden_dim=48,
+            dropout=0.12,
+            lr=1.2e-3,
+            weight_decay=2e-4,
+            pos_weight_scale=0.75,
+            threshold_min_recall=0.42,
+            threshold_sweep_start=0.82,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            loss_type="focal",
+            focal_gamma=2.0,
+        ),
+        ExperimentConfig(
+            name="conv_unet_smooth_balanced",
+            model_type="conv_unet",
+            hidden_dim=48,
+            dropout=0.10,
+            lr=1.5e-3,
+            weight_decay=1e-4,
+            pos_weight_scale=0.95,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.72,
+            threshold_sweep_end=0.98,
+            threshold_sweep_step=0.02,
+            label_smoothing=0.03,
+        ),
+        ExperimentConfig(
+            name="conv_unet_large_focal",
+            model_type="conv_unet",
+            hidden_dim=64,
+            dropout=0.14,
+            lr=1.0e-3,
+            weight_decay=2.5e-4,
+            pos_weight_scale=0.70,
+            threshold_min_recall=0.40,
+            threshold_sweep_start=0.84,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            loss_type="focal",
+            focal_gamma=2.0,
+        ),
+        ExperimentConfig(
+            name="beam_gru_focal_mid",
+            model_type="beam_gru",
+            hidden_dim=96,
+            dropout=0.18,
+            lr=9e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=0.85,
+            threshold_min_recall=0.45,
+            threshold_sweep_start=0.75,
+            threshold_sweep_end=0.99,
+            threshold_sweep_step=0.01,
+            loss_type="focal",
+            focal_gamma=1.5,
+        ),
+        ExperimentConfig(
+            name="beam_gru_large_strict",
+            model_type="beam_gru",
+            hidden_dim=160,
+            dropout=0.22,
+            lr=7e-4,
+            weight_decay=3e-4,
+            pos_weight_scale=0.70,
+            threshold_min_recall=0.38,
+            threshold_sweep_start=0.84,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            loss_type="focal",
+            focal_gamma=2.0,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_focal_mid",
+            model_type="beam_transformer",
+            hidden_dim=96,
+            dropout=0.16,
+            lr=9e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=0.90,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.78,
+            threshold_sweep_end=0.99,
+            threshold_sweep_step=0.01,
+            loss_type="focal",
+            focal_gamma=1.5,
+            temporal_layers=2,
+            transformer_layers=3,
+            attention_heads=4,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_focal_strict",
+            model_type="beam_transformer",
+            hidden_dim=128,
+            dropout=0.20,
+            lr=8e-4,
+            weight_decay=2.5e-4,
+            pos_weight_scale=0.75,
+            threshold_min_recall=0.42,
+            threshold_sweep_start=0.86,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            loss_type="focal",
+            focal_gamma=2.0,
+            temporal_layers=2,
+            transformer_layers=4,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_smooth_balanced",
+            model_type="beam_transformer",
+            hidden_dim=128,
+            dropout=0.16,
+            lr=8e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=0.95,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.80,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            label_smoothing=0.03,
+            temporal_layers=2,
+            transformer_layers=4,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_deep_balanced",
+            model_type="beam_transformer",
+            hidden_dim=160,
+            dropout=0.18,
+            lr=7e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=0.95,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.82,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            temporal_layers=3,
+            transformer_layers=5,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_deep_strict",
+            model_type="beam_transformer",
+            hidden_dim=192,
+            dropout=0.22,
+            lr=6e-4,
+            weight_decay=4e-4,
+            pos_weight_scale=0.65,
+            threshold_min_recall=0.35,
+            threshold_sweep_start=0.90,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.005,
+            loss_type="focal",
+            focal_gamma=2.0,
+            temporal_layers=3,
+            transformer_layers=5,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_large_ultratight",
+            model_type="beam_transformer",
+            hidden_dim=128,
+            dropout=0.18,
+            lr=7.5e-4,
+            weight_decay=2.5e-4,
+            pos_weight_scale=0.78,
+            threshold_min_recall=0.45,
+            threshold_sweep_start=0.94,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.005,
+            temporal_layers=2,
+            transformer_layers=4,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_large_smooth_tight",
+            model_type="beam_transformer",
+            hidden_dim=128,
+            dropout=0.16,
+            lr=7.5e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=0.90,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.92,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.005,
+            label_smoothing=0.02,
+            temporal_layers=2,
+            transformer_layers=4,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_large_focal_tight",
+            model_type="beam_transformer",
+            hidden_dim=128,
+            dropout=0.18,
+            lr=7e-4,
+            weight_decay=2.5e-4,
+            pos_weight_scale=0.78,
+            threshold_min_recall=0.45,
+            threshold_sweep_start=0.94,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.005,
+            loss_type="focal",
+            focal_gamma=1.5,
+            temporal_layers=2,
+            transformer_layers=4,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_xl_balanced_tight",
+            model_type="beam_transformer",
+            hidden_dim=160,
+            dropout=0.18,
+            lr=6.5e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=0.90,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.94,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.005,
+            temporal_layers=2,
+            transformer_layers=4,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_xl_smooth_tight",
+            model_type="beam_transformer",
+            hidden_dim=160,
+            dropout=0.18,
+            lr=6.5e-4,
+            weight_decay=2.5e-4,
+            pos_weight_scale=0.82,
+            threshold_min_recall=0.45,
+            threshold_sweep_start=0.95,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.005,
+            label_smoothing=0.02,
+            temporal_layers=2,
+            transformer_layers=4,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_xl_focal_tight",
+            model_type="beam_transformer",
+            hidden_dim=160,
+            dropout=0.20,
+            lr=6.5e-4,
+            weight_decay=3e-4,
+            pos_weight_scale=0.70,
+            threshold_min_recall=0.42,
+            threshold_sweep_start=0.95,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.005,
+            loss_type="focal",
+            focal_gamma=1.5,
+            temporal_layers=2,
+            transformer_layers=4,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_deep_balanced_tight",
+            model_type="beam_transformer",
+            hidden_dim=160,
+            dropout=0.20,
+            lr=6e-4,
+            weight_decay=3e-4,
+            pos_weight_scale=0.85,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.95,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.005,
+            temporal_layers=3,
+            transformer_layers=5,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_deep_focal_tight",
+            model_type="beam_transformer",
+            hidden_dim=192,
+            dropout=0.22,
+            lr=5.5e-4,
+            weight_decay=4e-4,
+            pos_weight_scale=0.65,
+            threshold_min_recall=0.40,
+            threshold_sweep_start=0.96,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.005,
+            loss_type="focal",
+            focal_gamma=1.5,
+            temporal_layers=3,
+            transformer_layers=5,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="conv_transformer_focal_mid",
+            model_type="conv_transformer",
+            hidden_dim=96,
+            dropout=0.16,
+            lr=9e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=0.90,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.78,
+            threshold_sweep_end=0.99,
+            threshold_sweep_step=0.01,
+            loss_type="focal",
+            focal_gamma=1.5,
+            transformer_layers=3,
+            attention_heads=4,
+        ),
+        ExperimentConfig(
+            name="conv_transformer_focal_strict",
+            model_type="conv_transformer",
+            hidden_dim=128,
+            dropout=0.20,
+            lr=8e-4,
+            weight_decay=2.5e-4,
+            pos_weight_scale=0.75,
+            threshold_min_recall=0.42,
+            threshold_sweep_start=0.86,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            loss_type="focal",
+            focal_gamma=2.0,
+            transformer_layers=4,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="conv_transformer_smooth_balanced",
+            model_type="conv_transformer",
+            hidden_dim=128,
+            dropout=0.16,
+            lr=8e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=0.95,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.80,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            label_smoothing=0.03,
+            transformer_layers=4,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="conv_transformer_xl_balanced",
+            model_type="conv_transformer",
+            hidden_dim=160,
+            dropout=0.18,
+            lr=7e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=0.95,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.82,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            transformer_layers=5,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="conv_transformer_xl_strict",
+            model_type="conv_transformer",
+            hidden_dim=192,
+            dropout=0.22,
+            lr=6e-4,
+            weight_decay=4e-4,
+            pos_weight_scale=0.65,
+            threshold_min_recall=0.35,
+            threshold_sweep_start=0.90,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.005,
+            loss_type="focal",
+            focal_gamma=2.0,
+            transformer_layers=5,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="conv_transformer_xl_smooth",
+            model_type="conv_transformer",
+            hidden_dim=160,
+            dropout=0.18,
+            lr=7e-4,
+            weight_decay=3e-4,
+            pos_weight_scale=0.85,
+            threshold_min_recall=0.45,
+            threshold_sweep_start=0.84,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            label_smoothing=0.04,
+            transformer_layers=5,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="conv_unet_xl_strict",
+            model_type="conv_unet",
+            hidden_dim=80,
+            dropout=0.16,
+            lr=1.0e-3,
+            weight_decay=3e-4,
+            pos_weight_scale=0.65,
+            threshold_min_recall=0.35,
+            threshold_sweep_start=0.88,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            loss_type="focal",
+            focal_gamma=2.0,
+        ),
+        ExperimentConfig(
+            name="conv_unet_xl_smooth",
+            model_type="conv_unet",
+            hidden_dim=80,
+            dropout=0.14,
+            lr=1.0e-3,
+            weight_decay=2.5e-4,
+            pos_weight_scale=0.85,
+            threshold_min_recall=0.45,
+            threshold_sweep_start=0.82,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            label_smoothing=0.04,
         ),
     ]
 
@@ -1204,8 +1909,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every-batches", type=int, default=20)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--balance-positive-windows", action="store_true")
-    parser.add_argument("--suite-epochs", type=int, default=14)
-    parser.add_argument("--suite-early-stop-patience", type=int, default=5)
+    parser.add_argument("--suite-epochs", type=int, default=20)
+    parser.add_argument("--suite-early-stop-patience", type=int, default=7)
     return parser.parse_args()
 
 
@@ -1235,6 +1940,15 @@ def _build_model_for_experiment(
             hidden_dim=exp.hidden_dim,
             dropout=exp.dropout,
             temporal_layers=exp.temporal_layers,
+            transformer_layers=exp.transformer_layers,
+            attention_heads=exp.attention_heads,
+        )
+    if exp.model_type == "conv_transformer":
+        return TemporalConvTransformerClassifier(
+            in_channels=input_channels,
+            num_sensors=num_sensors,
+            hidden_dim=exp.hidden_dim,
+            dropout=exp.dropout,
             transformer_layers=exp.transformer_layers,
             attention_heads=exp.attention_heads,
         )
@@ -1309,6 +2023,7 @@ def run_experiment(
                 model=model,
                 loader=train_loader,
                 optimizer=optimizer,
+                exp=exp,
                 device=device,
                 device_kind=device_kind,
                 epoch_idx=epoch,
@@ -1324,6 +2039,7 @@ def run_experiment(
                 device=device,
                 device_kind=device_kind,
                 pos_weight=scaled_pos_weight,
+                exp=exp,
                 decision_threshold=float(exp.threshold_sweep_start),
             )
             sweep_metrics = sweep_validation_thresholds(
@@ -1394,6 +2110,9 @@ def run_experiment(
                         "model_type": model.model_type,
                         "hidden_dim": exp.hidden_dim,
                         "dropout": exp.dropout,
+                        "loss_type": exp.loss_type,
+                        "focal_gamma": exp.focal_gamma,
+                        "label_smoothing": exp.label_smoothing,
                         "num_sensors": meta.num_sensors,
                         "history_steps": meta.history_steps,
                     },
@@ -1438,6 +2157,9 @@ def run_experiment(
         "lr": exp.lr,
         "weight_decay": exp.weight_decay,
         "pos_weight_scale": exp.pos_weight_scale,
+        "loss_type": exp.loss_type,
+        "focal_gamma": exp.focal_gamma,
+        "label_smoothing": exp.label_smoothing,
         "threshold_min_recall": exp.threshold_min_recall,
         "threshold_range": [exp.threshold_sweep_start, exp.threshold_sweep_end, exp.threshold_sweep_step],
         "best_epoch": int(best["epoch"]),
@@ -1492,6 +2214,12 @@ def main() -> None:
                 f"z_offset=[{-args.z_offset_max_cm:.1f},{args.z_offset_max_cm:.1f}]cm"
             )
             log("Running experiment suite with compact output; per-batch logs are suppressed.")
+            experiments = build_experiment_suite()
+            log(
+                "Suite config: "
+                f"experiments={len(experiments)} suite_epochs={args.suite_epochs} "
+                f"early_stop_patience={args.suite_early_stop_patience}"
+            )
 
             with split_path.open("w", encoding="utf-8") as fh:
                 json.dump(
@@ -1514,23 +2242,56 @@ def main() -> None:
                 )
             log(f"Wrote split manifest: {split_path}")
             suite_results: list[dict[str, object]] = []
-            for exp in build_experiment_suite():
+            failed_results: list[dict[str, object]] = []
+            for exp in experiments:
                 log(
                     f"Experiment start: {exp.name} model={exp.model_type} hidden={exp.hidden_dim} "
                     f"dropout={exp.dropout:.2f} lr={exp.lr:.5f} pos_weight_scale={exp.pos_weight_scale:.2f} "
+                    f"loss={exp.loss_type} gamma={exp.focal_gamma:.2f} smooth={exp.label_smoothing:.3f} "
                     f"recall_floor={exp.threshold_min_recall:.2f}"
                 )
-                result = run_experiment(
-                    exp=exp,
-                    args=args,
-                    device=device,
-                    device_kind=device_kind,
-                    train_loader=train_loader,
-                    val_loader=val_loader,
-                    meta=meta,
-                    sensor_names=sensor_names,
-                    input_channels=input_channels,
-                )
+                try:
+                    result = run_experiment(
+                        exp=exp,
+                        args=args,
+                        device=device,
+                        device_kind=device_kind,
+                        train_loader=train_loader,
+                        val_loader=val_loader,
+                        meta=meta,
+                        sensor_names=sensor_names,
+                        input_channels=input_channels,
+                    )
+                except Exception as exc:
+                    error_result = {
+                        "name": exp.name,
+                        "model_type": exp.model_type,
+                        "hidden_dim": exp.hidden_dim,
+                        "dropout": exp.dropout,
+                        "lr": exp.lr,
+                        "weight_decay": exp.weight_decay,
+                        "pos_weight_scale": exp.pos_weight_scale,
+                        "loss_type": exp.loss_type,
+                        "focal_gamma": exp.focal_gamma,
+                        "label_smoothing": exp.label_smoothing,
+                        "threshold_min_recall": exp.threshold_min_recall,
+                        "threshold_range": [
+                            exp.threshold_sweep_start,
+                            exp.threshold_sweep_end,
+                            exp.threshold_sweep_step,
+                        ],
+                        "status": "error",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                    failed_results.append(error_result)
+                    log(
+                        f"Experiment failed: {exp.name} "
+                        f"type={type(exc).__name__} message={str(exc)}"
+                    )
+                    continue
+
+                result["status"] = "ok"
                 suite_results.append(result)
                 best_metrics = result["best_metrics"]
                 log(
@@ -1544,7 +2305,33 @@ def main() -> None:
 
             suite_json_path = args.output.parent / f"{args.output.stem}.suite_results.json"
             with suite_json_path.open("w", encoding="utf-8") as fh:
-                json.dump(suite_results, fh, indent=2)
+                json.dump({"successful": suite_results, "failed": failed_results}, fh, indent=2)
+
+            if not suite_results:
+                log_plain(f"saved split manifest: {split_path}")
+                log_plain(f"saved suite results: {suite_json_path}")
+                log_plain(f"saved log: {log_path}")
+                log_plain("FINAL_SUITE_SUMMARY_BEGIN")
+                log_plain(
+                    "suite "
+                    f"experiments={len(experiments)} completed=0 failed={len(failed_results)} "
+                    f"suite_epochs={args.suite_epochs} early_stop_patience={args.suite_early_stop_patience}"
+                )
+                log_plain(
+                    "data "
+                    f"train_files={len(meta.train_files)} val_files={len(meta.val_files)} "
+                    f"train_windows={meta.train_windows} val_windows={meta.val_windows} "
+                    f"beam_positive_fraction={meta.beam_positive_fraction:.4f} "
+                    f"window_positive_fraction={meta.sample_positive_fraction:.4f}"
+                )
+                for failed in failed_results:
+                    log_plain(
+                        f"failed name={failed['name']} model={failed['model_type']} "
+                        f"error_type={failed['error_type']} error={failed['error']}"
+                    )
+                log_plain(f"artifacts suite={suite_json_path} split={split_path} log={log_path}")
+                log_plain("FINAL_SUITE_SUMMARY_END")
+                return
 
             sorted_by_precision = sorted(
                 suite_results,
@@ -1570,6 +2357,11 @@ def main() -> None:
             log_plain(f"saved log: {log_path}")
             log_plain("FINAL_SUITE_SUMMARY_BEGIN")
             log_plain(
+                "suite "
+                f"experiments={len(experiments)} completed={len(suite_results)} failed={len(failed_results)} "
+                f"suite_epochs={args.suite_epochs} early_stop_patience={args.suite_early_stop_patience}"
+            )
+            log_plain(
                 "data "
                 f"train_files={len(meta.train_files)} val_files={len(meta.val_files)} "
                 f"train_windows={meta.train_windows} val_windows={meta.val_windows} "
@@ -1583,7 +2375,9 @@ def main() -> None:
                 f"f1={float(best_precision['best_val_f1']):.4f} "
                 f"recall={float(best_precision['best_metrics']['recall']):.4f} "
                 f"fpr={float(best_precision['best_metrics']['false_positive_rate']):.4f} "
-                f"threshold={float(best_precision['best_metrics']['threshold']):.2f}"
+                f"threshold={float(best_precision['best_metrics']['threshold']):.2f} "
+                f"loss={best_precision['loss_type']} gamma={best_precision['focal_gamma']:.2f} "
+                f"smooth={best_precision['label_smoothing']:.3f}"
             )
             log_plain(
                 "best_f1 "
@@ -1592,7 +2386,9 @@ def main() -> None:
                 f"f1={float(best_f1['best_val_f1']):.4f} "
                 f"recall={float(best_f1['best_metrics']['recall']):.4f} "
                 f"fpr={float(best_f1['best_metrics']['false_positive_rate']):.4f} "
-                f"threshold={float(best_f1['best_metrics']['threshold']):.2f}"
+                f"threshold={float(best_f1['best_metrics']['threshold']):.2f} "
+                f"loss={best_f1['loss_type']} gamma={best_f1['focal_gamma']:.2f} "
+                f"smooth={best_f1['label_smoothing']:.3f}"
             )
             for rank, result in enumerate(sorted_by_precision, start=1):
                 metrics = result["best_metrics"]
@@ -1607,7 +2403,13 @@ def main() -> None:
                     f"thr={float(metrics['threshold']):.2f} "
                     f"cfg=modeltype:{result['model_type']},hidden:{result['hidden_dim']},dropout:{result['dropout']},"
                     f"lr:{result['lr']},wd:{result['weight_decay']},pws:{result['pos_weight_scale']},"
+                    f"loss:{result['loss_type']},gamma:{result['focal_gamma']},smooth:{result['label_smoothing']},"
                     f"recall_floor:{result['threshold_min_recall']}"
+                )
+            for failed in failed_results:
+                log_plain(
+                    f"failed name={failed['name']} model={failed['model_type']} "
+                    f"error_type={failed['error_type']} error={failed['error']}"
                 )
             log_plain(f"artifacts suite={suite_json_path} split={split_path} log={log_path}")
             log_plain("FINAL_SUITE_SUMMARY_END")
