@@ -1,0 +1,833 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+from contextlib import nullcontext
+from dataclasses import dataclass
+from pathlib import Path
+from time import perf_counter
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+
+from train import (
+    DEFAULT_LIDAR_MAX_RANGE_CM,
+    MODEL_SENSOR_YAW_PITCH_DEG,
+    configure_runtime_for_device,
+    log,
+    log_plain,
+    optimizer_step_for_device,
+    resolve_data_loader_workers,
+    save_checkpoint_for_device,
+    select_runtime_device,
+    set_log_file,
+)
+
+
+@dataclass(frozen=True)
+class RealSequence:
+    name: str
+    pose_xyz_cm: np.ndarray
+    heading_pitch_roll_deg: np.ndarray
+    lidar_cm: np.ndarray
+    obstacle_labels: np.ndarray
+    sensor_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DatasetMeta:
+    train_files: list[str]
+    val_files: list[str]
+    train_windows: int
+    val_windows: int
+    num_sensors: int
+    history_steps: int
+    current_plus_history: int
+    pos_weight: float
+    sample_positive_fraction: float
+    beam_positive_fraction: float
+
+
+def _jsonable_args(args: argparse.Namespace) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for key, value in vars(args).items():
+        out[key] = str(value) if isinstance(value, Path) else value
+    return out
+
+
+def _sensor_columns(fieldnames: list[str]) -> list[str]:
+    cols = [name for name in fieldnames if name.startswith("lidar_") and name.endswith("_cm")]
+    if not cols:
+        raise ValueError("No lidar *_cm columns found in raw cleanlog CSV")
+    return cols
+
+
+def _label_columns(fieldnames: list[str], sensor_columns: list[str]) -> list[str]:
+    label_cols = []
+    for sensor_col in sensor_columns:
+        label_col = f"{sensor_col}_is_obstacle"
+        if label_col not in fieldnames:
+            raise ValueError(f"Missing label column {label_col!r}")
+        label_cols.append(label_col)
+    return label_cols
+
+
+def _read_cleanlog_pair(raw_path: Path, label_path: Path) -> RealSequence:
+    with raw_path.open("r", encoding="utf-8", newline="") as raw_fh:
+        raw_reader = csv.DictReader(raw_fh)
+        raw_fieldnames = list(raw_reader.fieldnames or [])
+        sensor_columns = _sensor_columns(raw_fieldnames)
+        raw_rows = list(raw_reader)
+
+    with label_path.open("r", encoding="utf-8", newline="") as label_fh:
+        label_reader = csv.DictReader(label_fh)
+        label_fieldnames = list(label_reader.fieldnames or [])
+        _label_columns(label_fieldnames, sensor_columns)
+        label_rows = list(label_reader)
+
+    if len(raw_rows) != len(label_rows):
+        raise ValueError(
+            f"Row count mismatch for {raw_path.name}: raw={len(raw_rows)} label={len(label_rows)}"
+        )
+    if len(raw_rows) == 0:
+        raise ValueError(f"{raw_path.name} contains zero rows")
+
+    num_steps = len(raw_rows)
+    num_sensors = len(sensor_columns)
+    pose_xyz = np.zeros((num_steps, 3), dtype=np.float32)
+    angles = np.zeros((num_steps, 3), dtype=np.float32)
+    lidar_cm = np.zeros((num_steps, num_sensors), dtype=np.float32)
+    labels = np.zeros((num_steps, num_sensors), dtype=np.float32)
+
+    for idx, (raw_row, label_row) in enumerate(zip(raw_rows, label_rows, strict=True)):
+        for key in ("iso_time_utc", "step_idx"):
+            raw_value = raw_row.get(key, "")
+            label_value = label_row.get(key, "")
+            if raw_value != label_value:
+                raise ValueError(
+                    f"Alignment mismatch for {raw_path.name} row {idx}: "
+                    f"{key} raw={raw_value!r} label={label_value!r}"
+                )
+
+        pose_xyz[idx, 0] = float(raw_row["rover_pos_x"])
+        pose_xyz[idx, 1] = float(raw_row["rover_pos_y"])
+        pose_xyz[idx, 2] = float(raw_row["rover_pos_z"])
+        angles[idx, 0] = float(raw_row["heading"])
+        angles[idx, 1] = float(raw_row["pitch"])
+        angles[idx, 2] = float(raw_row["roll"])
+
+        for sensor_idx, sensor_col in enumerate(sensor_columns):
+            lidar_cm[idx, sensor_idx] = float(raw_row[sensor_col])
+            labels[idx, sensor_idx] = float(label_row[f"{sensor_col}_is_obstacle"])
+
+    return RealSequence(
+        name=raw_path.name,
+        pose_xyz_cm=pose_xyz,
+        heading_pitch_roll_deg=angles,
+        lidar_cm=lidar_cm,
+        obstacle_labels=labels,
+        sensor_names=tuple(sensor_columns),
+    )
+
+
+def load_real_sequences(cleanlog_dir: Path) -> list[RealSequence]:
+    label_dir = cleanlog_dir / "labeled_obstacles_liveexport"
+    if not cleanlog_dir.exists():
+        raise FileNotFoundError(f"Missing cleanlog directory: {cleanlog_dir}")
+    if not label_dir.exists():
+        raise FileNotFoundError(f"Missing label directory: {label_dir}")
+
+    raw_files = sorted(path for path in cleanlog_dir.glob("*.csv") if (label_dir / path.name).exists())
+    if not raw_files:
+        raise FileNotFoundError(f"No paired raw/label CSVs found in {cleanlog_dir}")
+
+    sequences = [_read_cleanlog_pair(raw_path, label_dir / raw_path.name) for raw_path in raw_files]
+    sensor_names = sequences[0].sensor_names
+    for seq in sequences[1:]:
+        if seq.sensor_names != sensor_names:
+            raise ValueError(f"Sensor schema mismatch in {seq.name}")
+    return sequences
+
+
+def split_sequences(
+    sequences: list[RealSequence],
+    val_fraction: float,
+    seed: int,
+) -> tuple[list[RealSequence], list[RealSequence]]:
+    if len(sequences) < 2:
+        raise ValueError("Need at least two paired cleanlog files to create a validation split")
+    rng = np.random.default_rng(int(seed))
+    order = np.arange(len(sequences))
+    rng.shuffle(order)
+
+    val_count = int(round(len(sequences) * float(val_fraction)))
+    val_count = max(1, min(len(sequences) - 1, val_count))
+    val_ids = set(int(i) for i in order[:val_count])
+    train = [seq for idx, seq in enumerate(sequences) if idx not in val_ids]
+    val = [seq for idx, seq in enumerate(sequences) if idx in val_ids]
+    return train, val
+
+
+class RealLidarSequenceDataset(Dataset):
+    def __init__(
+        self,
+        sequences: list[RealSequence],
+        history_steps: int,
+        max_range_cm: float,
+        augment: bool = False,
+        xy_offset_max_cm: float = 10000.0,
+        z_offset_max_cm: float = 10.0,
+        absolute_xy_scale_cm: float = 20000.0,
+        absolute_z_scale_cm: float = 5000.0,
+        relative_xy_scale_cm: float = 5000.0,
+        relative_z_scale_cm: float = 500.0,
+    ):
+        self.sequences = list(sequences)
+        self.history_steps = int(history_steps)
+        self.window_size = self.history_steps + 1
+        self.max_range_cm = float(max(max_range_cm, 1.0))
+        self.augment = bool(augment)
+        self.xy_offset_max_cm = float(max(xy_offset_max_cm, 0.0))
+        self.z_offset_max_cm = float(max(z_offset_max_cm, 0.0))
+        self.absolute_xy_scale_cm = float(max(absolute_xy_scale_cm, 1.0))
+        self.absolute_z_scale_cm = float(max(absolute_z_scale_cm, 1.0))
+        self.relative_xy_scale_cm = float(max(relative_xy_scale_cm, 1.0))
+        self.relative_z_scale_cm = float(max(relative_z_scale_cm, 1.0))
+        self.rng = np.random.default_rng()
+
+        self.index: list[tuple[int, int]] = []
+        for seq_idx, seq in enumerate(self.sequences):
+            if seq.lidar_cm.shape[0] < self.window_size:
+                continue
+            for end_idx in range(self.history_steps, seq.lidar_cm.shape[0]):
+                self.index.append((seq_idx, end_idx))
+
+        if not self.index:
+            raise ValueError(
+                f"No valid windows: history_steps={self.history_steps} exceeds all cleanlog sequence lengths"
+            )
+
+        self.num_sensors = int(self.sequences[0].lidar_cm.shape[1])
+        sensor_yaw = np.deg2rad(MODEL_SENSOR_YAW_PITCH_DEG[: self.num_sensors, 0].astype(np.float32))
+        sensor_pitch = np.deg2rad(MODEL_SENSOR_YAW_PITCH_DEG[: self.num_sensors, 1].astype(np.float32))
+        sensor_idx = np.linspace(0.0, 1.0, self.num_sensors, dtype=np.float32)
+        self.sensor_features = {
+            "yaw_sin": np.sin(sensor_yaw).astype(np.float32),
+            "yaw_cos": np.cos(sensor_yaw).astype(np.float32),
+            "pitch_sin": np.sin(sensor_pitch).astype(np.float32),
+            "pitch_cos": np.cos(sensor_pitch).astype(np.float32),
+            "index": sensor_idx.astype(np.float32),
+        }
+        self.current_has_obstacle = np.asarray(
+            [self.sequences[seq_idx].obstacle_labels[end_idx].max() > 0.5 for seq_idx, end_idx in self.index],
+            dtype=np.bool_,
+        )
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    @property
+    def input_channels(self) -> int:
+        return 20
+
+    def _sample_translation_offsets(self) -> np.ndarray:
+        if not self.augment:
+            return np.zeros((3,), dtype=np.float32)
+        return np.asarray(
+            [
+                self.rng.uniform(-self.xy_offset_max_cm, self.xy_offset_max_cm),
+                self.rng.uniform(-self.xy_offset_max_cm, self.xy_offset_max_cm),
+                self.rng.uniform(-self.z_offset_max_cm, self.z_offset_max_cm),
+            ],
+            dtype=np.float32,
+        )
+
+    def __getitem__(self, item: int) -> tuple[torch.Tensor, torch.Tensor]:
+        seq_idx, end_idx = self.index[item]
+        seq = self.sequences[seq_idx]
+        start_idx = end_idx - self.history_steps
+
+        pose_xyz = seq.pose_xyz_cm[start_idx : end_idx + 1].copy()
+        pose_xyz += self._sample_translation_offsets().reshape(1, 3)
+        rel_xyz = pose_xyz - pose_xyz[-1:].copy()
+        angles_deg = seq.heading_pitch_roll_deg[start_idx : end_idx + 1]
+        lidar = seq.lidar_cm[start_idx : end_idx + 1]
+        target = seq.obstacle_labels[end_idx]
+
+        hit = (lidar >= 0.0).astype(np.float32)
+        clipped = np.where(hit > 0.0, np.clip(lidar, 0.0, self.max_range_cm), self.max_range_cm).astype(np.float32)
+        range_norm = (clipped / self.max_range_cm).astype(np.float32)
+
+        headings = np.deg2rad(angles_deg[:, 0].astype(np.float32))
+        pitches = np.deg2rad(angles_deg[:, 1].astype(np.float32))
+        rolls = np.deg2rad(angles_deg[:, 2].astype(np.float32))
+        time_age = np.linspace(-1.0, 0.0, self.window_size, dtype=np.float32)
+
+        abs_x = np.broadcast_to((pose_xyz[:, 0] / self.absolute_xy_scale_cm)[:, None], (self.window_size, self.num_sensors))
+        abs_y = np.broadcast_to((pose_xyz[:, 1] / self.absolute_xy_scale_cm)[:, None], (self.window_size, self.num_sensors))
+        abs_z = np.broadcast_to((pose_xyz[:, 2] / self.absolute_z_scale_cm)[:, None], (self.window_size, self.num_sensors))
+        rel_x = np.broadcast_to((rel_xyz[:, 0] / self.relative_xy_scale_cm)[:, None], (self.window_size, self.num_sensors))
+        rel_y = np.broadcast_to((rel_xyz[:, 1] / self.relative_xy_scale_cm)[:, None], (self.window_size, self.num_sensors))
+        rel_z = np.broadcast_to((rel_xyz[:, 2] / self.relative_z_scale_cm)[:, None], (self.window_size, self.num_sensors))
+        heading_sin = np.broadcast_to(np.sin(headings)[:, None], (self.window_size, self.num_sensors))
+        heading_cos = np.broadcast_to(np.cos(headings)[:, None], (self.window_size, self.num_sensors))
+        pitch_sin = np.broadcast_to(np.sin(pitches)[:, None], (self.window_size, self.num_sensors))
+        pitch_cos = np.broadcast_to(np.cos(pitches)[:, None], (self.window_size, self.num_sensors))
+        roll_sin = np.broadcast_to(np.sin(rolls)[:, None], (self.window_size, self.num_sensors))
+        roll_cos = np.broadcast_to(np.cos(rolls)[:, None], (self.window_size, self.num_sensors))
+        sensor_yaw_sin = np.broadcast_to(self.sensor_features["yaw_sin"][None, :], (self.window_size, self.num_sensors))
+        sensor_yaw_cos = np.broadcast_to(self.sensor_features["yaw_cos"][None, :], (self.window_size, self.num_sensors))
+        sensor_pitch_sin = np.broadcast_to(self.sensor_features["pitch_sin"][None, :], (self.window_size, self.num_sensors))
+        sensor_pitch_cos = np.broadcast_to(self.sensor_features["pitch_cos"][None, :], (self.window_size, self.num_sensors))
+        sensor_idx = np.broadcast_to(self.sensor_features["index"][None, :], (self.window_size, self.num_sensors))
+        time_map = np.broadcast_to(time_age[:, None], (self.window_size, self.num_sensors))
+
+        features = np.stack(
+            [
+                range_norm,
+                hit,
+                abs_x,
+                abs_y,
+                abs_z,
+                rel_x,
+                rel_y,
+                rel_z,
+                heading_sin,
+                heading_cos,
+                pitch_sin,
+                pitch_cos,
+                roll_sin,
+                roll_cos,
+                sensor_yaw_sin,
+                sensor_yaw_cos,
+                sensor_pitch_sin,
+                sensor_pitch_cos,
+                sensor_idx,
+                time_map,
+            ],
+            axis=0,
+        ).astype(np.float32)
+
+        return torch.from_numpy(features), torch.from_numpy(target.astype(np.float32))
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        groups = 8 if out_ch >= 8 and out_ch % 8 == 0 else 1
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(groups, out_ch),
+            nn.GELU(),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(groups, out_ch),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class SmallTemporalUNet(nn.Module):
+    def __init__(self, in_channels: int, base_channels: int = 32, dropout: float = 0.10):
+        super().__init__()
+        self.model_type = "real_cleanlog_temporal_unet"
+        self.in_channels = int(in_channels)
+        self.base_channels = int(base_channels)
+
+        self.enc1 = ConvBlock(in_channels, base_channels)
+        self.enc2 = ConvBlock(base_channels, base_channels * 2)
+        self.enc3 = ConvBlock(base_channels * 2, base_channels * 4)
+        self.bottleneck = ConvBlock(base_channels * 4, base_channels * 4)
+        self.pool = nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1))
+        self.drop = nn.Dropout2d(dropout)
+        self.dec3 = ConvBlock(base_channels * 8, base_channels * 2)
+        self.dec2 = ConvBlock(base_channels * 4, base_channels)
+        self.dec1 = ConvBlock(base_channels * 2, base_channels)
+        self.head = nn.Conv2d(base_channels, 1, kernel_size=1)
+
+    def _upsample_to(self, x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        return F.interpolate(x, size=ref.shape[-2:], mode="bilinear", align_corners=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(self.drop(e1)))
+        e3 = self.enc3(self.pool(self.drop(e2)))
+        b = self.bottleneck(self.pool(self.drop(e3)))
+
+        d3 = self._upsample_to(b, e3)
+        d3 = self.dec3(torch.cat([d3, e3], dim=1))
+        d2 = self._upsample_to(d3, e2)
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        d1 = self._upsample_to(d2, e1)
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+
+        logits = self.head(d1).squeeze(1)
+        return logits[:, -1, :]
+
+
+def build_sampler(dataset: RealLidarSequenceDataset) -> WeightedRandomSampler | None:
+    sample_has_obstacle = dataset.current_has_obstacle.astype(np.float32)
+    pos = float(sample_has_obstacle.sum())
+    neg = float(len(sample_has_obstacle) - pos)
+    if pos <= 0.0 or neg <= 0.0:
+        return None
+    pos_weight = neg / pos
+    sample_weights = np.where(sample_has_obstacle > 0.5, pos_weight, 1.0).astype(np.float32)
+    return WeightedRandomSampler(
+        weights=torch.from_numpy(sample_weights),
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+
+
+def compute_pos_weight(sequences: list[RealSequence], max_weight: float) -> tuple[float, float, float]:
+    labels = np.concatenate([seq.obstacle_labels.reshape(-1) for seq in sequences], axis=0).astype(np.float64)
+    positive = float(np.sum(labels > 0.5))
+    negative = float(np.sum(labels <= 0.5))
+    pos_weight = negative / max(positive, 1.0)
+    pos_weight = float(np.clip(pos_weight, 1.0, float(max_weight)))
+
+    sample_positive_flags = np.concatenate(
+        [np.any(seq.obstacle_labels > 0.5, axis=1).astype(np.float64) for seq in sequences],
+        axis=0,
+    )
+    sample_positive_fraction = float(sample_positive_flags.mean()) if sample_positive_flags.size else 0.0
+    beam_positive_fraction = float(np.mean(labels > 0.5)) if labels.size else 0.0
+    return pos_weight, sample_positive_fraction, beam_positive_fraction
+
+
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    device_kind: str,
+    pos_weight: float,
+) -> dict[str, float | list[list[int]]]:
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
+    tp = 0
+    tn = 0
+    fp = 0
+    fn = 0
+    pos_weight_t = torch.tensor([pos_weight], device=device, dtype=torch.float32)
+
+    with torch.inference_mode():
+        for x, y in loader:
+            x = x.to(device)
+            y = y.to(device)
+            logits = model(x)
+            loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight_t)
+            preds = (logits > 0.0).float()
+
+            total_loss += float(loss.item()) * float(y.shape[0])
+            total_samples += int(y.shape[0])
+            tp += int(((preds == 1.0) & (y == 1.0)).sum().item())
+            tn += int(((preds == 0.0) & (y == 0.0)).sum().item())
+            fp += int(((preds == 1.0) & (y == 0.0)).sum().item())
+            fn += int(((preds == 0.0) & (y == 1.0)).sum().item())
+
+            if device_kind == "xla":
+                import torch_xla.core.xla_model as xm
+
+                xm.mark_step()
+
+    total_beams = tp + tn + fp + fn
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    accuracy = (tp + tn) / max(total_beams, 1)
+    return {
+        "loss": total_loss / max(total_samples, 1),
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "confusion_matrix": [[tn, fp], [fn, tp]],
+    }
+
+
+def train_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    device_kind: str,
+    epoch_idx: int,
+    total_epochs: int,
+    pos_weight: float,
+    grad_clip_norm: float,
+    use_amp: bool,
+    log_every_batches: int,
+) -> dict[str, float]:
+    model.train(True)
+    total_loss = 0.0
+    total_samples = 0
+    total_correct = 0
+    total_beams = 0
+    tp = 0
+    fp = 0
+    fn = 0
+    batch_total = len(loader)
+    epoch_t0 = perf_counter()
+    pos_weight_t = torch.tensor([pos_weight], device=device, dtype=torch.float32)
+    scaler = torch.amp.GradScaler("cuda", enabled=bool(use_amp and device_kind == "cuda"))
+
+    for batch_idx, (x, y) in enumerate(loader, start=1):
+        x = x.to(device, non_blocking=device_kind == "cuda")
+        y = y.to(device, non_blocking=device_kind == "cuda")
+
+        amp_context = (
+            torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+            if device_kind == "cuda" and use_amp
+            else nullcontext()
+        )
+        with amp_context:
+            logits = model(x)
+            loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight_t)
+
+        optimizer.zero_grad(set_to_none=True)
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            if grad_clip_norm > 0.0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if grad_clip_norm > 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            optimizer_step_for_device(optimizer, device_kind)
+
+        preds = (logits > 0.0).float()
+        total_loss += float(loss.item()) * float(y.shape[0])
+        total_samples += int(y.shape[0])
+        total_correct += int((preds == y).sum().item())
+        total_beams += int(y.numel())
+        tp += int(((preds == 1.0) & (y == 1.0)).sum().item())
+        fp += int(((preds == 1.0) & (y == 0.0)).sum().item())
+        fn += int(((preds == 0.0) & (y == 1.0)).sum().item())
+
+        if log_every_batches > 0 and (batch_idx % log_every_batches == 0 or batch_idx == batch_total):
+            running_loss = total_loss / max(total_samples, 1)
+            running_acc = total_correct / max(total_beams, 1)
+            running_precision = tp / max(tp + fp, 1)
+            running_recall = tp / max(tp + fn, 1)
+            log(
+                f"train epoch {epoch_idx:03d}/{total_epochs:03d} "
+                f"batch {batch_idx:04d}/{batch_total:04d} "
+                f"loss={running_loss:.5f} acc={running_acc:.4f} "
+                f"prec={running_precision:.4f} recall={running_recall:.4f}"
+            )
+
+    elapsed_s = perf_counter() - epoch_t0
+    return {
+        "loss": total_loss / max(total_samples, 1),
+        "accuracy": total_correct / max(total_beams, 1),
+        "precision": tp / max(tp + fp, 1),
+        "recall": tp / max(tp + fn, 1),
+        "time_s": elapsed_s,
+    }
+
+
+def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, DatasetMeta, tuple[str, ...], int]:
+    sequences = load_real_sequences(args.cleanlog_dir)
+    train_sequences, val_sequences = split_sequences(sequences, val_fraction=args.val_fraction, seed=args.seed)
+    pos_weight, sample_positive_fraction, beam_positive_fraction = compute_pos_weight(
+        train_sequences,
+        max_weight=args.pos_weight_cap,
+    )
+
+    train_ds = RealLidarSequenceDataset(
+        train_sequences,
+        history_steps=args.history_steps,
+        max_range_cm=args.max_range_cm,
+        augment=True,
+        xy_offset_max_cm=args.xy_offset_max_cm,
+        z_offset_max_cm=args.z_offset_max_cm,
+        absolute_xy_scale_cm=args.absolute_xy_scale_cm,
+        absolute_z_scale_cm=args.absolute_z_scale_cm,
+        relative_xy_scale_cm=args.relative_xy_scale_cm,
+        relative_z_scale_cm=args.relative_z_scale_cm,
+    )
+    val_ds = RealLidarSequenceDataset(
+        val_sequences,
+        history_steps=args.history_steps,
+        max_range_cm=args.max_range_cm,
+        augment=False,
+        xy_offset_max_cm=0.0,
+        z_offset_max_cm=0.0,
+        absolute_xy_scale_cm=args.absolute_xy_scale_cm,
+        absolute_z_scale_cm=args.absolute_z_scale_cm,
+        relative_xy_scale_cm=args.relative_xy_scale_cm,
+        relative_z_scale_cm=args.relative_z_scale_cm,
+    )
+    workers = resolve_data_loader_workers(args.workers)
+    pin_memory = str(args.device).lower() in {"auto", "cuda"}
+    sampler = build_sampler(train_ds) if args.balance_positive_windows else None
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=sampler is None,
+        sampler=sampler,
+        num_workers=workers,
+        pin_memory=pin_memory,
+        persistent_workers=bool(workers > 0),
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=workers,
+        pin_memory=pin_memory,
+        persistent_workers=bool(workers > 0),
+    )
+    meta = DatasetMeta(
+        train_files=[seq.name for seq in train_sequences],
+        val_files=[seq.name for seq in val_sequences],
+        train_windows=len(train_ds),
+        val_windows=len(val_ds),
+        num_sensors=train_ds.num_sensors,
+        history_steps=args.history_steps,
+        current_plus_history=args.history_steps + 1,
+        pos_weight=pos_weight,
+        sample_positive_fraction=sample_positive_fraction,
+        beam_positive_fraction=beam_positive_fraction,
+    )
+    return train_loader, val_loader, meta, train_sequences[0].sensor_names, train_ds.input_channels
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train a real cleanlog beam classifier on the last N lidar frames plus the current frame."
+    )
+    parser.add_argument("--cleanlog-dir", type=Path, default=Path("cleanlog"))
+    parser.add_argument("--output", type=Path, default=Path("runs/realdatabeam_unet.pt"))
+    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=2e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--history-steps", type=int, default=30)
+    parser.add_argument("--val-fraction", type=float, default=0.25)
+    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--workers", type=int, default=-1)
+    parser.add_argument("--base-channels", type=int, default=32)
+    parser.add_argument("--dropout", type=float, default=0.10)
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--max-range-cm", type=float, default=DEFAULT_LIDAR_MAX_RANGE_CM)
+    parser.add_argument("--xy-offset-max-cm", type=float, default=10000.0)
+    parser.add_argument("--z-offset-max-cm", type=float, default=10.0)
+    parser.add_argument("--absolute-xy-scale-cm", type=float, default=20000.0)
+    parser.add_argument("--absolute-z-scale-cm", type=float, default=5000.0)
+    parser.add_argument("--relative-xy-scale-cm", type=float, default=5000.0)
+    parser.add_argument("--relative-z-scale-cm", type=float, default=500.0)
+    parser.add_argument("--pos-weight-cap", type=float, default=25.0)
+    parser.add_argument("--plateau-factor", type=float, default=0.5)
+    parser.add_argument("--plateau-patience", type=int, default=3)
+    parser.add_argument("--min-lr", type=float, default=1e-5)
+    parser.add_argument("--log-every-batches", type=int, default=20)
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--balance-positive-windows", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    log_path = args.output.with_suffix(".log.txt")
+    metrics_path = args.output.with_suffix(".metrics.csv")
+    split_path = args.output.with_suffix(".split.json")
+    val_report_path = args.output.with_suffix(".val_report.json")
+
+    with log_path.open("w", encoding="utf-8") as log_fh:
+        set_log_file(log_fh)
+        try:
+            device, device_kind = select_runtime_device(args.device)
+            configure_runtime_for_device(device_kind)
+            log("Starting real cleanlog temporal U-Net trainer")
+            log(f"Device selected: {device_kind} -> {device}")
+
+            train_loader, val_loader, meta, sensor_names, input_channels = build_loaders(args)
+            log(
+                "Dataset split summary: "
+                f"train_files={len(meta.train_files)} val_files={len(meta.val_files)} "
+                f"train_windows={meta.train_windows} val_windows={meta.val_windows}"
+            )
+            log(
+                "Beam stats: "
+                f"num_sensors={meta.num_sensors} history_steps={meta.history_steps} "
+                f"window_size={meta.current_plus_history} pos_weight={meta.pos_weight:.3f}"
+            )
+            log(
+                "Positive fractions from train split: "
+                f"window_has_obstacle={meta.sample_positive_fraction:.4f} "
+                f"beam_is_obstacle={meta.beam_positive_fraction:.4f}"
+            )
+            log(
+                "Augmentation: "
+                f"xy_offset=[{-args.xy_offset_max_cm:.1f},{args.xy_offset_max_cm:.1f}]cm "
+                f"z_offset=[{-args.z_offset_max_cm:.1f},{args.z_offset_max_cm:.1f}]cm"
+            )
+
+            with split_path.open("w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "train_files": meta.train_files,
+                        "val_files": meta.val_files,
+                        "train_windows": meta.train_windows,
+                        "val_windows": meta.val_windows,
+                        "num_sensors": meta.num_sensors,
+                        "sensor_names": list(sensor_names),
+                        "history_steps": meta.history_steps,
+                        "window_size": meta.current_plus_history,
+                        "beam_positive_fraction": meta.beam_positive_fraction,
+                        "sample_positive_fraction": meta.sample_positive_fraction,
+                        "pos_weight": meta.pos_weight,
+                        "args": _jsonable_args(args),
+                    },
+                    fh,
+                    indent=2,
+                )
+            log(f"Wrote split manifest: {split_path}")
+
+            model = SmallTemporalUNet(
+                in_channels=input_channels,
+                base_channels=args.base_channels,
+                dropout=args.dropout,
+            ).to(device)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=args.plateau_factor,
+                patience=args.plateau_patience,
+                min_lr=args.min_lr,
+            )
+
+            best = {"val_loss": float("inf"), "epoch": -1, "metrics": None}
+            with metrics_path.open("w", encoding="utf-8", newline="") as metrics_fh:
+                writer = csv.writer(metrics_fh)
+                writer.writerow(
+                    [
+                        "epoch",
+                        "train_loss",
+                        "train_acc",
+                        "train_precision",
+                        "train_recall",
+                        "val_loss",
+                        "val_acc",
+                        "val_precision",
+                        "val_recall",
+                        "best_val_loss",
+                        "lr",
+                    ]
+                )
+
+                for epoch in range(1, args.epochs + 1):
+                    train_metrics = train_epoch(
+                        model=model,
+                        loader=train_loader,
+                        optimizer=optimizer,
+                        device=device,
+                        device_kind=device_kind,
+                        epoch_idx=epoch,
+                        total_epochs=args.epochs,
+                        pos_weight=meta.pos_weight,
+                        grad_clip_norm=args.grad_clip_norm,
+                        use_amp=bool(args.amp),
+                        log_every_batches=args.log_every_batches,
+                    )
+                    val_metrics = evaluate(
+                        model=model,
+                        loader=val_loader,
+                        device=device,
+                        device_kind=device_kind,
+                        pos_weight=meta.pos_weight,
+                    )
+                    scheduler.step(float(val_metrics["loss"]))
+
+                    current_lr = float(optimizer.param_groups[0]["lr"])
+                    writer.writerow(
+                        [
+                            epoch,
+                            train_metrics["loss"],
+                            train_metrics["accuracy"],
+                            train_metrics["precision"],
+                            train_metrics["recall"],
+                            val_metrics["loss"],
+                            val_metrics["accuracy"],
+                            val_metrics["precision"],
+                            val_metrics["recall"],
+                            min(best["val_loss"], float(val_metrics["loss"])),
+                            current_lr,
+                        ]
+                    )
+                    metrics_fh.flush()
+
+                    log(
+                        f"epoch {epoch:03d}/{args.epochs:03d} "
+                        f"train_loss={train_metrics['loss']:.5f} train_acc={train_metrics['accuracy']:.4f} "
+                        f"val_loss={float(val_metrics['loss']):.5f} val_acc={float(val_metrics['accuracy']):.4f} "
+                        f"val_prec={float(val_metrics['precision']):.4f} val_recall={float(val_metrics['recall']):.4f} "
+                        f"lr={current_lr:.6f}"
+                    )
+
+                    if float(val_metrics["loss"]) < best["val_loss"]:
+                        best = {"val_loss": float(val_metrics["loss"]), "epoch": epoch, "metrics": val_metrics}
+                        checkpoint = {
+                            "model_state_dict": model.state_dict(),
+                            "model_config": {
+                                "model_type": model.model_type,
+                                "in_channels": input_channels,
+                                "base_channels": args.base_channels,
+                                "dropout": args.dropout,
+                                "num_sensors": meta.num_sensors,
+                                "history_steps": meta.history_steps,
+                                "max_range_cm": args.max_range_cm,
+                            },
+                            "meta": {
+                                "train_files": meta.train_files,
+                                "val_files": meta.val_files,
+                                "sensor_names": list(sensor_names),
+                                "beam_positive_fraction": meta.beam_positive_fraction,
+                                "sample_positive_fraction": meta.sample_positive_fraction,
+                                "pos_weight": meta.pos_weight,
+                                "best_val_loss": best["val_loss"],
+                                "best_epoch": best["epoch"],
+                            },
+                        }
+                        save_checkpoint_for_device(checkpoint, args.output, device_kind)
+                        with val_report_path.open("w", encoding="utf-8") as fh:
+                            json.dump(
+                                {
+                                    "best_epoch": best["epoch"],
+                                    "best_val_loss": best["val_loss"],
+                                    "metrics": best["metrics"],
+                                },
+                                fh,
+                                indent=2,
+                            )
+                        log(
+                            f"New best validation loss at epoch {epoch:03d}: "
+                            f"{best['val_loss']:.6f}. Saved checkpoint -> {args.output}"
+                        )
+
+            log_plain(f"saved checkpoint: {args.output}")
+            log_plain(f"saved split manifest: {split_path}")
+            log_plain(f"saved metrics: {metrics_path}")
+            log_plain(f"saved val report: {val_report_path}")
+            log_plain(f"saved log: {log_path}")
+        finally:
+            set_log_file(None)
+
+
+if __name__ == "__main__":
+    main()
