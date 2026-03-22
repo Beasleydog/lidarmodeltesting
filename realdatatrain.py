@@ -473,6 +473,10 @@ def evaluate(
         "accuracy": accuracy,
         "precision": precision,
         "recall": recall,
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+        "tp": tp,
         "confusion_matrix": [[tn, fp], [fn, tp]],
     }
 
@@ -557,6 +561,10 @@ def train_epoch(
         "accuracy": total_correct / max(total_beams, 1),
         "precision": tp / max(tp + fp, 1),
         "recall": tp / max(tp + fn, 1),
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": max(total_beams - tp - fp - fn, 0),
         "time_s": elapsed_s,
     }
 
@@ -657,6 +665,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plateau-factor", type=float, default=0.5)
     parser.add_argument("--plateau-patience", type=int, default=3)
     parser.add_argument("--min-lr", type=float, default=1e-5)
+    parser.add_argument("--early-stop-patience", type=int, default=8)
+    parser.add_argument("--early-stop-min-delta", type=float, default=1e-4)
     parser.add_argument("--log-every-batches", type=int, default=20)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--balance-positive-windows", action="store_true")
@@ -740,6 +750,7 @@ def main() -> None:
             )
 
             best = {"val_loss": float("inf"), "epoch": -1, "metrics": None}
+            epochs_without_improve = 0
             with metrics_path.open("w", encoding="utf-8", newline="") as metrics_fh:
                 writer = csv.writer(metrics_fh)
                 writer.writerow(
@@ -749,10 +760,18 @@ def main() -> None:
                         "train_acc",
                         "train_precision",
                         "train_recall",
+                        "train_tn",
+                        "train_fp",
+                        "train_fn",
+                        "train_tp",
                         "val_loss",
                         "val_acc",
                         "val_precision",
                         "val_recall",
+                        "val_tn",
+                        "val_fp",
+                        "val_fn",
+                        "val_tp",
                         "best_val_loss",
                         "lr",
                     ]
@@ -789,10 +808,18 @@ def main() -> None:
                             train_metrics["accuracy"],
                             train_metrics["precision"],
                             train_metrics["recall"],
+                            train_metrics["tn"],
+                            train_metrics["fp"],
+                            train_metrics["fn"],
+                            train_metrics["tp"],
                             val_metrics["loss"],
                             val_metrics["accuracy"],
                             val_metrics["precision"],
                             val_metrics["recall"],
+                            val_metrics["tn"],
+                            val_metrics["fp"],
+                            val_metrics["fn"],
+                            val_metrics["tp"],
                             min(best["val_loss"], float(val_metrics["loss"])),
                             current_lr,
                         ]
@@ -802,13 +829,19 @@ def main() -> None:
                     log(
                         f"epoch {epoch:03d}/{args.epochs:03d} "
                         f"train_loss={train_metrics['loss']:.5f} train_acc={train_metrics['accuracy']:.4f} "
+                        f"train_cm=[[{int(train_metrics['tn'])},{int(train_metrics['fp'])}],"
+                        f"[{int(train_metrics['fn'])},{int(train_metrics['tp'])}]] "
                         f"val_loss={float(val_metrics['loss']):.5f} val_acc={float(val_metrics['accuracy']):.4f} "
                         f"val_prec={float(val_metrics['precision']):.4f} val_recall={float(val_metrics['recall']):.4f} "
+                        f"val_cm=[[{int(val_metrics['tn'])},{int(val_metrics['fp'])}],"
+                        f"[{int(val_metrics['fn'])},{int(val_metrics['tp'])}]] "
                         f"lr={current_lr:.6f}"
                     )
 
-                    if float(val_metrics["loss"]) < best["val_loss"]:
+                    improved = float(val_metrics["loss"]) < (best["val_loss"] - float(args.early_stop_min_delta))
+                    if improved:
                         best = {"val_loss": float(val_metrics["loss"]), "epoch": epoch, "metrics": val_metrics}
+                        epochs_without_improve = 0
                         checkpoint = {
                             "model_state_dict": model.state_dict(),
                             "model_config": {
@@ -846,6 +879,18 @@ def main() -> None:
                             f"New best validation loss at epoch {epoch:03d}: "
                             f"{best['val_loss']:.6f}. Saved checkpoint -> {args.output}"
                         )
+                    else:
+                        epochs_without_improve += 1
+                        log(
+                            f"no val improvement for {epochs_without_improve} epoch(s) "
+                            f"(patience={args.early_stop_patience}, min_delta={args.early_stop_min_delta:.6f})"
+                        )
+                        if epochs_without_improve >= int(args.early_stop_patience):
+                            log(
+                                f"Early stopping at epoch {epoch:03d}: "
+                                f"best_val={best['val_loss']:.6f} from epoch {best['epoch']:03d}"
+                            )
+                            break
 
             log_plain(f"saved checkpoint: {args.output}")
             log_plain(f"saved split manifest: {split_path}")
