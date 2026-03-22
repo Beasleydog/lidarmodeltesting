@@ -416,7 +416,8 @@ def compute_pos_weight(sequences: list[RealSequence], max_weight: float) -> tupl
     labels = np.concatenate([seq.obstacle_labels.reshape(-1) for seq in sequences], axis=0).astype(np.float64)
     positive = float(np.sum(labels > 0.5))
     negative = float(np.sum(labels <= 0.5))
-    pos_weight = negative / max(positive, 1.0)
+    raw_pos_weight = negative / max(positive, 1.0)
+    pos_weight = np.sqrt(raw_pos_weight)
     pos_weight = float(np.clip(pos_weight, 1.0, float(max_weight)))
 
     sample_positive_flags = np.concatenate(
@@ -434,15 +435,15 @@ def evaluate(
     device: torch.device,
     device_kind: str,
     pos_weight: float,
+    decision_threshold: float = 0.5,
 ) -> dict[str, float | list[list[int]]]:
     model.eval()
     total_loss = 0.0
     total_samples = 0
-    tp = 0
-    tn = 0
-    fp = 0
-    fn = 0
     pos_weight_t = torch.tensor([pos_weight], device=device, dtype=torch.float32)
+    threshold = float(decision_threshold)
+    logits_chunks: list[np.ndarray] = []
+    target_chunks: list[np.ndarray] = []
 
     with torch.inference_mode():
         for x, y in loader:
@@ -450,35 +451,121 @@ def evaluate(
             y = y.to(device)
             logits = model(x)
             loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight_t)
-            preds = (logits > 0.0).float()
 
             total_loss += float(loss.item()) * float(y.shape[0])
             total_samples += int(y.shape[0])
-            tp += int(((preds == 1.0) & (y == 1.0)).sum().item())
-            tn += int(((preds == 0.0) & (y == 0.0)).sum().item())
-            fp += int(((preds == 1.0) & (y == 0.0)).sum().item())
-            fn += int(((preds == 0.0) & (y == 1.0)).sum().item())
+            logits_chunks.append(logits.detach().cpu().numpy().astype(np.float32, copy=False))
+            target_chunks.append(y.detach().cpu().numpy().astype(np.float32, copy=False))
 
             if device_kind == "xla":
                 import torch_xla.core.xla_model as xm
 
                 xm.mark_step()
 
+    logits_np = np.concatenate(logits_chunks, axis=0)
+    targets_np = np.concatenate(target_chunks, axis=0)
+    probs_np = 1.0 / (1.0 + np.exp(-logits_np))
+    preds_np = probs_np >= threshold
+    target_bool = targets_np > 0.5
+
+    tp = int(np.sum(preds_np & target_bool))
+    tn = int(np.sum((~preds_np) & (~target_bool)))
+    fp = int(np.sum(preds_np & (~target_bool)))
+    fn = int(np.sum((~preds_np) & target_bool))
     total_beams = tp + tn + fp + fn
     precision = tp / max(tp + fp, 1)
     recall = tp / max(tp + fn, 1)
     accuracy = (tp + tn) / max(total_beams, 1)
+    f1 = (2.0 * precision * recall) / max(precision + recall, 1e-12)
     return {
         "loss": total_loss / max(total_samples, 1),
         "accuracy": accuracy,
         "precision": precision,
         "recall": recall,
+        "f1": f1,
+        "threshold": threshold,
         "tn": tn,
         "fp": fp,
         "fn": fn,
         "tp": tp,
         "confusion_matrix": [[tn, fp], [fn, tp]],
     }
+
+
+def _compute_binary_metrics_from_probs(
+    probs: np.ndarray,
+    targets: np.ndarray,
+    threshold: float,
+) -> dict[str, float | list[list[int]]]:
+    preds = probs >= float(threshold)
+    target_bool = targets > 0.5
+    tp = int(np.sum(preds & target_bool))
+    tn = int(np.sum((~preds) & (~target_bool)))
+    fp = int(np.sum(preds & (~target_bool)))
+    fn = int(np.sum((~preds) & target_bool))
+    total = tp + tn + fp + fn
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    accuracy = (tp + tn) / max(total, 1)
+    f1 = (2.0 * precision * recall) / max(precision + recall, 1e-12)
+    return {
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "threshold": float(threshold),
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+        "tp": tp,
+        "confusion_matrix": [[tn, fp], [fn, tp]],
+    }
+
+
+def sweep_validation_thresholds(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    device_kind: str,
+    thresholds: list[float],
+) -> dict[str, float | list[list[int]]]:
+    model.eval()
+    logits_chunks: list[np.ndarray] = []
+    target_chunks: list[np.ndarray] = []
+
+    with torch.inference_mode():
+        for x, y in loader:
+            x = x.to(device)
+            logits = model(x)
+            logits_chunks.append(logits.detach().cpu().numpy().astype(np.float32, copy=False))
+            target_chunks.append(y.detach().cpu().numpy().astype(np.float32, copy=False))
+
+            if device_kind == "xla":
+                import torch_xla.core.xla_model as xm
+
+                xm.mark_step()
+
+    logits_np = np.concatenate(logits_chunks, axis=0)
+    targets_np = np.concatenate(target_chunks, axis=0)
+    probs_np = 1.0 / (1.0 + np.exp(-logits_np))
+
+    best_metrics: dict[str, float | list[list[int]]] | None = None
+    for threshold in thresholds:
+        metrics = _compute_binary_metrics_from_probs(probs_np, targets_np, threshold)
+        if best_metrics is None:
+            best_metrics = metrics
+            continue
+        if float(metrics["f1"]) > float(best_metrics["f1"]) + 1e-12:
+            best_metrics = metrics
+            continue
+        if abs(float(metrics["f1"]) - float(best_metrics["f1"])) <= 1e-12 and float(metrics["precision"]) > float(
+            best_metrics["precision"]
+        ):
+            best_metrics = metrics
+
+    if best_metrics is None:
+        raise RuntimeError("Threshold sweep produced no metrics")
+    return best_metrics
 
 
 def train_epoch(
@@ -556,11 +643,15 @@ def train_epoch(
             )
 
     elapsed_s = perf_counter() - epoch_t0
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = (2.0 * precision * recall) / max(precision + recall, 1e-12)
     return {
         "loss": total_loss / max(total_samples, 1),
         "accuracy": total_correct / max(total_beams, 1),
-        "precision": tp / max(tp + fp, 1),
-        "recall": tp / max(tp + fn, 1),
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
         "tp": tp,
         "fp": fp,
         "fn": fn,
@@ -667,6 +758,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-lr", type=float, default=1e-5)
     parser.add_argument("--early-stop-patience", type=int, default=8)
     parser.add_argument("--early-stop-min-delta", type=float, default=1e-4)
+    parser.add_argument("--eval-threshold", type=float, default=0.5)
+    parser.add_argument("--threshold-sweep-start", type=float, default=0.10)
+    parser.add_argument("--threshold-sweep-end", type=float, default=0.90)
+    parser.add_argument("--threshold-sweep-step", type=float, default=0.05)
     parser.add_argument("--log-every-batches", type=int, default=20)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--balance-positive-windows", action="store_true")
@@ -713,6 +808,21 @@ def main() -> None:
                 f"xy_offset=[{-args.xy_offset_max_cm:.1f},{args.xy_offset_max_cm:.1f}]cm "
                 f"z_offset=[{-args.z_offset_max_cm:.1f},{args.z_offset_max_cm:.1f}]cm"
             )
+            threshold_values = np.arange(
+                float(args.threshold_sweep_start),
+                float(args.threshold_sweep_end) + (0.5 * float(args.threshold_sweep_step)),
+                float(args.threshold_sweep_step),
+                dtype=np.float32,
+            )
+            threshold_values = np.clip(threshold_values, 0.0, 1.0)
+            threshold_values = sorted(set(float(round(v, 6)) for v in threshold_values.tolist()))
+            if float(args.eval_threshold) not in threshold_values:
+                threshold_values.append(float(args.eval_threshold))
+                threshold_values = sorted(set(threshold_values))
+            log(
+                f"Validation threshold sweep: {threshold_values[0]:.2f}..{threshold_values[-1]:.2f} "
+                f"step~{args.threshold_sweep_step:.2f} default_eval={args.eval_threshold:.2f}"
+            )
 
             with split_path.open("w", encoding="utf-8") as fh:
                 json.dump(
@@ -749,7 +859,7 @@ def main() -> None:
                 min_lr=args.min_lr,
             )
 
-            best = {"val_loss": float("inf"), "epoch": -1, "metrics": None}
+            best = {"val_loss": float("inf"), "val_f1": -1.0, "epoch": -1, "metrics": None}
             epochs_without_improve = 0
             with metrics_path.open("w", encoding="utf-8", newline="") as metrics_fh:
                 writer = csv.writer(metrics_fh)
@@ -760,6 +870,7 @@ def main() -> None:
                         "train_acc",
                         "train_precision",
                         "train_recall",
+                        "train_f1",
                         "train_tn",
                         "train_fp",
                         "train_fn",
@@ -768,11 +879,13 @@ def main() -> None:
                         "val_acc",
                         "val_precision",
                         "val_recall",
+                        "val_f1",
+                        "val_threshold",
                         "val_tn",
                         "val_fp",
                         "val_fn",
                         "val_tp",
-                        "best_val_loss",
+                        "best_val_f1",
                         "lr",
                     ]
                 )
@@ -797,6 +910,28 @@ def main() -> None:
                         device=device,
                         device_kind=device_kind,
                         pos_weight=meta.pos_weight,
+                        decision_threshold=float(args.eval_threshold),
+                    )
+                    sweep_metrics = sweep_validation_thresholds(
+                        model=model,
+                        loader=val_loader,
+                        device=device,
+                        device_kind=device_kind,
+                        thresholds=threshold_values,
+                    )
+                    val_metrics.update(
+                        {
+                            "accuracy": sweep_metrics["accuracy"],
+                            "precision": sweep_metrics["precision"],
+                            "recall": sweep_metrics["recall"],
+                            "f1": sweep_metrics["f1"],
+                            "threshold": sweep_metrics["threshold"],
+                            "tn": sweep_metrics["tn"],
+                            "fp": sweep_metrics["fp"],
+                            "fn": sweep_metrics["fn"],
+                            "tp": sweep_metrics["tp"],
+                            "confusion_matrix": sweep_metrics["confusion_matrix"],
+                        }
                     )
                     scheduler.step(float(val_metrics["loss"]))
 
@@ -808,6 +943,7 @@ def main() -> None:
                             train_metrics["accuracy"],
                             train_metrics["precision"],
                             train_metrics["recall"],
+                            train_metrics["f1"],
                             train_metrics["tn"],
                             train_metrics["fp"],
                             train_metrics["fn"],
@@ -816,11 +952,13 @@ def main() -> None:
                             val_metrics["accuracy"],
                             val_metrics["precision"],
                             val_metrics["recall"],
+                            val_metrics["f1"],
+                            val_metrics["threshold"],
                             val_metrics["tn"],
                             val_metrics["fp"],
                             val_metrics["fn"],
                             val_metrics["tp"],
-                            min(best["val_loss"], float(val_metrics["loss"])),
+                            max(float(best["val_f1"]), float(val_metrics["f1"])),
                             current_lr,
                         ]
                     )
@@ -829,18 +967,25 @@ def main() -> None:
                     log(
                         f"epoch {epoch:03d}/{args.epochs:03d} "
                         f"train_loss={train_metrics['loss']:.5f} train_acc={train_metrics['accuracy']:.4f} "
+                        f"train_f1={train_metrics['f1']:.4f} "
                         f"train_cm=[[{int(train_metrics['tn'])},{int(train_metrics['fp'])}],"
                         f"[{int(train_metrics['fn'])},{int(train_metrics['tp'])}]] "
                         f"val_loss={float(val_metrics['loss']):.5f} val_acc={float(val_metrics['accuracy']):.4f} "
                         f"val_prec={float(val_metrics['precision']):.4f} val_recall={float(val_metrics['recall']):.4f} "
+                        f"val_f1={float(val_metrics['f1']):.4f} thr={float(val_metrics['threshold']):.2f} "
                         f"val_cm=[[{int(val_metrics['tn'])},{int(val_metrics['fp'])}],"
                         f"[{int(val_metrics['fn'])},{int(val_metrics['tp'])}]] "
                         f"lr={current_lr:.6f}"
                     )
 
-                    improved = float(val_metrics["loss"]) < (best["val_loss"] - float(args.early_stop_min_delta))
+                    improved = float(val_metrics["f1"]) > (float(best["val_f1"]) + float(args.early_stop_min_delta))
                     if improved:
-                        best = {"val_loss": float(val_metrics["loss"]), "epoch": epoch, "metrics": val_metrics}
+                        best = {
+                            "val_loss": float(val_metrics["loss"]),
+                            "val_f1": float(val_metrics["f1"]),
+                            "epoch": epoch,
+                            "metrics": val_metrics,
+                        }
                         epochs_without_improve = 0
                         checkpoint = {
                             "model_state_dict": model.state_dict(),
@@ -861,6 +1006,8 @@ def main() -> None:
                                 "sample_positive_fraction": meta.sample_positive_fraction,
                                 "pos_weight": meta.pos_weight,
                                 "best_val_loss": best["val_loss"],
+                                "best_val_f1": best["val_f1"],
+                                "best_threshold": float(val_metrics["threshold"]),
                                 "best_epoch": best["epoch"],
                             },
                         }
@@ -870,14 +1017,17 @@ def main() -> None:
                                 {
                                     "best_epoch": best["epoch"],
                                     "best_val_loss": best["val_loss"],
+                                    "best_val_f1": best["val_f1"],
+                                    "best_threshold": float(val_metrics["threshold"]),
                                     "metrics": best["metrics"],
                                 },
                                 fh,
                                 indent=2,
                             )
                         log(
-                            f"New best validation loss at epoch {epoch:03d}: "
-                            f"{best['val_loss']:.6f}. Saved checkpoint -> {args.output}"
+                            f"New best validation F1 at epoch {epoch:03d}: "
+                            f"{best['val_f1']:.6f} at threshold {float(val_metrics['threshold']):.2f}. "
+                            f"Saved checkpoint -> {args.output}"
                         )
                     else:
                         epochs_without_improve += 1
@@ -888,7 +1038,7 @@ def main() -> None:
                         if epochs_without_improve >= int(args.early_stop_patience):
                             log(
                                 f"Early stopping at epoch {epoch:03d}: "
-                                f"best_val={best['val_loss']:.6f} from epoch {best['epoch']:03d}"
+                                f"best_val_f1={best['val_f1']:.6f} from epoch {best['epoch']:03d}"
                             )
                             break
 
