@@ -705,6 +705,268 @@ class TemporalConvTransformerClassifier(nn.Module):
         return self.head(torch.cat([encoded, global_context], dim=-1)).squeeze(-1)
 
 
+def _compute_local_beam_endpoints(
+    x: torch.Tensor,
+    max_range_cm: float,
+    relative_xy_scale_cm: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    range_cm = torch.clamp(x[:, 0], 0.0, 1.0) * float(max_range_cm)
+    hit = x[:, 1] > 0.5
+    rel_x_global = x[:, 5] * float(relative_xy_scale_cm)
+    rel_y_global = x[:, 6] * float(relative_xy_scale_cm)
+    heading = torch.atan2(x[:, 8], x[:, 9])
+    sensor_yaw = torch.atan2(x[:, 14], x[:, 15])
+    beam_yaw_global = heading + sensor_yaw
+
+    endpoint_x_global_rel = rel_x_global + range_cm * torch.cos(beam_yaw_global)
+    endpoint_y_global_rel = rel_y_global + range_cm * torch.sin(beam_yaw_global)
+
+    current_heading = heading[:, -1:, :1]
+    cos_h = torch.cos(current_heading)
+    sin_h = torch.sin(current_heading)
+    local_x = cos_h * endpoint_x_global_rel + sin_h * endpoint_y_global_rel
+    local_y = -sin_h * endpoint_x_global_rel + cos_h * endpoint_y_global_rel
+    time_age = 0.5 * (x[:, 19] + 1.0)
+    return local_x, local_y, hit, time_age
+
+
+def _rasterize_bev_history(
+    local_x: torch.Tensor,
+    local_y: torch.Tensor,
+    hit: torch.Tensor,
+    time_age: torch.Tensor,
+    grid_size: int,
+    grid_extent_cm: float,
+) -> torch.Tensor:
+    batch_size, time_steps, sensor_count = local_x.shape
+    grid_size_i = int(grid_size)
+    extent = float(grid_extent_cm)
+
+    norm_x = torch.clamp(local_x / extent, -1.0, 1.0)
+    norm_y = torch.clamp(-local_y / extent, -1.0, 1.0)
+    ix = torch.round((norm_x + 1.0) * 0.5 * float(grid_size_i - 1)).long()
+    iy = torch.round((norm_y + 1.0) * 0.5 * float(grid_size_i - 1)).long()
+    valid = (norm_x >= -1.0) & (norm_x <= 1.0) & (norm_y >= -1.0) & (norm_y <= 1.0)
+
+    batch_idx = torch.arange(batch_size, device=local_x.device).view(batch_size, 1, 1).expand_as(ix)
+    lin = batch_idx * (grid_size_i * grid_size_i) + iy * grid_size_i + ix
+
+    def scatter_channel(mask: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        flat = torch.zeros(batch_size * grid_size_i * grid_size_i, device=local_x.device, dtype=torch.float32)
+        if torch.any(mask):
+            flat.scatter_add_(0, lin[mask], weight[mask].to(dtype=torch.float32))
+        return flat.view(batch_size, 1, grid_size_i, grid_size_i)
+
+    current_mask = torch.zeros_like(valid)
+    current_mask[:, -1, :] = True
+    hit_f = hit.to(dtype=torch.float32)
+    recency = torch.clamp(time_age, 0.05, 1.0).to(dtype=torch.float32)
+
+    all_endpoints = scatter_channel(valid, recency)
+    hit_endpoints = scatter_channel(valid & hit, recency)
+    current_all = scatter_channel(valid & current_mask, torch.ones_like(recency))
+    current_hit = scatter_channel(valid & current_mask & hit, torch.ones_like(recency))
+    hit_recent = scatter_channel(valid & hit, recency * recency)
+    return torch.cat([all_endpoints, hit_endpoints, current_all, current_hit, hit_recent], dim=1)
+
+
+def _sample_bev_features(
+    bev_features: torch.Tensor,
+    sample_x_cm: torch.Tensor,
+    sample_y_cm: torch.Tensor,
+    grid_extent_cm: float,
+) -> torch.Tensor:
+    extent = float(grid_extent_cm)
+    norm_x = torch.clamp(sample_x_cm / extent, -1.0, 1.0)
+    norm_y = torch.clamp(-sample_y_cm / extent, -1.0, 1.0)
+    grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(2)
+    sampled = F.grid_sample(bev_features, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+    return sampled.squeeze(-1).permute(0, 2, 1)
+
+
+class TemporalBEVUNetClassifier(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        num_sensors: int,
+        hidden_dim: int = 96,
+        dropout: float = 0.15,
+        max_range_cm: float = DEFAULT_LIDAR_MAX_RANGE_CM,
+        relative_xy_scale_cm: float = 5000.0,
+        grid_size: int = 64,
+    ):
+        super().__init__()
+        self.model_type = "real_cleanlog_temporal_bev_unet"
+        self.in_channels = int(in_channels)
+        self.num_sensors = int(num_sensors)
+        self.hidden_dim = int(hidden_dim)
+        self.max_range_cm = float(max_range_cm)
+        self.relative_xy_scale_cm = float(relative_xy_scale_cm)
+        self.grid_size = int(grid_size)
+        self.grid_extent_cm = float(max(self.max_range_cm * 0.9, 6000.0))
+
+        bev_channels = max(self.hidden_dim // 2, 32)
+        self.bev_in = ConvBlock(5, bev_channels)
+        self.bev_pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.bev_mid = ConvBlock(bev_channels, bev_channels * 2)
+        self.bev_bottleneck = ConvBlock(bev_channels * 2, bev_channels * 2)
+        self.bev_out = ConvBlock(bev_channels * 4, bev_channels)
+        self.drop = nn.Dropout2d(dropout)
+
+        self.current_mlp = nn.Sequential(
+            nn.Linear(self.in_channels, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.sensor_embedding = nn.Embedding(self.num_sensors, self.hidden_dim)
+        self.head = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim * 3),
+            nn.Linear(self.hidden_dim * 3, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 1),
+        )
+        self.bev_proj = nn.Sequential(
+            nn.Linear(bev_channels, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, _, _, sensor_count = x.shape
+        if sensor_count != self.num_sensors:
+            raise ValueError(f"Expected {self.num_sensors} sensors, got {sensor_count}")
+
+        local_x, local_y, hit, time_age = _compute_local_beam_endpoints(
+            x,
+            max_range_cm=self.max_range_cm,
+            relative_xy_scale_cm=self.relative_xy_scale_cm,
+        )
+        bev = _rasterize_bev_history(local_x, local_y, hit, time_age, self.grid_size, self.grid_extent_cm)
+        e1 = self.bev_in(bev)
+        e2 = self.bev_mid(self.bev_pool(self.drop(e1)))
+        b = self.bev_bottleneck(self.bev_pool(self.drop(e2)))
+        up = F.interpolate(b, size=e2.shape[-2:], mode="bilinear", align_corners=False)
+        up = torch.cat([up, e2], dim=1)
+        bev_features = self.bev_out(F.interpolate(up, size=e1.shape[-2:], mode="bilinear", align_corners=False))
+
+        current_x = local_x[:, -1, :]
+        current_y = local_y[:, -1, :]
+        sampled = _sample_bev_features(bev_features, current_x, current_y, self.grid_extent_cm)
+        sampled = self.bev_proj(sampled)
+        global_bev = self.bev_proj(bev_features.mean(dim=(-2, -1))).unsqueeze(1).expand(-1, sensor_count, -1)
+
+        current_features = x[:, :, -1, :].permute(0, 2, 1)
+        current_tokens = self.current_mlp(current_features)
+        beam_ids = torch.arange(self.num_sensors, device=x.device)
+        beam_embed = self.sensor_embedding(beam_ids).unsqueeze(0).expand(batch_size, -1, -1)
+        fused = torch.cat([sampled, current_tokens + beam_embed, global_bev], dim=-1)
+        return self.head(fused).squeeze(-1)
+
+
+class TemporalBEVFusionClassifier(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        num_sensors: int,
+        hidden_dim: int = 128,
+        dropout: float = 0.18,
+        transformer_layers: int = 3,
+        attention_heads: int = 4,
+        max_range_cm: float = DEFAULT_LIDAR_MAX_RANGE_CM,
+        relative_xy_scale_cm: float = 5000.0,
+        grid_size: int = 64,
+    ):
+        super().__init__()
+        self.model_type = "real_cleanlog_temporal_bev_fusion"
+        self.in_channels = int(in_channels)
+        self.num_sensors = int(num_sensors)
+        self.hidden_dim = int(hidden_dim)
+        self.transformer_layers = int(max(transformer_layers, 1))
+        self.attention_heads = int(max(attention_heads, 1))
+        if self.hidden_dim % self.attention_heads != 0:
+            raise ValueError("hidden_dim must be divisible by attention_heads")
+        self.max_range_cm = float(max_range_cm)
+        self.relative_xy_scale_cm = float(relative_xy_scale_cm)
+        self.grid_size = int(grid_size)
+        self.grid_extent_cm = float(max(self.max_range_cm * 0.9, 6000.0))
+
+        bev_channels = max(self.hidden_dim // 2, 48)
+        self.bev_stem = nn.Sequential(
+            nn.Conv2d(5, bev_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8 if bev_channels % 8 == 0 else 1, bev_channels),
+            nn.GELU(),
+            nn.Conv2d(bev_channels, bev_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8 if bev_channels % 8 == 0 else 1, bev_channels),
+            nn.GELU(),
+        )
+        self.bev_block = nn.Sequential(
+            nn.Conv2d(bev_channels, bev_channels, kernel_size=3, padding=2, dilation=2, bias=False),
+            nn.GroupNorm(8 if bev_channels % 8 == 0 else 1, bev_channels),
+            nn.GELU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(bev_channels, bev_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8 if bev_channels % 8 == 0 else 1, bev_channels),
+            nn.GELU(),
+        )
+        self.bev_proj = nn.Sequential(
+            nn.Linear(bev_channels, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+        )
+        self.current_mlp = nn.Sequential(
+            nn.Linear(self.in_channels, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.sensor_embedding = nn.Embedding(self.num_sensors, self.hidden_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=self.attention_heads,
+            dim_feedforward=self.hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.beam_encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.transformer_layers)
+        self.head = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim * 2),
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, _, _, sensor_count = x.shape
+        if sensor_count != self.num_sensors:
+            raise ValueError(f"Expected {self.num_sensors} sensors, got {sensor_count}")
+
+        local_x, local_y, hit, time_age = _compute_local_beam_endpoints(
+            x,
+            max_range_cm=self.max_range_cm,
+            relative_xy_scale_cm=self.relative_xy_scale_cm,
+        )
+        bev = _rasterize_bev_history(local_x, local_y, hit, time_age, self.grid_size, self.grid_extent_cm)
+        bev_features = self.bev_stem(bev)
+        bev_features = bev_features + self.bev_block(bev_features)
+
+        current_x = local_x[:, -1, :]
+        current_y = local_y[:, -1, :]
+        sampled = _sample_bev_features(bev_features, current_x, current_y, self.grid_extent_cm)
+        sampled_tokens = self.bev_proj(sampled)
+        global_tokens = self.bev_proj(bev_features.mean(dim=(-2, -1))).unsqueeze(1).expand(-1, sensor_count, -1)
+        current_tokens = self.current_mlp(x[:, :, -1, :].permute(0, 2, 1))
+        beam_ids = torch.arange(self.num_sensors, device=x.device)
+        beam_embed = self.sensor_embedding(beam_ids).unsqueeze(0).expand(batch_size, -1, -1)
+        tokens = sampled_tokens + current_tokens + beam_embed
+        encoded = self.beam_encoder(tokens)
+        return self.head(torch.cat([encoded, global_tokens], dim=-1)).squeeze(-1)
+
+
 def build_sampler(dataset: RealLidarSequenceDataset) -> WeightedRandomSampler | None:
     sample_has_obstacle = dataset.current_has_obstacle.astype(np.float32)
     pos = float(sample_has_obstacle.sum())
@@ -1836,6 +2098,83 @@ def build_experiment_suite() -> list[ExperimentConfig]:
             attention_heads=8,
         ),
         ExperimentConfig(
+            name="bev_unet_balanced",
+            model_type="bev_unet",
+            hidden_dim=96,
+            dropout=0.15,
+            lr=8e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=0.95,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.80,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            label_smoothing=0.02,
+        ),
+        ExperimentConfig(
+            name="bev_unet_strict",
+            model_type="bev_unet",
+            hidden_dim=128,
+            dropout=0.18,
+            lr=7e-4,
+            weight_decay=3e-4,
+            pos_weight_scale=0.75,
+            threshold_min_recall=0.42,
+            threshold_sweep_start=0.90,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.005,
+            loss_type="focal",
+            focal_gamma=1.5,
+        ),
+        ExperimentConfig(
+            name="bev_fusion_balanced",
+            model_type="bev_fusion",
+            hidden_dim=128,
+            dropout=0.16,
+            lr=7.5e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=0.95,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.88,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.01,
+            transformer_layers=3,
+            attention_heads=4,
+        ),
+        ExperimentConfig(
+            name="bev_fusion_strict",
+            model_type="bev_fusion",
+            hidden_dim=160,
+            dropout=0.20,
+            lr=6.5e-4,
+            weight_decay=3e-4,
+            pos_weight_scale=0.75,
+            threshold_min_recall=0.42,
+            threshold_sweep_start=0.94,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.005,
+            loss_type="focal",
+            focal_gamma=1.5,
+            transformer_layers=4,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="bev_fusion_smooth_tight",
+            model_type="bev_fusion",
+            hidden_dim=160,
+            dropout=0.18,
+            lr=6.5e-4,
+            weight_decay=2.5e-4,
+            pos_weight_scale=0.85,
+            threshold_min_recall=0.45,
+            threshold_sweep_start=0.94,
+            threshold_sweep_end=0.995,
+            threshold_sweep_step=0.005,
+            label_smoothing=0.02,
+            transformer_layers=4,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
             name="conv_unet_xl_strict",
             model_type="conv_unet",
             hidden_dim=80,
@@ -1916,6 +2255,7 @@ def parse_args() -> argparse.Namespace:
 
 def _build_model_for_experiment(
     exp: ExperimentConfig,
+    args: argparse.Namespace,
     input_channels: int,
     num_sensors: int,
 ) -> nn.Module:
@@ -1952,6 +2292,26 @@ def _build_model_for_experiment(
             transformer_layers=exp.transformer_layers,
             attention_heads=exp.attention_heads,
         )
+    if exp.model_type == "bev_unet":
+        return TemporalBEVUNetClassifier(
+            in_channels=input_channels,
+            num_sensors=num_sensors,
+            hidden_dim=exp.hidden_dim,
+            dropout=exp.dropout,
+            max_range_cm=args.max_range_cm,
+            relative_xy_scale_cm=args.relative_xy_scale_cm,
+        )
+    if exp.model_type == "bev_fusion":
+        return TemporalBEVFusionClassifier(
+            in_channels=input_channels,
+            num_sensors=num_sensors,
+            hidden_dim=exp.hidden_dim,
+            dropout=exp.dropout,
+            transformer_layers=exp.transformer_layers,
+            attention_heads=exp.attention_heads,
+            max_range_cm=args.max_range_cm,
+            relative_xy_scale_cm=args.relative_xy_scale_cm,
+        )
     raise ValueError(f"Unknown model_type {exp.model_type!r}")
 
 
@@ -1977,7 +2337,12 @@ def run_experiment(
     val_report_path = output_base.with_suffix(".val_report.json")
     metrics_path = output_base.with_suffix(".metrics.csv")
 
-    model = _build_model_for_experiment(exp, input_channels=input_channels, num_sensors=meta.num_sensors).to(device)
+    model = _build_model_for_experiment(
+        exp,
+        args=args,
+        input_channels=input_channels,
+        num_sensors=meta.num_sensors,
+    ).to(device)
     param_count = sum(p.numel() for p in model.parameters())
     optimizer = torch.optim.AdamW(model.parameters(), lr=exp.lr, weight_decay=exp.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
