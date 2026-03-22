@@ -1,0 +1,77 @@
+Training files: 1000
+Real smartdrive runs: 20
+
+Per-sensor range comparison
+sensor train_valid% train_q50 train_q95 real_pipeline_enabled% real_raw_pos% real_raw_q50 real_raw_q95 real_raw_zero% real_raw_neg1%
+ 0        23.6     575.4     958.0                 100.0           1.3          1.6        804.8           80.6           18.1
+ 1        81.0     561.0     908.9                   0.0          89.2        507.2        584.4            0.0           10.8
+ 2        13.4     659.5     973.5                 100.0          31.0        454.4        838.8            0.0           69.0
+ 3        80.9     565.6     919.2                   0.0          88.4        508.3        577.9            0.0           11.6
+ 4        23.3     573.3     957.5                 100.0          66.2        567.3        840.8            0.0           33.8
+ 5        90.7     485.8     841.7                   0.0          94.7        409.8        459.4            0.0            5.3
+ 6        90.9     487.7     851.0                   0.0          94.7        410.1        456.8            0.0            5.3
+ 7        89.8     480.5     831.4                   0.0          99.5        422.5        466.7            0.0            0.5
+ 8        89.4     493.4     844.4                   0.0          99.3        419.4        467.8            0.0            0.7
+ 9        20.6     652.6     969.0                 100.0          93.6        682.5        806.3            0.0            6.4
+10        30.7     542.9     949.7                 100.0          96.7        279.9        426.6            0.0            3.3
+11        30.5     541.4     947.4                 100.0          96.2        277.0        410.9            0.0            3.8
+12        18.9     674.9     969.2                 100.0          72.8        684.6        948.7            0.0           27.2
+13        41.2     687.6     972.7                 100.0          43.0        549.0        972.9            0.0           57.0
+14        40.2     677.2     970.9                 100.0          45.0        478.6        927.0            0.0           55.0
+15        23.0     576.6     960.0                 100.0          37.1        492.0        881.2            0.0           62.9
+16        23.3     573.9     959.3                 100.0          67.5        572.3        832.0            0.0           32.5
+
+Top mean distance shifts
+sensor 0: train_mean=566.3 real_mean=91.7 delta=-474.6
+sensor 11: train_mean=556.6 real_mean=288.3 delta=-268.3
+sensor 10: train_mean=558.7 real_mean=293.1 delta=-265.6
+sensor 14: train_mean=651.0 real_mean=469.4 delta=-181.6
+sensor 2: train_mean=614.3 real_mean=451.2 delta=-163.1
+sensor 13: train_mean=655.0 real_mean=575.5 delta=-79.5
+sensor 16: train_mean=566.8 real_mean=508.5 delta=-58.4
+sensor 4: train_mean=570.0 real_mean=521.8 delta=-48.1
+sensor 15: train_mean=565.6 real_mean=518.8 delta=-46.8
+sensor 9: train_mean=642.7 real_mean=672.2 delta=29.5
+
+Train valid sensors per step: mean=8.11 p50=8.0 p95=13.0 p99=15.0
+Real enabled sensors per step: mean=11.00 p50=11.0 p95=11.0 p99=11.0
+Real positive-range sensors per step: mean=6.50 p50=6.0 p95=10.0 p99=10.0
+Real nonpositive enabled sensors per step: mean=4.50 p50=5.0 p95=7.0 p99=8.0
+Train short-range hits <150 cm per step: mean=0.18 p50=0.0 p95=2.0 p99=4.0
+Real short-range hits <150 cm per step: mean=0.24 p50=0.0 p95=2.0 p99=3.0
+Train far hits >=900 cm per step: mean=0.56 p50=0.0 p95=2.0 p99=3.0
+Real far hits >=900 cm per step: mean=0.23 p50=0.0 p95=1.0 p99=2.0
+
+Train step delta XY cm: mean=20.78 p50=10.9 p95=24.3 p99=30.2
+Real step delta XY cm: mean=10.17 p50=0.0 p95=60.9 p99=106.3
+Train step delta yaw deg: mean=0.57 p50=0.3 p95=1.0 p99=1.5
+Real step delta yaw deg: mean=0.65 p50=0.0 p95=3.6 p99=7.0
+Train stationary delta_xy==0 fraction: 0.11%
+Real stationary delta_xy==0 fraction: 74.13%
+Train stationary delta_yaw==0 fraction: 0.52%
+Real stationary delta_yaw==0 fraction: 71.34%
+
+Training exact-zero lidar readings: 0.00%
+Real raw exact-zero lidar readings: 4.74%
+Real raw -1 lidar readings: 23.72%
+Real raw positive lidar readings: 71.54%
+Real pipeline-enabled fraction: 64.71%
+
+Most common unusable reasons by sensor
+sensor 0: nonpositive_range=6336, invalid_range=1749, inside_rover_bbox=782, already_marked=545, placed_new=119
+sensor 1: sensor_disabled=8613, invalid_range=1039
+sensor 2: invalid_range=6657, masked_hit=1650, already_marked=700, masked_non_contact=432, inside_rover_bbox=104
+sensor 3: sensor_disabled=8528, invalid_range=1124
+sensor 4: masked_hit=4262, invalid_range=3265, masked_non_contact=1054, already_marked=642, out_of_local_radius=288
+sensor 5: sensor_disabled=9139, invalid_range=513
+sensor 6: sensor_disabled=9145, invalid_range=507
+sensor 7: sensor_disabled=9600, invalid_range=52
+sensor 8: sensor_disabled=9581, invalid_range=71
+sensor 9: masked_hit=6748, masked_non_contact=1552, invalid_range=615, out_of_local_radius=406, already_marked=235
+sensor 10: masked_hit=7275, masked_non_contact=1735, invalid_range=315, already_marked=235, placed_new=86
+sensor 11: masked_hit=7215, masked_non_contact=1700, invalid_range=368, already_marked=287, placed_new=79
+sensor 12: masked_hit=5179, invalid_range=2628, masked_non_contact=1369, already_marked=202, out_of_local_radius=179
+sensor 13: invalid_range=5505, masked_hit=2636, already_marked=673, masked_non_contact=629, out_of_local_radius=111
+sensor 14: invalid_range=5306, masked_hit=2562, already_marked=896, masked_non_contact=609, inside_rover_bbox=151
+sensor 15: invalid_range=6069, masked_hit=2493, masked_non_contact=732, already_marked=239, out_of_local_radius=79
+sensor 16: masked_hit=4350, invalid_range=3134, masked_non_contact=1028, already_marked=725, out_of_local_radius=257

@@ -1,0 +1,47 @@
+created_utc=2026-03-09T22:26:52Z
+model_backend=gru_pt_loaded:local_train_py
+pose_units_to_cm=100.0
+grid_cell_size_cm=50.0
+path_target_lookahead_cm=500.0
+max_forward_throttle=20.0
+min_forward_throttle=18.0
+recovery_reverse_throttle=-60.0
+recovery_reverse_seconds=8
+recovery_brake_seconds=5
+stationary_timeout_sec=7
+startup_stuck_grace_sec=5.0
+stationary_move_threshold_cm=10.0
+stationary_speed_threshold=0.1
+path_direction_lookahead_cm=120.0
+path_reverse_engage_heading_deg=125.0
+path_reverse_release_heading_deg=75.0
+model_history_min_delta=5.0
+model_history_min_frames=6
+lidar_max_range_cm=1000.0
+grid_origin_x_cm=-4900.0
+grid_origin_y_cm=-4020.019600000116
+grid_width_cells=129
+grid_height_cells=129
+obstacle_padding_cells=9
+start_x_cm=300.000
+start_y_cm=1179.980
+goal_x_cm=-3700.000
+goal_y_cm=-2820.020
+sensor_layout_idx	sensor_x_cm	sensor_y_cm	sensor_yaw_deg	sensor_pitch_deg
+0	250.000	245.000	30.000	0.000
+1	325.000	75.000	20.000	-20.000
+2	325.000	0.000	0.000	0.000
+3	325.000	-75.000	-20.000	-20.000
+4	250.000	-245.000	-30.000	0.000
+5	325.000	75.000	0.000	-25.000
+6	325.000	-75.000	0.000	-25.000
+7	40.000	235.000	90.000	-20.000
+8	40.000	-235.000	-90.000	-20.000
+9	-215.000	270.000	140.000	0.000
+10	-320.000	80.000	180.000	0.000
+11	-320.000	-50.000	180.000	0.000
+12	-215.000	-215.000	-140.000	0.000
+13	325.000	75.000	20.000	-10.000
+14	325.000	-75.000	-20.000	-10.000
+15	250.000	245.000	15.000	0.000
+16	250.000	-245.000	-15.000	0.000

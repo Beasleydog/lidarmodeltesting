@@ -1,0 +1,2 @@
+step_idx	elapsed_s	attempted	trigger	planner_rebuilt	previous_path_points	raw_path_points	follow_path_points	status
+0	0.000	1	lidar	0	649	83	649	replanned

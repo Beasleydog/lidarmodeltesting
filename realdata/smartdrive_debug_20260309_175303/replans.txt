@@ -1,0 +1,12 @@
+step_idx	elapsed_s	attempted	trigger	planner_rebuilt	previous_path_points	raw_path_points	follow_path_points	status
+0	0.000	1	lidar	0	649	91	665	replanned
+1	0.402	0	none	0	665	0	665	not_attempted
+2	0.678	0	none	0	665	0	665	not_attempted
+3	0.959	0	none	0	665	0	665	not_attempted
+4	1.239	0	none	0	665	0	665	not_attempted
+5	1.505	0	none	0	665	0	665	not_attempted
+6	1.778	0	none	0	665	0	665	not_attempted
+7	2.054	0	none	0	665	0	665	not_attempted
+8	2.331	0	none	0	665	0	665	not_attempted
+9	2.650	0	none	0	665	0	665	not_attempted
+10	2.921	0	none	0	665	0	665	not_attempted
