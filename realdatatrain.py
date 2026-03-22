@@ -477,12 +477,16 @@ def evaluate(
     recall = tp / max(tp + fn, 1)
     accuracy = (tp + tn) / max(total_beams, 1)
     f1 = (2.0 * precision * recall) / max(precision + recall, 1e-12)
+    specificity = tn / max(tn + fp, 1)
+    false_positive_rate = fp / max(fp + tn, 1)
     return {
         "loss": total_loss / max(total_samples, 1),
         "accuracy": accuracy,
         "precision": precision,
         "recall": recall,
         "f1": f1,
+        "specificity": specificity,
+        "false_positive_rate": false_positive_rate,
         "threshold": threshold,
         "tn": tn,
         "fp": fp,
@@ -508,11 +512,15 @@ def _compute_binary_metrics_from_probs(
     recall = tp / max(tp + fn, 1)
     accuracy = (tp + tn) / max(total, 1)
     f1 = (2.0 * precision * recall) / max(precision + recall, 1e-12)
+    specificity = tn / max(tn + fp, 1)
+    false_positive_rate = fp / max(fp + tn, 1)
     return {
         "accuracy": accuracy,
         "precision": precision,
         "recall": recall,
         "f1": f1,
+        "specificity": specificity,
+        "false_positive_rate": false_positive_rate,
         "threshold": float(threshold),
         "tn": tn,
         "fp": fp,
@@ -528,6 +536,7 @@ def sweep_validation_thresholds(
     device: torch.device,
     device_kind: str,
     thresholds: list[float],
+    min_recall: float,
 ) -> dict[str, float | list[list[int]]]:
     model.eval()
     logits_chunks: list[np.ndarray] = []
@@ -550,19 +559,40 @@ def sweep_validation_thresholds(
     probs_np = 1.0 / (1.0 + np.exp(-logits_np))
 
     best_metrics: dict[str, float | list[list[int]]] | None = None
+    best_fallback: dict[str, float | list[list[int]]] | None = None
     for threshold in thresholds:
         metrics = _compute_binary_metrics_from_probs(probs_np, targets_np, threshold)
+        if best_fallback is None:
+            best_fallback = metrics
+        else:
+            if float(metrics["f1"]) > float(best_fallback["f1"]) + 1e-12:
+                best_fallback = metrics
+            elif (
+                abs(float(metrics["f1"]) - float(best_fallback["f1"])) <= 1e-12
+                and float(metrics["precision"]) > float(best_fallback["precision"])
+            ):
+                best_fallback = metrics
+
+        if float(metrics["recall"]) + 1e-12 < float(min_recall):
+            continue
         if best_metrics is None:
             best_metrics = metrics
             continue
-        if float(metrics["f1"]) > float(best_metrics["f1"]) + 1e-12:
+        if float(metrics["precision"]) > float(best_metrics["precision"]) + 1e-12:
             best_metrics = metrics
             continue
-        if abs(float(metrics["f1"]) - float(best_metrics["f1"])) <= 1e-12 and float(metrics["precision"]) > float(
-            best_metrics["precision"]
-        ):
-            best_metrics = metrics
+        if abs(float(metrics["precision"]) - float(best_metrics["precision"])) <= 1e-12:
+            if float(metrics["f1"]) > float(best_metrics["f1"]) + 1e-12:
+                best_metrics = metrics
+                continue
+            if (
+                abs(float(metrics["f1"]) - float(best_metrics["f1"])) <= 1e-12
+                and float(metrics["specificity"]) > float(best_metrics["specificity"])
+            ):
+                best_metrics = metrics
 
+    if best_metrics is None:
+        best_metrics = best_fallback
     if best_metrics is None:
         raise RuntimeError("Threshold sweep produced no metrics")
     return best_metrics
@@ -646,16 +676,21 @@ def train_epoch(
     precision = tp / max(tp + fp, 1)
     recall = tp / max(tp + fn, 1)
     f1 = (2.0 * precision * recall) / max(precision + recall, 1e-12)
+    specificity = (max(total_beams - tp - fp - fn, 0)) / max(max(total_beams - tp - fn, 0), 1)
+    false_positive_rate = fp / max(fp + max(total_beams - tp - fp - fn, 0), 1)
+    tn = max(total_beams - tp - fp - fn, 0)
     return {
         "loss": total_loss / max(total_samples, 1),
         "accuracy": total_correct / max(total_beams, 1),
         "precision": precision,
         "recall": recall,
         "f1": f1,
+        "specificity": specificity,
+        "false_positive_rate": false_positive_rate,
         "tp": tp,
         "fp": fp,
         "fn": fn,
-        "tn": max(total_beams - tp - fp - fn, 0),
+        "tn": tn,
         "time_s": elapsed_s,
     }
 
@@ -754,14 +789,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--relative-z-scale-cm", type=float, default=500.0)
     parser.add_argument("--pos-weight-cap", type=float, default=25.0)
     parser.add_argument("--plateau-factor", type=float, default=0.5)
-    parser.add_argument("--plateau-patience", type=int, default=3)
+    parser.add_argument("--plateau-patience", type=int, default=2)
     parser.add_argument("--min-lr", type=float, default=1e-5)
-    parser.add_argument("--early-stop-patience", type=int, default=8)
+    parser.add_argument("--early-stop-patience", type=int, default=10)
     parser.add_argument("--early-stop-min-delta", type=float, default=1e-4)
-    parser.add_argument("--eval-threshold", type=float, default=0.5)
-    parser.add_argument("--threshold-sweep-start", type=float, default=0.10)
+    parser.add_argument("--eval-threshold", type=float, default=0.7)
+    parser.add_argument("--threshold-sweep-start", type=float, default=0.60)
     parser.add_argument("--threshold-sweep-end", type=float, default=0.90)
-    parser.add_argument("--threshold-sweep-step", type=float, default=0.05)
+    parser.add_argument("--threshold-sweep-step", type=float, default=0.02)
+    parser.add_argument("--threshold-min-recall", type=float, default=0.50)
     parser.add_argument("--log-every-batches", type=int, default=20)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--balance-positive-windows", action="store_true")
@@ -821,7 +857,8 @@ def main() -> None:
                 threshold_values = sorted(set(threshold_values))
             log(
                 f"Validation threshold sweep: {threshold_values[0]:.2f}..{threshold_values[-1]:.2f} "
-                f"step~{args.threshold_sweep_step:.2f} default_eval={args.eval_threshold:.2f}"
+                f"step~{args.threshold_sweep_step:.2f} default_eval={args.eval_threshold:.2f} "
+                f"min_recall={args.threshold_min_recall:.2f}"
             )
 
             with split_path.open("w", encoding="utf-8") as fh:
@@ -859,7 +896,7 @@ def main() -> None:
                 min_lr=args.min_lr,
             )
 
-            best = {"val_loss": float("inf"), "val_f1": -1.0, "epoch": -1, "metrics": None}
+            best = {"val_loss": float("inf"), "val_f1": -1.0, "val_precision": -1.0, "epoch": -1, "metrics": None}
             epochs_without_improve = 0
             with metrics_path.open("w", encoding="utf-8", newline="") as metrics_fh:
                 writer = csv.writer(metrics_fh)
@@ -871,6 +908,8 @@ def main() -> None:
                         "train_precision",
                         "train_recall",
                         "train_f1",
+                        "train_specificity",
+                        "train_fpr",
                         "train_tn",
                         "train_fp",
                         "train_fn",
@@ -880,11 +919,14 @@ def main() -> None:
                         "val_precision",
                         "val_recall",
                         "val_f1",
+                        "val_specificity",
+                        "val_fpr",
                         "val_threshold",
                         "val_tn",
                         "val_fp",
                         "val_fn",
                         "val_tp",
+                        "best_val_precision",
                         "best_val_f1",
                         "lr",
                     ]
@@ -918,6 +960,7 @@ def main() -> None:
                         device=device,
                         device_kind=device_kind,
                         thresholds=threshold_values,
+                        min_recall=float(args.threshold_min_recall),
                     )
                     val_metrics.update(
                         {
@@ -944,6 +987,8 @@ def main() -> None:
                             train_metrics["precision"],
                             train_metrics["recall"],
                             train_metrics["f1"],
+                            train_metrics["specificity"],
+                            train_metrics["false_positive_rate"],
                             train_metrics["tn"],
                             train_metrics["fp"],
                             train_metrics["fn"],
@@ -953,11 +998,14 @@ def main() -> None:
                             val_metrics["precision"],
                             val_metrics["recall"],
                             val_metrics["f1"],
+                            val_metrics["specificity"],
+                            val_metrics["false_positive_rate"],
                             val_metrics["threshold"],
                             val_metrics["tn"],
                             val_metrics["fp"],
                             val_metrics["fn"],
                             val_metrics["tp"],
+                            max(float(best["val_precision"]), float(val_metrics["precision"])),
                             max(float(best["val_f1"]), float(val_metrics["f1"])),
                             current_lr,
                         ]
@@ -967,22 +1015,31 @@ def main() -> None:
                     log(
                         f"epoch {epoch:03d}/{args.epochs:03d} "
                         f"train_loss={train_metrics['loss']:.5f} train_acc={train_metrics['accuracy']:.4f} "
-                        f"train_f1={train_metrics['f1']:.4f} "
+                        f"train_f1={train_metrics['f1']:.4f} train_spec={train_metrics['specificity']:.4f} "
                         f"train_cm=[[{int(train_metrics['tn'])},{int(train_metrics['fp'])}],"
                         f"[{int(train_metrics['fn'])},{int(train_metrics['tp'])}]] "
                         f"val_loss={float(val_metrics['loss']):.5f} val_acc={float(val_metrics['accuracy']):.4f} "
                         f"val_prec={float(val_metrics['precision']):.4f} val_recall={float(val_metrics['recall']):.4f} "
-                        f"val_f1={float(val_metrics['f1']):.4f} thr={float(val_metrics['threshold']):.2f} "
+                        f"val_f1={float(val_metrics['f1']):.4f} val_spec={float(val_metrics['specificity']):.4f} "
+                        f"val_fpr={float(val_metrics['false_positive_rate']):.4f} "
+                        f"thr={float(val_metrics['threshold']):.2f} "
                         f"val_cm=[[{int(val_metrics['tn'])},{int(val_metrics['fp'])}],"
                         f"[{int(val_metrics['fn'])},{int(val_metrics['tp'])}]] "
                         f"lr={current_lr:.6f}"
                     )
 
-                    improved = float(val_metrics["f1"]) > (float(best["val_f1"]) + float(args.early_stop_min_delta))
+                    improved = False
+                    if float(val_metrics["precision"]) > (float(best["val_precision"]) + float(args.early_stop_min_delta)):
+                        improved = True
+                    elif abs(float(val_metrics["precision"]) - float(best["val_precision"])) <= float(
+                        args.early_stop_min_delta
+                    ) and float(val_metrics["f1"]) > (float(best["val_f1"]) + float(args.early_stop_min_delta)):
+                        improved = True
                     if improved:
                         best = {
                             "val_loss": float(val_metrics["loss"]),
                             "val_f1": float(val_metrics["f1"]),
+                            "val_precision": float(val_metrics["precision"]),
                             "epoch": epoch,
                             "metrics": val_metrics,
                         }
@@ -1006,6 +1063,7 @@ def main() -> None:
                                 "sample_positive_fraction": meta.sample_positive_fraction,
                                 "pos_weight": meta.pos_weight,
                                 "best_val_loss": best["val_loss"],
+                                "best_val_precision": best["val_precision"],
                                 "best_val_f1": best["val_f1"],
                                 "best_threshold": float(val_metrics["threshold"]),
                                 "best_epoch": best["epoch"],
@@ -1017,6 +1075,7 @@ def main() -> None:
                                 {
                                     "best_epoch": best["epoch"],
                                     "best_val_loss": best["val_loss"],
+                                    "best_val_precision": best["val_precision"],
                                     "best_val_f1": best["val_f1"],
                                     "best_threshold": float(val_metrics["threshold"]),
                                     "metrics": best["metrics"],
@@ -1025,8 +1084,9 @@ def main() -> None:
                                 indent=2,
                             )
                         log(
-                            f"New best validation F1 at epoch {epoch:03d}: "
-                            f"{best['val_f1']:.6f} at threshold {float(val_metrics['threshold']):.2f}. "
+                            f"New best validation precision at epoch {epoch:03d}: "
+                            f"{best['val_precision']:.6f} with F1={best['val_f1']:.6f} "
+                            f"at threshold {float(val_metrics['threshold']):.2f}. "
                             f"Saved checkpoint -> {args.output}"
                         )
                     else:
@@ -1038,6 +1098,7 @@ def main() -> None:
                         if epochs_without_improve >= int(args.early_stop_patience):
                             log(
                                 f"Early stopping at epoch {epoch:03d}: "
+                                f"best_val_precision={best['val_precision']:.6f} "
                                 f"best_val_f1={best['val_f1']:.6f} from epoch {best['epoch']:03d}"
                             )
                             break
@@ -1047,6 +1108,43 @@ def main() -> None:
             log_plain(f"saved metrics: {metrics_path}")
             log_plain(f"saved val report: {val_report_path}")
             log_plain(f"saved log: {log_path}")
+            if best["metrics"] is not None:
+                best_metrics = best["metrics"]
+                log_plain("FINAL_SUMMARY_BEGIN")
+                log_plain(
+                    "config "
+                    f"history_steps={args.history_steps} batch_size={args.batch_size} lr={args.lr} "
+                    f"dropout={args.dropout} weight_decay={args.weight_decay} "
+                    f"pos_weight={meta.pos_weight:.4f} min_recall={args.threshold_min_recall:.2f} "
+                    f"threshold_sweep={args.threshold_sweep_start:.2f}:{args.threshold_sweep_step:.2f}:{args.threshold_sweep_end:.2f}"
+                )
+                log_plain(
+                    "data "
+                    f"train_files={len(meta.train_files)} val_files={len(meta.val_files)} "
+                    f"train_windows={meta.train_windows} val_windows={meta.val_windows} "
+                    f"beam_positive_fraction={meta.beam_positive_fraction:.4f} "
+                    f"window_positive_fraction={meta.sample_positive_fraction:.4f}"
+                )
+                log_plain(
+                    "best "
+                    f"epoch={best['epoch']} val_loss={best['val_loss']:.6f} "
+                    f"val_precision={best['val_precision']:.6f} val_f1={best['val_f1']:.6f} "
+                    f"threshold={float(best_metrics['threshold']):.2f} "
+                    f"precision={float(best_metrics['precision']):.4f} "
+                    f"recall={float(best_metrics['recall']):.4f} "
+                    f"specificity={float(best_metrics['specificity']):.4f} "
+                    f"fpr={float(best_metrics['false_positive_rate']):.4f}"
+                )
+                log_plain(
+                    "best_confusion "
+                    f"tn={int(best_metrics['tn'])} fp={int(best_metrics['fp'])} "
+                    f"fn={int(best_metrics['fn'])} tp={int(best_metrics['tp'])}"
+                )
+                log_plain(
+                    "artifacts "
+                    f"checkpoint={args.output} split={split_path} metrics={metrics_path} val_report={val_report_path} log={log_path}"
+                )
+                log_plain("FINAL_SUMMARY_END")
         finally:
             set_log_file(None)
 
