@@ -59,6 +59,26 @@ def _jsonable_args(args: argparse.Namespace) -> dict[str, object]:
     return out
 
 
+def _parse_float(value: object, default: float, field_name: str, file_name: str, row_idx: int) -> float:
+    if value is None:
+        return float(default)
+    text = str(value).strip()
+    if not text:
+        return float(default)
+    lowered = text.lower()
+    if lowered in {"nan", "none", "null", "na", "n/a"}:
+        return float(default)
+    try:
+        parsed = float(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"Failed to parse float in {file_name} row {row_idx} field {field_name}: {text!r}"
+        ) from exc
+    if not np.isfinite(parsed):
+        return float(default)
+    return float(parsed)
+
+
 def _sensor_columns(fieldnames: list[str]) -> list[str]:
     cols = [name for name in fieldnames if name.startswith("lidar_") and name.endswith("_cm")]
     if not cols:
@@ -113,16 +133,23 @@ def _read_cleanlog_pair(raw_path: Path, label_path: Path) -> RealSequence:
                     f"{key} raw={raw_value!r} label={label_value!r}"
                 )
 
-        pose_xyz[idx, 0] = float(raw_row["rover_pos_x"])
-        pose_xyz[idx, 1] = float(raw_row["rover_pos_y"])
-        pose_xyz[idx, 2] = float(raw_row["rover_pos_z"])
-        angles[idx, 0] = float(raw_row["heading"])
-        angles[idx, 1] = float(raw_row["pitch"])
-        angles[idx, 2] = float(raw_row["roll"])
+        pose_xyz[idx, 0] = _parse_float(raw_row.get("rover_pos_x"), 0.0, "rover_pos_x", raw_path.name, idx)
+        pose_xyz[idx, 1] = _parse_float(raw_row.get("rover_pos_y"), 0.0, "rover_pos_y", raw_path.name, idx)
+        pose_xyz[idx, 2] = _parse_float(raw_row.get("rover_pos_z"), 0.0, "rover_pos_z", raw_path.name, idx)
+        angles[idx, 0] = _parse_float(raw_row.get("heading"), 0.0, "heading", raw_path.name, idx)
+        angles[idx, 1] = _parse_float(raw_row.get("pitch"), 0.0, "pitch", raw_path.name, idx)
+        angles[idx, 2] = _parse_float(raw_row.get("roll"), 0.0, "roll", raw_path.name, idx)
 
         for sensor_idx, sensor_col in enumerate(sensor_columns):
-            lidar_cm[idx, sensor_idx] = float(raw_row[sensor_col])
-            labels[idx, sensor_idx] = float(label_row[f"{sensor_col}_is_obstacle"])
+            lidar_cm[idx, sensor_idx] = _parse_float(raw_row.get(sensor_col), -1.0, sensor_col, raw_path.name, idx)
+            label_value = _parse_float(
+                label_row.get(f"{sensor_col}_is_obstacle"),
+                0.0,
+                f"{sensor_col}_is_obstacle",
+                label_path.name,
+                idx,
+            )
+            labels[idx, sensor_idx] = 1.0 if label_value > 0.5 else 0.0
 
     return RealSequence(
         name=raw_path.name,
