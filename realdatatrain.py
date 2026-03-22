@@ -52,6 +52,24 @@ class DatasetMeta:
     beam_positive_fraction: float
 
 
+@dataclass(frozen=True)
+class ExperimentConfig:
+    name: str
+    model_type: str
+    hidden_dim: int
+    dropout: float
+    lr: float
+    weight_decay: float
+    pos_weight_scale: float
+    threshold_min_recall: float
+    threshold_sweep_start: float
+    threshold_sweep_end: float
+    threshold_sweep_step: float
+    temporal_layers: int = 1
+    transformer_layers: int = 2
+    attention_heads: int = 4
+
+
 def _jsonable_args(args: argparse.Namespace) -> dict[str, object]:
     out: dict[str, object] = {}
     for key, value in vars(args).items():
@@ -456,6 +474,134 @@ class TemporalBeamTransformerClassifier(nn.Module):
         return logits
 
 
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        groups = 8 if out_ch >= 8 and out_ch % 8 == 0 else 1
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(groups, out_ch),
+            nn.GELU(),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(groups, out_ch),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class SmallTemporalUNet(nn.Module):
+    def __init__(self, in_channels: int, num_sensors: int, base_channels: int = 32, dropout: float = 0.10):
+        super().__init__()
+        del num_sensors
+        self.model_type = "real_cleanlog_temporal_unet"
+        self.in_channels = int(in_channels)
+        self.base_channels = int(base_channels)
+
+        self.enc1 = ConvBlock(in_channels, base_channels)
+        self.enc2 = ConvBlock(base_channels, base_channels * 2)
+        self.enc3 = ConvBlock(base_channels * 2, base_channels * 4)
+        self.bottleneck = ConvBlock(base_channels * 4, base_channels * 4)
+        self.pool = nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1))
+        self.drop = nn.Dropout2d(dropout)
+        self.dec3 = ConvBlock(base_channels * 8, base_channels * 2)
+        self.dec2 = ConvBlock(base_channels * 4, base_channels)
+        self.dec1 = ConvBlock(base_channels * 2, base_channels)
+        self.head = nn.Conv2d(base_channels, 1, kernel_size=1)
+
+    def _upsample_to(self, x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        return F.interpolate(x, size=ref.shape[-2:], mode="bilinear", align_corners=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(self.drop(e1)))
+        e3 = self.enc3(self.pool(self.drop(e2)))
+        b = self.bottleneck(self.pool(self.drop(e3)))
+
+        d3 = self._upsample_to(b, e3)
+        d3 = self.dec3(torch.cat([d3, e3], dim=1))
+        d2 = self._upsample_to(d3, e2)
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        d1 = self._upsample_to(d2, e1)
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+        return self.head(d1).squeeze(1)[:, -1, :]
+
+
+class TemporalBeamGRUClassifier(nn.Module):
+    def __init__(self, in_channels: int, num_sensors: int, hidden_dim: int = 64, dropout: float = 0.15):
+        super().__init__()
+        self.model_type = "real_cleanlog_temporal_beam_gru"
+        self.in_channels = int(in_channels)
+        self.num_sensors = int(num_sensors)
+        self.hidden_dim = int(hidden_dim)
+        temporal_hidden = max(self.hidden_dim // 2, 16)
+
+        sensor_geom = MODEL_SENSOR_YAW_PITCH_DEG[: self.num_sensors].astype(np.float32)
+        sensor_geom_rad = np.deg2rad(sensor_geom)
+        sensor_geom_feats = np.concatenate(
+            [
+                np.sin(sensor_geom_rad[:, :1]),
+                np.cos(sensor_geom_rad[:, :1]),
+                np.sin(sensor_geom_rad[:, 1:2]),
+                np.cos(sensor_geom_rad[:, 1:2]),
+            ],
+            axis=1,
+        ).astype(np.float32)
+        self.register_buffer("sensor_geom_feats", torch.from_numpy(sensor_geom_feats), persistent=False)
+        self.register_buffer("sensor_ids", torch.arange(self.num_sensors, dtype=torch.long), persistent=False)
+
+        self.temporal_input = nn.Sequential(
+            nn.Linear(self.in_channels, temporal_hidden),
+            nn.LayerNorm(temporal_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.temporal_gru = nn.GRU(
+            input_size=temporal_hidden,
+            hidden_size=temporal_hidden,
+            num_layers=2,
+            batch_first=True,
+            dropout=dropout,
+            bidirectional=True,
+        )
+        self.current_mlp = nn.Sequential(
+            nn.Linear(self.in_channels, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.sensor_embedding = nn.Embedding(self.num_sensors, self.hidden_dim)
+        self.sensor_geom_mlp = nn.Sequential(
+            nn.Linear(4, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim * 2),
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, channels, time_steps, sensor_count = x.shape
+        beam_sequences = x.permute(0, 3, 2, 1).reshape(batch_size * sensor_count, time_steps, channels)
+        temporal_inputs = self.temporal_input(beam_sequences)
+        temporal_outputs, _ = self.temporal_gru(temporal_inputs)
+        temporal_tokens = temporal_outputs[:, -1, :].reshape(batch_size, sensor_count, self.hidden_dim)
+
+        current_features = x[:, :, -1, :].permute(0, 2, 1).reshape(batch_size * sensor_count, channels)
+        current_tokens = self.current_mlp(current_features).reshape(batch_size, sensor_count, self.hidden_dim)
+        beam_embed = self.sensor_embedding(self.sensor_ids.to(device=x.device)).unsqueeze(0).expand(batch_size, -1, -1)
+        geom_embed = self.sensor_geom_mlp(self.sensor_geom_feats.to(device=x.device)).unsqueeze(0).expand(batch_size, -1, -1)
+
+        fused = torch.cat([temporal_tokens + beam_embed + geom_embed, current_tokens], dim=-1)
+        return self.head(fused).squeeze(-1)
+
+
 def build_sampler(dataset: RealLidarSequenceDataset) -> WeightedRandomSampler | None:
     sample_has_obstacle = dataset.current_has_obstacle.astype(np.float32)
     pos = float(sample_has_obstacle.sum())
@@ -821,6 +967,127 @@ def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, Dat
     return train_loader, val_loader, meta, train_sequences[0].sensor_names, train_ds.input_channels
 
 
+def build_experiment_suite() -> list[ExperimentConfig]:
+    return [
+        ExperimentConfig(
+            name="conv_unet_balanced",
+            model_type="conv_unet",
+            hidden_dim=32,
+            dropout=0.10,
+            lr=2e-3,
+            weight_decay=1e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.60,
+            threshold_sweep_end=0.95,
+            threshold_sweep_step=0.02,
+        ),
+        ExperimentConfig(
+            name="conv_unet_strict",
+            model_type="conv_unet",
+            hidden_dim=32,
+            dropout=0.12,
+            lr=2e-3,
+            weight_decay=2e-4,
+            pos_weight_scale=0.85,
+            threshold_min_recall=0.45,
+            threshold_sweep_start=0.70,
+            threshold_sweep_end=0.98,
+            threshold_sweep_step=0.02,
+        ),
+        ExperimentConfig(
+            name="beam_gru_mid",
+            model_type="beam_gru",
+            hidden_dim=64,
+            dropout=0.15,
+            lr=1e-3,
+            weight_decay=1e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.60,
+            threshold_sweep_end=0.95,
+            threshold_sweep_step=0.02,
+        ),
+        ExperimentConfig(
+            name="beam_gru_strict",
+            model_type="beam_gru",
+            hidden_dim=96,
+            dropout=0.18,
+            lr=1e-3,
+            weight_decay=2e-4,
+            pos_weight_scale=0.80,
+            threshold_min_recall=0.45,
+            threshold_sweep_start=0.70,
+            threshold_sweep_end=0.98,
+            threshold_sweep_step=0.02,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_mid",
+            model_type="beam_transformer",
+            hidden_dim=96,
+            dropout=0.15,
+            lr=1e-3,
+            weight_decay=1e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.60,
+            threshold_sweep_end=0.95,
+            threshold_sweep_step=0.02,
+            temporal_layers=2,
+            transformer_layers=3,
+            attention_heads=4,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_strict",
+            model_type="beam_transformer",
+            hidden_dim=96,
+            dropout=0.18,
+            lr=1e-3,
+            weight_decay=2e-4,
+            pos_weight_scale=0.80,
+            threshold_min_recall=0.45,
+            threshold_sweep_start=0.70,
+            threshold_sweep_end=0.98,
+            threshold_sweep_step=0.02,
+            temporal_layers=2,
+            transformer_layers=3,
+            attention_heads=4,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_large",
+            model_type="beam_transformer",
+            hidden_dim=128,
+            dropout=0.18,
+            lr=8e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=0.85,
+            threshold_min_recall=0.50,
+            threshold_sweep_start=0.70,
+            threshold_sweep_end=0.98,
+            threshold_sweep_step=0.02,
+            temporal_layers=2,
+            transformer_layers=4,
+            attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="beam_transformer_large_strict",
+            model_type="beam_transformer",
+            hidden_dim=128,
+            dropout=0.20,
+            lr=8e-4,
+            weight_decay=3e-4,
+            pos_weight_scale=0.70,
+            threshold_min_recall=0.40,
+            threshold_sweep_start=0.75,
+            threshold_sweep_end=0.99,
+            threshold_sweep_step=0.01,
+            temporal_layers=2,
+            transformer_layers=4,
+            attention_heads=8,
+        ),
+    ]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a real cleanlog beam classifier on the last N lidar frames plus the current frame."
@@ -863,7 +1130,251 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every-batches", type=int, default=20)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--balance-positive-windows", action="store_true")
+    parser.add_argument("--suite-epochs", type=int, default=14)
+    parser.add_argument("--suite-early-stop-patience", type=int, default=5)
     return parser.parse_args()
+
+
+def _build_model_for_experiment(
+    exp: ExperimentConfig,
+    input_channels: int,
+    num_sensors: int,
+) -> nn.Module:
+    if exp.model_type == "conv_unet":
+        return SmallTemporalUNet(
+            in_channels=input_channels,
+            num_sensors=num_sensors,
+            base_channels=exp.hidden_dim,
+            dropout=exp.dropout,
+        )
+    if exp.model_type == "beam_gru":
+        return TemporalBeamGRUClassifier(
+            in_channels=input_channels,
+            num_sensors=num_sensors,
+            hidden_dim=exp.hidden_dim,
+            dropout=exp.dropout,
+        )
+    if exp.model_type == "beam_transformer":
+        return TemporalBeamTransformerClassifier(
+            in_channels=input_channels,
+            num_sensors=num_sensors,
+            hidden_dim=exp.hidden_dim,
+            dropout=exp.dropout,
+            temporal_layers=exp.temporal_layers,
+            transformer_layers=exp.transformer_layers,
+            attention_heads=exp.attention_heads,
+        )
+    raise ValueError(f"Unknown model_type {exp.model_type!r}")
+
+
+def _build_threshold_values(start: float, end: float, step: float) -> list[float]:
+    values = np.arange(float(start), float(end) + (0.5 * float(step)), float(step), dtype=np.float32)
+    values = np.clip(values, 0.0, 1.0)
+    return sorted(set(float(round(v, 6)) for v in values.tolist()))
+
+
+def run_experiment(
+    exp: ExperimentConfig,
+    args: argparse.Namespace,
+    device: torch.device,
+    device_kind: str,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    meta: DatasetMeta,
+    sensor_names: tuple[str, ...],
+    input_channels: int,
+) -> dict[str, object]:
+    output_base = args.output.parent / f"{args.output.stem}.{exp.name}"
+    ckpt_path = output_base.with_suffix(".pt")
+    val_report_path = output_base.with_suffix(".val_report.json")
+    metrics_path = output_base.with_suffix(".metrics.csv")
+
+    model = _build_model_for_experiment(exp, input_channels=input_channels, num_sensors=meta.num_sensors).to(device)
+    param_count = sum(p.numel() for p in model.parameters())
+    optimizer = torch.optim.AdamW(model.parameters(), lr=exp.lr, weight_decay=exp.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=args.plateau_factor,
+        patience=args.plateau_patience,
+        min_lr=args.min_lr,
+    )
+    threshold_values = _build_threshold_values(
+        exp.threshold_sweep_start,
+        exp.threshold_sweep_end,
+        exp.threshold_sweep_step,
+    )
+    scaled_pos_weight = max(1.0, float(meta.pos_weight) * float(exp.pos_weight_scale))
+
+    best = {"val_loss": float("inf"), "val_f1": -1.0, "val_precision": -1.0, "epoch": -1, "metrics": None}
+    epochs_without_improve = 0
+
+    with metrics_path.open("w", encoding="utf-8", newline="") as metrics_fh:
+        writer = csv.writer(metrics_fh)
+        writer.writerow(
+            [
+                "epoch",
+                "train_loss",
+                "train_acc",
+                "train_precision",
+                "train_recall",
+                "train_f1",
+                "val_loss",
+                "val_acc",
+                "val_precision",
+                "val_recall",
+                "val_f1",
+                "val_specificity",
+                "val_fpr",
+                "val_threshold",
+            ]
+        )
+
+        for epoch in range(1, args.suite_epochs + 1):
+            train_metrics = train_epoch(
+                model=model,
+                loader=train_loader,
+                optimizer=optimizer,
+                device=device,
+                device_kind=device_kind,
+                epoch_idx=epoch,
+                total_epochs=args.suite_epochs,
+                pos_weight=scaled_pos_weight,
+                grad_clip_norm=args.grad_clip_norm,
+                use_amp=bool(args.amp),
+                log_every_batches=0,
+            )
+            val_metrics = evaluate(
+                model=model,
+                loader=val_loader,
+                device=device,
+                device_kind=device_kind,
+                pos_weight=scaled_pos_weight,
+                decision_threshold=float(exp.threshold_sweep_start),
+            )
+            sweep_metrics = sweep_validation_thresholds(
+                model=model,
+                loader=val_loader,
+                device=device,
+                device_kind=device_kind,
+                thresholds=threshold_values,
+                min_recall=float(exp.threshold_min_recall),
+            )
+            val_metrics.update(
+                {
+                    "accuracy": sweep_metrics["accuracy"],
+                    "precision": sweep_metrics["precision"],
+                    "recall": sweep_metrics["recall"],
+                    "f1": sweep_metrics["f1"],
+                    "specificity": sweep_metrics["specificity"],
+                    "false_positive_rate": sweep_metrics["false_positive_rate"],
+                    "threshold": sweep_metrics["threshold"],
+                    "tn": sweep_metrics["tn"],
+                    "fp": sweep_metrics["fp"],
+                    "fn": sweep_metrics["fn"],
+                    "tp": sweep_metrics["tp"],
+                    "confusion_matrix": sweep_metrics["confusion_matrix"],
+                }
+            )
+            scheduler.step(float(val_metrics["loss"]))
+
+            writer.writerow(
+                [
+                    epoch,
+                    train_metrics["loss"],
+                    train_metrics["accuracy"],
+                    train_metrics["precision"],
+                    train_metrics["recall"],
+                    train_metrics["f1"],
+                    val_metrics["loss"],
+                    val_metrics["accuracy"],
+                    val_metrics["precision"],
+                    val_metrics["recall"],
+                    val_metrics["f1"],
+                    val_metrics["specificity"],
+                    val_metrics["false_positive_rate"],
+                    val_metrics["threshold"],
+                ]
+            )
+            metrics_fh.flush()
+
+            improved = False
+            if float(val_metrics["precision"]) > (float(best["val_precision"]) + float(args.early_stop_min_delta)):
+                improved = True
+            elif abs(float(val_metrics["precision"]) - float(best["val_precision"])) <= float(
+                args.early_stop_min_delta
+            ) and float(val_metrics["f1"]) > (float(best["val_f1"]) + float(args.early_stop_min_delta)):
+                improved = True
+            if improved:
+                best = {
+                    "val_loss": float(val_metrics["loss"]),
+                    "val_f1": float(val_metrics["f1"]),
+                    "val_precision": float(val_metrics["precision"]),
+                    "epoch": epoch,
+                    "metrics": dict(val_metrics),
+                }
+                epochs_without_improve = 0
+                checkpoint = {
+                    "model_state_dict": model.state_dict(),
+                    "model_config": {
+                        "model_type": model.model_type,
+                        "hidden_dim": exp.hidden_dim,
+                        "dropout": exp.dropout,
+                        "num_sensors": meta.num_sensors,
+                        "history_steps": meta.history_steps,
+                    },
+                    "meta": {
+                        "experiment": exp.name,
+                        "sensor_names": list(sensor_names),
+                        "best_val_precision": best["val_precision"],
+                        "best_val_f1": best["val_f1"],
+                        "best_threshold": float(val_metrics["threshold"]),
+                        "best_epoch": best["epoch"],
+                    },
+                }
+                save_checkpoint_for_device(checkpoint, ckpt_path, device_kind)
+                with val_report_path.open("w", encoding="utf-8") as fh:
+                    json.dump(
+                        {
+                            "experiment": exp.name,
+                            "best_epoch": best["epoch"],
+                            "best_val_loss": best["val_loss"],
+                            "best_val_precision": best["val_precision"],
+                            "best_val_f1": best["val_f1"],
+                            "best_threshold": float(val_metrics["threshold"]),
+                            "metrics": best["metrics"],
+                        },
+                        fh,
+                        indent=2,
+                    )
+            else:
+                epochs_without_improve += 1
+                if epochs_without_improve >= int(args.suite_early_stop_patience):
+                    break
+
+    if best["metrics"] is None:
+        raise RuntimeError(f"Experiment {exp.name} produced no best metrics")
+
+    return {
+        "name": exp.name,
+        "model_type": exp.model_type,
+        "params": param_count,
+        "hidden_dim": exp.hidden_dim,
+        "dropout": exp.dropout,
+        "lr": exp.lr,
+        "weight_decay": exp.weight_decay,
+        "pos_weight_scale": exp.pos_weight_scale,
+        "threshold_min_recall": exp.threshold_min_recall,
+        "threshold_range": [exp.threshold_sweep_start, exp.threshold_sweep_end, exp.threshold_sweep_step],
+        "best_epoch": int(best["epoch"]),
+        "best_val_loss": float(best["val_loss"]),
+        "best_val_precision": float(best["val_precision"]),
+        "best_val_f1": float(best["val_f1"]),
+        "best_metrics": best["metrics"],
+        "checkpoint": str(ckpt_path),
+        "metrics_csv": str(metrics_path),
+        "val_report": str(val_report_path),
+    }
 
 
 def main() -> None:
@@ -906,22 +1417,7 @@ def main() -> None:
                 f"xy_offset=[{-args.xy_offset_max_cm:.1f},{args.xy_offset_max_cm:.1f}]cm "
                 f"z_offset=[{-args.z_offset_max_cm:.1f},{args.z_offset_max_cm:.1f}]cm"
             )
-            threshold_values = np.arange(
-                float(args.threshold_sweep_start),
-                float(args.threshold_sweep_end) + (0.5 * float(args.threshold_sweep_step)),
-                float(args.threshold_sweep_step),
-                dtype=np.float32,
-            )
-            threshold_values = np.clip(threshold_values, 0.0, 1.0)
-            threshold_values = sorted(set(float(round(v, 6)) for v in threshold_values.tolist()))
-            if float(args.eval_threshold) not in threshold_values:
-                threshold_values.append(float(args.eval_threshold))
-                threshold_values = sorted(set(threshold_values))
-            log(
-                f"Validation threshold sweep: {threshold_values[0]:.2f}..{threshold_values[-1]:.2f} "
-                f"step~{args.threshold_sweep_step:.2f} default_eval={args.eval_threshold:.2f} "
-                f"min_recall={args.threshold_min_recall:.2f}"
-            )
+            log("Running experiment suite with compact output; per-batch logs are suppressed.")
 
             with split_path.open("w", encoding="utf-8") as fh:
                 json.dump(
@@ -943,283 +1439,104 @@ def main() -> None:
                     indent=2,
                 )
             log(f"Wrote split manifest: {split_path}")
-
-            model = TemporalBeamTransformerClassifier(
-                in_channels=input_channels,
-                num_sensors=meta.num_sensors,
-                hidden_dim=args.base_channels,
-                dropout=args.dropout,
-                temporal_layers=args.temporal_layers,
-                transformer_layers=args.transformer_layers,
-                attention_heads=args.attention_heads,
-            ).to(device)
-            param_count = sum(p.numel() for p in model.parameters())
-            log(
-                f"Model summary: type={model.model_type} hidden_dim={args.base_channels} "
-                f"temporal_layers={args.temporal_layers} transformer_layers={args.transformer_layers} "
-                f"attention_heads={args.attention_heads} dropout={args.dropout:.2f} params={param_count}"
-            )
-            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode="min",
-                factor=args.plateau_factor,
-                patience=args.plateau_patience,
-                min_lr=args.min_lr,
-            )
-
-            best = {"val_loss": float("inf"), "val_f1": -1.0, "val_precision": -1.0, "epoch": -1, "metrics": None}
-            epochs_without_improve = 0
-            with metrics_path.open("w", encoding="utf-8", newline="") as metrics_fh:
-                writer = csv.writer(metrics_fh)
-                writer.writerow(
-                    [
-                        "epoch",
-                        "train_loss",
-                        "train_acc",
-                        "train_precision",
-                        "train_recall",
-                        "train_f1",
-                        "train_specificity",
-                        "train_fpr",
-                        "train_tn",
-                        "train_fp",
-                        "train_fn",
-                        "train_tp",
-                        "val_loss",
-                        "val_acc",
-                        "val_precision",
-                        "val_recall",
-                        "val_f1",
-                        "val_specificity",
-                        "val_fpr",
-                        "val_threshold",
-                        "val_tn",
-                        "val_fp",
-                        "val_fn",
-                        "val_tp",
-                        "best_val_precision",
-                        "best_val_f1",
-                        "lr",
-                    ]
+            suite_results: list[dict[str, object]] = []
+            for exp in build_experiment_suite():
+                log(
+                    f"Experiment start: {exp.name} model={exp.model_type} hidden={exp.hidden_dim} "
+                    f"dropout={exp.dropout:.2f} lr={exp.lr:.5f} pos_weight_scale={exp.pos_weight_scale:.2f} "
+                    f"recall_floor={exp.threshold_min_recall:.2f}"
                 )
-
-                for epoch in range(1, args.epochs + 1):
-                    train_metrics = train_epoch(
-                        model=model,
-                        loader=train_loader,
-                        optimizer=optimizer,
-                        device=device,
-                        device_kind=device_kind,
-                        epoch_idx=epoch,
-                        total_epochs=args.epochs,
-                        pos_weight=meta.pos_weight,
-                        grad_clip_norm=args.grad_clip_norm,
-                        use_amp=bool(args.amp),
-                        log_every_batches=args.log_every_batches,
-                    )
-                    val_metrics = evaluate(
-                        model=model,
-                        loader=val_loader,
-                        device=device,
-                        device_kind=device_kind,
-                        pos_weight=meta.pos_weight,
-                        decision_threshold=float(args.eval_threshold),
-                    )
-                    sweep_metrics = sweep_validation_thresholds(
-                        model=model,
-                        loader=val_loader,
-                        device=device,
-                        device_kind=device_kind,
-                        thresholds=threshold_values,
-                        min_recall=float(args.threshold_min_recall),
-                    )
-                    val_metrics.update(
-                        {
-                            "accuracy": sweep_metrics["accuracy"],
-                            "precision": sweep_metrics["precision"],
-                            "recall": sweep_metrics["recall"],
-                            "f1": sweep_metrics["f1"],
-                            "threshold": sweep_metrics["threshold"],
-                            "tn": sweep_metrics["tn"],
-                            "fp": sweep_metrics["fp"],
-                            "fn": sweep_metrics["fn"],
-                            "tp": sweep_metrics["tp"],
-                            "confusion_matrix": sweep_metrics["confusion_matrix"],
-                        }
-                    )
-                    scheduler.step(float(val_metrics["loss"]))
-
-                    current_lr = float(optimizer.param_groups[0]["lr"])
-                    writer.writerow(
-                        [
-                            epoch,
-                            train_metrics["loss"],
-                            train_metrics["accuracy"],
-                            train_metrics["precision"],
-                            train_metrics["recall"],
-                            train_metrics["f1"],
-                            train_metrics["specificity"],
-                            train_metrics["false_positive_rate"],
-                            train_metrics["tn"],
-                            train_metrics["fp"],
-                            train_metrics["fn"],
-                            train_metrics["tp"],
-                            val_metrics["loss"],
-                            val_metrics["accuracy"],
-                            val_metrics["precision"],
-                            val_metrics["recall"],
-                            val_metrics["f1"],
-                            val_metrics["specificity"],
-                            val_metrics["false_positive_rate"],
-                            val_metrics["threshold"],
-                            val_metrics["tn"],
-                            val_metrics["fp"],
-                            val_metrics["fn"],
-                            val_metrics["tp"],
-                            max(float(best["val_precision"]), float(val_metrics["precision"])),
-                            max(float(best["val_f1"]), float(val_metrics["f1"])),
-                            current_lr,
-                        ]
-                    )
-                    metrics_fh.flush()
-
-                    log(
-                        f"epoch {epoch:03d}/{args.epochs:03d} "
-                        f"train_loss={train_metrics['loss']:.5f} train_acc={train_metrics['accuracy']:.4f} "
-                        f"train_f1={train_metrics['f1']:.4f} train_spec={train_metrics['specificity']:.4f} "
-                        f"train_cm=[[{int(train_metrics['tn'])},{int(train_metrics['fp'])}],"
-                        f"[{int(train_metrics['fn'])},{int(train_metrics['tp'])}]] "
-                        f"val_loss={float(val_metrics['loss']):.5f} val_acc={float(val_metrics['accuracy']):.4f} "
-                        f"val_prec={float(val_metrics['precision']):.4f} val_recall={float(val_metrics['recall']):.4f} "
-                        f"val_f1={float(val_metrics['f1']):.4f} val_spec={float(val_metrics['specificity']):.4f} "
-                        f"val_fpr={float(val_metrics['false_positive_rate']):.4f} "
-                        f"thr={float(val_metrics['threshold']):.2f} "
-                        f"val_cm=[[{int(val_metrics['tn'])},{int(val_metrics['fp'])}],"
-                        f"[{int(val_metrics['fn'])},{int(val_metrics['tp'])}]] "
-                        f"lr={current_lr:.6f}"
-                    )
-
-                    improved = False
-                    if float(val_metrics["precision"]) > (float(best["val_precision"]) + float(args.early_stop_min_delta)):
-                        improved = True
-                    elif abs(float(val_metrics["precision"]) - float(best["val_precision"])) <= float(
-                        args.early_stop_min_delta
-                    ) and float(val_metrics["f1"]) > (float(best["val_f1"]) + float(args.early_stop_min_delta)):
-                        improved = True
-                    if improved:
-                        best = {
-                            "val_loss": float(val_metrics["loss"]),
-                            "val_f1": float(val_metrics["f1"]),
-                            "val_precision": float(val_metrics["precision"]),
-                            "epoch": epoch,
-                            "metrics": val_metrics,
-                        }
-                        epochs_without_improve = 0
-                        checkpoint = {
-                            "model_state_dict": model.state_dict(),
-                            "model_config": {
-                                "model_type": model.model_type,
-                                "in_channels": input_channels,
-                                "hidden_dim": args.base_channels,
-                                "dropout": args.dropout,
-                                "num_sensors": meta.num_sensors,
-                                "history_steps": meta.history_steps,
-                                "max_range_cm": args.max_range_cm,
-                                "temporal_layers": args.temporal_layers,
-                                "transformer_layers": args.transformer_layers,
-                                "attention_heads": args.attention_heads,
-                            },
-                            "meta": {
-                                "train_files": meta.train_files,
-                                "val_files": meta.val_files,
-                                "sensor_names": list(sensor_names),
-                                "beam_positive_fraction": meta.beam_positive_fraction,
-                                "sample_positive_fraction": meta.sample_positive_fraction,
-                                "pos_weight": meta.pos_weight,
-                                "best_val_loss": best["val_loss"],
-                                "best_val_precision": best["val_precision"],
-                                "best_val_f1": best["val_f1"],
-                                "best_threshold": float(val_metrics["threshold"]),
-                                "best_epoch": best["epoch"],
-                            },
-                        }
-                        save_checkpoint_for_device(checkpoint, args.output, device_kind)
-                        with val_report_path.open("w", encoding="utf-8") as fh:
-                            json.dump(
-                                {
-                                    "best_epoch": best["epoch"],
-                                    "best_val_loss": best["val_loss"],
-                                    "best_val_precision": best["val_precision"],
-                                    "best_val_f1": best["val_f1"],
-                                    "best_threshold": float(val_metrics["threshold"]),
-                                    "metrics": best["metrics"],
-                                },
-                                fh,
-                                indent=2,
-                            )
-                        log(
-                            f"New best validation precision at epoch {epoch:03d}: "
-                            f"{best['val_precision']:.6f} with F1={best['val_f1']:.6f} "
-                            f"at threshold {float(val_metrics['threshold']):.2f}. "
-                            f"Saved checkpoint -> {args.output}"
-                        )
-                    else:
-                        epochs_without_improve += 1
-                        log(
-                            f"no val improvement for {epochs_without_improve} epoch(s) "
-                            f"(patience={args.early_stop_patience}, min_delta={args.early_stop_min_delta:.6f})"
-                        )
-                        if epochs_without_improve >= int(args.early_stop_patience):
-                            log(
-                                f"Early stopping at epoch {epoch:03d}: "
-                                f"best_val_precision={best['val_precision']:.6f} "
-                                f"best_val_f1={best['val_f1']:.6f} from epoch {best['epoch']:03d}"
-                            )
-                            break
-
-            log_plain(f"saved checkpoint: {args.output}")
-            log_plain(f"saved split manifest: {split_path}")
-            log_plain(f"saved metrics: {metrics_path}")
-            log_plain(f"saved val report: {val_report_path}")
-            log_plain(f"saved log: {log_path}")
-            if best["metrics"] is not None:
-                best_metrics = best["metrics"]
-                log_plain("FINAL_SUMMARY_BEGIN")
-                log_plain(
-                    "config "
-                    f"history_steps={args.history_steps} batch_size={args.batch_size} lr={args.lr} "
-                    f"dropout={args.dropout} weight_decay={args.weight_decay} "
-                    f"pos_weight={meta.pos_weight:.4f} min_recall={args.threshold_min_recall:.2f} "
-                    f"threshold_sweep={args.threshold_sweep_start:.2f}:{args.threshold_sweep_step:.2f}:{args.threshold_sweep_end:.2f}"
+                result = run_experiment(
+                    exp=exp,
+                    args=args,
+                    device=device,
+                    device_kind=device_kind,
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    meta=meta,
+                    sensor_names=sensor_names,
+                    input_channels=input_channels,
                 )
-                log_plain(
-                    "data "
-                    f"train_files={len(meta.train_files)} val_files={len(meta.val_files)} "
-                    f"train_windows={meta.train_windows} val_windows={meta.val_windows} "
-                    f"beam_positive_fraction={meta.beam_positive_fraction:.4f} "
-                    f"window_positive_fraction={meta.sample_positive_fraction:.4f}"
-                )
-                log_plain(
-                    "best "
-                    f"epoch={best['epoch']} val_loss={best['val_loss']:.6f} "
-                    f"val_precision={best['val_precision']:.6f} val_f1={best['val_f1']:.6f} "
-                    f"threshold={float(best_metrics['threshold']):.2f} "
-                    f"precision={float(best_metrics['precision']):.4f} "
+                suite_results.append(result)
+                best_metrics = result["best_metrics"]
+                log(
+                    f"Experiment done: {result['name']} "
+                    f"precision={float(result['best_val_precision']):.4f} "
+                    f"f1={float(result['best_val_f1']):.4f} "
                     f"recall={float(best_metrics['recall']):.4f} "
-                    f"specificity={float(best_metrics['specificity']):.4f} "
-                    f"fpr={float(best_metrics['false_positive_rate']):.4f}"
+                    f"fpr={float(best_metrics['false_positive_rate']):.4f} "
+                    f"threshold={float(best_metrics['threshold']):.2f}"
                 )
+
+            suite_json_path = args.output.parent / f"{args.output.stem}.suite_results.json"
+            with suite_json_path.open("w", encoding="utf-8") as fh:
+                json.dump(suite_results, fh, indent=2)
+
+            sorted_by_precision = sorted(
+                suite_results,
+                key=lambda r: (
+                    float(r["best_val_precision"]),
+                    float(r["best_val_f1"]),
+                    -float(r["best_metrics"]["false_positive_rate"]),
+                ),
+                reverse=True,
+            )
+            sorted_by_f1 = sorted(
+                suite_results,
+                key=lambda r: (
+                    float(r["best_val_f1"]),
+                    float(r["best_val_precision"]),
+                ),
+                reverse=True,
+            )
+            best_precision = sorted_by_precision[0]
+            best_f1 = sorted_by_f1[0]
+            log_plain(f"saved split manifest: {split_path}")
+            log_plain(f"saved suite results: {suite_json_path}")
+            log_plain(f"saved log: {log_path}")
+            log_plain("FINAL_SUITE_SUMMARY_BEGIN")
+            log_plain(
+                "data "
+                f"train_files={len(meta.train_files)} val_files={len(meta.val_files)} "
+                f"train_windows={meta.train_windows} val_windows={meta.val_windows} "
+                f"beam_positive_fraction={meta.beam_positive_fraction:.4f} "
+                f"window_positive_fraction={meta.sample_positive_fraction:.4f}"
+            )
+            log_plain(
+                "best_precision "
+                f"name={best_precision['name']} model={best_precision['model_type']} params={best_precision['params']} "
+                f"precision={float(best_precision['best_val_precision']):.4f} "
+                f"f1={float(best_precision['best_val_f1']):.4f} "
+                f"recall={float(best_precision['best_metrics']['recall']):.4f} "
+                f"fpr={float(best_precision['best_metrics']['false_positive_rate']):.4f} "
+                f"threshold={float(best_precision['best_metrics']['threshold']):.2f}"
+            )
+            log_plain(
+                "best_f1 "
+                f"name={best_f1['name']} model={best_f1['model_type']} params={best_f1['params']} "
+                f"precision={float(best_f1['best_val_precision']):.4f} "
+                f"f1={float(best_f1['best_val_f1']):.4f} "
+                f"recall={float(best_f1['best_metrics']['recall']):.4f} "
+                f"fpr={float(best_f1['best_metrics']['false_positive_rate']):.4f} "
+                f"threshold={float(best_f1['best_metrics']['threshold']):.2f}"
+            )
+            for rank, result in enumerate(sorted_by_precision, start=1):
+                metrics = result["best_metrics"]
                 log_plain(
-                    "best_confusion "
-                    f"tn={int(best_metrics['tn'])} fp={int(best_metrics['fp'])} "
-                    f"fn={int(best_metrics['fn'])} tp={int(best_metrics['tp'])}"
+                    f"rank {rank:02d} "
+                    f"name={result['name']} model={result['model_type']} params={result['params']} "
+                    f"epoch={result['best_epoch']} prec={float(result['best_val_precision']):.4f} "
+                    f"f1={float(result['best_val_f1']):.4f} "
+                    f"recall={float(metrics['recall']):.4f} "
+                    f"spec={float(metrics['specificity']):.4f} "
+                    f"fpr={float(metrics['false_positive_rate']):.4f} "
+                    f"thr={float(metrics['threshold']):.2f} "
+                    f"cfg=modeltype:{result['model_type']},hidden:{result['hidden_dim']},dropout:{result['dropout']},"
+                    f"lr:{result['lr']},wd:{result['weight_decay']},pws:{result['pos_weight_scale']},"
+                    f"recall_floor:{result['threshold_min_recall']}"
                 )
-                log_plain(
-                    "artifacts "
-                    f"checkpoint={args.output} split={split_path} metrics={metrics_path} val_report={val_report_path} log={log_path}"
-                )
-                log_plain("FINAL_SUMMARY_END")
+            log_plain(f"artifacts suite={suite_json_path} split={split_path} log={log_path}")
+            log_plain("FINAL_SUITE_SUMMARY_END")
         finally:
             set_log_file(None)
 
