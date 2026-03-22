@@ -1,231 +1,194 @@
 /content/lidarmodeltesting# python realdatatrain.py 
-[20:30:19] Starting real cleanlog temporal U-Net trainer
-[20:30:19] Device selected: cuda -> cuda
-[20:30:21] Dataset split summary: train_files=36 val_files=12 train_windows=14024 val_windows=5124
-[20:30:21] Beam stats: num_sensors=17 history_steps=30 window_size=31 pos_weight=3.568
-[20:30:21] Positive fractions from train split: window_has_obstacle=0.4629 beam_is_obstacle=0.0728
-[20:30:21] Augmentation: xy_offset=[-10000.0,10000.0]cm z_offset=[-10.0,10.0]cm
-[20:30:21] Validation threshold sweep: 0.60..0.90 step~0.02 default_eval=0.70 min_recall=0.50
-[20:30:21] Wrote split manifest: runs/realdatabeam_unet.split.json
-[20:30:21] Model summary: type=real_cleanlog_temporal_unet base_channels=24 dropout=0.15 params=477529
-[20:30:23] train epoch 001/030 batch 0020/0220 loss=0.56781 acc=0.8794 prec=0.1815 recall=0.1846
-[20:30:23] train epoch 001/030 batch 0040/0220 loss=0.49606 acc=0.8953 prec=0.3472 recall=0.4055
-[20:30:23] train epoch 001/030 batch 0060/0220 loss=0.45525 acc=0.9047 prec=0.3974 recall=0.4705
-[20:30:23] train epoch 001/030 batch 0080/0220 loss=0.42653 acc=0.9118 prec=0.4303 recall=0.5093
-[20:30:24] train epoch 001/030 batch 0100/0220 loss=0.40823 acc=0.9145 prec=0.4440 recall=0.5409
-[20:30:24] train epoch 001/030 batch 0120/0220 loss=0.39160 acc=0.9189 prec=0.4613 recall=0.5564
-[20:30:24] train epoch 001/030 batch 0140/0220 loss=0.38313 acc=0.9207 prec=0.4767 recall=0.5758
-[20:30:24] train epoch 001/030 batch 0160/0220 loss=0.37355 acc=0.9224 prec=0.4903 recall=0.5953
-[20:30:25] train epoch 001/030 batch 0180/0220 loss=0.36267 acc=0.9252 prec=0.5032 recall=0.6052
-[20:30:25] train epoch 001/030 batch 0200/0220 loss=0.35446 acc=0.9270 prec=0.5127 recall=0.6135
-[20:30:25] train epoch 001/030 batch 0220/0220 loss=0.34649 acc=0.9286 prec=0.5227 recall=0.6251
-[20:30:26] epoch 001/030 train_loss=0.34649 train_acc=0.9286 train_f1=0.5693 train_spec=0.9534 train_cm=[[210154,10267],[6744,11243]] val_loss=0.40935 val_acc=0.9463 val_prec=0.6783 val_recall=0.4005 val_f1=0.5036 val_spec=0.9892 val_fpr=0.0108 thr=0.60 val_cm=[[80054,1126],[3554,2374]] lr=0.001000
-[20:30:26] New best validation precision at epoch 001: 0.678286 with F1=0.503606 at threshold 0.60. Saved checkpoint -> runs/realdatabeam_unet.pt
-[20:30:26] train epoch 002/030 batch 0020/0220 loss=0.25590 acc=0.9477 prec=0.6269 recall=0.7403
-[20:30:27] train epoch 002/030 batch 0040/0220 loss=0.25854 acc=0.9470 prec=0.6316 recall=0.7377
-[20:30:27] train epoch 002/030 batch 0060/0220 loss=0.25692 acc=0.9470 prec=0.6356 recall=0.7474
-[20:30:27] train epoch 002/030 batch 0080/0220 loss=0.25572 acc=0.9479 prec=0.6414 recall=0.7461
-[20:30:27] train epoch 002/030 batch 0100/0220 loss=0.24976 acc=0.9489 prec=0.6459 recall=0.7542
-[20:30:28] train epoch 002/030 batch 0120/0220 loss=0.24492 acc=0.9495 prec=0.6455 recall=0.7574
-[20:30:28] train epoch 002/030 batch 0140/0220 loss=0.24295 acc=0.9500 prec=0.6485 recall=0.7597
-[20:30:28] train epoch 002/030 batch 0160/0220 loss=0.24020 acc=0.9505 prec=0.6489 recall=0.7614
-[20:30:28] train epoch 002/030 batch 0180/0220 loss=0.23562 acc=0.9515 prec=0.6517 recall=0.7652
-[20:30:28] train epoch 002/030 batch 0200/0220 loss=0.23261 acc=0.9521 prec=0.6539 recall=0.7675
-[20:30:29] train epoch 002/030 batch 0220/0220 loss=0.23006 acc=0.9527 prec=0.6586 recall=0.7731
-[20:30:30] epoch 002/030 train_loss=0.23006 train_acc=0.9527 train_f1=0.7113 train_spec=0.9673 train_cm=[[213214,7207],[4081,13906]] val_loss=0.37623 val_acc=0.9571 val_prec=0.7898 val_recall=0.5027 val_f1=0.6144 val_spec=0.9805 val_fpr=0.0195 thr=0.90 val_cm=[[80387,793],[2948,2980]] lr=0.001000
-[20:30:30] New best validation precision at epoch 002: 0.789822 with F1=0.614370 at threshold 0.90. Saved checkpoint -> runs/realdatabeam_unet.pt
-[20:30:30] train epoch 003/030 batch 0020/0220 loss=0.20526 acc=0.9591 prec=0.7049 recall=0.7908
-[20:30:30] train epoch 003/030 batch 0040/0220 loss=0.20571 acc=0.9562 prec=0.6845 recall=0.8046
-[20:30:30] train epoch 003/030 batch 0060/0220 loss=0.19425 acc=0.9587 prec=0.6928 recall=0.8085
-[20:30:31] train epoch 003/030 batch 0080/0220 loss=0.19156 acc=0.9593 prec=0.7007 recall=0.8120
-[20:30:31] train epoch 003/030 batch 0100/0220 loss=0.19150 acc=0.9591 prec=0.6944 recall=0.8132
-[20:30:31] train epoch 003/030 batch 0120/0220 loss=0.18821 acc=0.9598 prec=0.6990 recall=0.8184
-[20:30:31] train epoch 003/030 batch 0140/0220 loss=0.18757 acc=0.9602 prec=0.7012 recall=0.8212
-[20:30:31] train epoch 003/030 batch 0160/0220 loss=0.18535 acc=0.9607 prec=0.7058 recall=0.8238
-[20:30:32] train epoch 003/030 batch 0180/0220 loss=0.18442 acc=0.9610 prec=0.7085 recall=0.8231
-[20:30:32] train epoch 003/030 batch 0200/0220 loss=0.18171 acc=0.9614 prec=0.7104 recall=0.8260
-[20:30:32] train epoch 003/030 batch 0220/0220 loss=0.18121 acc=0.9615 prec=0.7108 recall=0.8268
-[20:30:33] epoch 003/030 train_loss=0.18121 train_acc=0.9615 train_f1=0.7644 train_spec=0.9725 train_cm=[[214369,6052],[3115,14872]] val_loss=0.40080 val_acc=0.9487 val_prec=0.6617 val_recall=0.5035 val_f1=0.5719 val_spec=0.9781 val_fpr=0.0219 thr=0.76 val_cm=[[79654,1526],[2943,2985]] lr=0.001000
-[20:30:33] no val improvement for 1 epoch(s) (patience=10, min_delta=0.000100)
-[20:30:33] train epoch 004/030 batch 0020/0220 loss=0.15195 acc=0.9676 prec=0.7385 recall=0.8611
-[20:30:33] train epoch 004/030 batch 0040/0220 loss=0.15634 acc=0.9665 prec=0.7300 recall=0.8583
-[20:30:34] train epoch 004/030 batch 0060/0220 loss=0.15531 acc=0.9667 prec=0.7330 recall=0.8534
-[20:30:34] train epoch 004/030 batch 0080/0220 loss=0.15590 acc=0.9666 prec=0.7355 recall=0.8585
-[20:30:34] train epoch 004/030 batch 0100/0220 loss=0.15518 acc=0.9664 prec=0.7359 recall=0.8582
-[20:30:34] train epoch 004/030 batch 0120/0220 loss=0.15383 acc=0.9668 prec=0.7398 recall=0.8584
-[20:30:35] train epoch 004/030 batch 0140/0220 loss=0.15253 acc=0.9672 prec=0.7432 recall=0.8602
-[20:30:35] train epoch 004/030 batch 0160/0220 loss=0.15107 acc=0.9675 prec=0.7463 recall=0.8633
-[20:30:35] train epoch 004/030 batch 0180/0220 loss=0.15027 acc=0.9674 prec=0.7460 recall=0.8633
-[20:30:35] train epoch 004/030 batch 0200/0220 loss=0.15013 acc=0.9674 prec=0.7458 recall=0.8626
-[20:30:35] train epoch 004/030 batch 0220/0220 loss=0.14998 acc=0.9675 prec=0.7460 recall=0.8635
-[20:30:36] epoch 004/030 train_loss=0.14998 train_acc=0.9675 train_f1=0.8005 train_spec=0.9760 train_cm=[[215134,5287],[2456,15531]] val_loss=0.45075 val_acc=0.9572 val_prec=0.7929 val_recall=0.5032 val_f1=0.6157 val_spec=0.9865 val_fpr=0.0135 thr=0.78 val_cm=[[80401,779],[2945,2983]] lr=0.001000
-[20:30:36] New best validation precision at epoch 004: 0.792929 with F1=0.615686 at threshold 0.78. Saved checkpoint -> runs/realdatabeam_unet.pt
-[20:30:37] train epoch 005/030 batch 0020/0220 loss=0.12450 acc=0.9731 prec=0.7835 recall=0.8835
-[20:30:37] train epoch 005/030 batch 0040/0220 loss=0.12955 acc=0.9717 prec=0.7704 recall=0.8776
-[20:30:37] train epoch 005/030 batch 0060/0220 loss=0.12692 acc=0.9722 prec=0.7744 recall=0.8847
-[20:30:37] train epoch 005/030 batch 0080/0220 loss=0.13097 acc=0.9711 prec=0.7676 recall=0.8849
-[20:30:37] train epoch 005/030 batch 0100/0220 loss=0.13205 acc=0.9710 prec=0.7697 recall=0.8830
-[20:30:38] train epoch 005/030 batch 0120/0220 loss=0.13063 acc=0.9715 prec=0.7721 recall=0.8843
-[20:30:38] train epoch 005/030 batch 0140/0220 loss=0.12921 acc=0.9719 prec=0.7745 recall=0.8858
-[20:30:38] train epoch 005/030 batch 0160/0220 loss=0.12786 acc=0.9721 prec=0.7759 recall=0.8886
-[20:30:38] train epoch 005/030 batch 0180/0220 loss=0.12676 acc=0.9725 prec=0.7788 recall=0.8901
-[20:30:39] train epoch 005/030 batch 0200/0220 loss=0.12681 acc=0.9724 prec=0.7783 recall=0.8888
-[20:30:39] train epoch 005/030 batch 0220/0220 loss=0.12633 acc=0.9724 prec=0.7774 recall=0.8885
-[20:30:40] epoch 005/030 train_loss=0.12633 train_acc=0.9724 train_f1=0.8293 train_spec=0.9792 train_cm=[[215845,4576],[2005,15982]] val_loss=0.46111 val_acc=0.9554 val_prec=0.7608 val_recall=0.5017 val_f1=0.6047 val_spec=0.9842 val_fpr=0.0158 thr=0.80 val_cm=[[80245,935],[2954,2974]] lr=0.000500
-[20:30:40] no val improvement for 1 epoch(s) (patience=10, min_delta=0.000100)
-[20:30:40] train epoch 006/030 batch 0020/0220 loss=0.10046 acc=0.9766 prec=0.7911 recall=0.9091
-[20:30:40] train epoch 006/030 batch 0040/0220 loss=0.09593 acc=0.9784 prec=0.8141 recall=0.9172
-[20:30:40] train epoch 006/030 batch 0060/0220 loss=0.09172 acc=0.9791 prec=0.8186 recall=0.9227
-[20:30:41] train epoch 006/030 batch 0080/0220 loss=0.09144 acc=0.9794 prec=0.8223 recall=0.9212
-[20:30:41] train epoch 006/030 batch 0100/0220 loss=0.09201 acc=0.9792 prec=0.8220 recall=0.9215
-[20:30:41] train epoch 006/030 batch 0120/0220 loss=0.09165 acc=0.9795 prec=0.8233 recall=0.9221
-[20:30:41] train epoch 006/030 batch 0140/0220 loss=0.09072 acc=0.9797 prec=0.8257 recall=0.9237
-[20:30:42] train epoch 006/030 batch 0160/0220 loss=0.09056 acc=0.9797 prec=0.8260 recall=0.9240
-[20:30:42] train epoch 006/030 batch 0180/0220 loss=0.08935 acc=0.9800 prec=0.8290 recall=0.9252
-[20:30:42] train epoch 006/030 batch 0200/0220 loss=0.08808 acc=0.9802 prec=0.8298 recall=0.9268
-[20:30:42] train epoch 006/030 batch 0220/0220 loss=0.08782 acc=0.9802 prec=0.8299 recall=0.9273
-[20:30:43] epoch 006/030 train_loss=0.08782 train_acc=0.9802 train_f1=0.8759 train_spec=0.9845 train_cm=[[217001,3420],[1307,16680]] val_loss=0.53427 val_acc=0.9597 val_prec=0.8316 val_recall=0.5113 val_f1=0.6332 val_spec=0.9850 val_fpr=0.0150 thr=0.90 val_cm=[[80566,614],[2897,3031]] lr=0.000500
-[20:30:43] New best validation precision at epoch 006: 0.831550 with F1=0.633239 at threshold 0.90. Saved checkpoint -> runs/realdatabeam_unet.pt
-[20:30:43] train epoch 007/030 batch 0020/0220 loss=0.07215 acc=0.9847 prec=0.8730 recall=0.9494
-[20:30:44] train epoch 007/030 batch 0040/0220 loss=0.07727 acc=0.9824 prec=0.8504 recall=0.9413
-[20:30:44] train epoch 007/030 batch 0060/0220 loss=0.07590 acc=0.9829 prec=0.8523 recall=0.9437
-[20:30:44] train epoch 007/030 batch 0080/0220 loss=0.07441 acc=0.9830 prec=0.8494 recall=0.9438
-[20:30:44] train epoch 007/030 batch 0100/0220 loss=0.07510 acc=0.9827 prec=0.8480 recall=0.9425
-[20:30:44] train epoch 007/030 batch 0120/0220 loss=0.07463 acc=0.9827 prec=0.8458 recall=0.9425
-[20:30:45] train epoch 007/030 batch 0140/0220 loss=0.07460 acc=0.9828 prec=0.8479 recall=0.9425
-[20:30:45] train epoch 007/030 batch 0160/0220 loss=0.07529 acc=0.9826 prec=0.8461 recall=0.9423
-[20:30:45] train epoch 007/030 batch 0180/0220 loss=0.07476 acc=0.9827 prec=0.8478 recall=0.9431
-[20:30:45] train epoch 007/030 batch 0200/0220 loss=0.07432 acc=0.9827 prec=0.8468 recall=0.9427
-[20:30:45] train epoch 007/030 batch 0220/0220 loss=0.07405 acc=0.9828 prec=0.8467 recall=0.9430
-[20:30:46] epoch 007/030 train_loss=0.07405 train_acc=0.9828 train_f1=0.8923 train_spec=0.9861 train_cm=[[217351,3070],[1026,16961]] val_loss=0.55585 val_acc=0.9572 val_prec=0.7937 val_recall=0.5010 val_f1=0.6143 val_spec=0.9851 val_fpr=0.0149 thr=0.88 val_cm=[[80408,772],[2958,2970]] lr=0.000500
-[20:30:46] no val improvement for 1 epoch(s) (patience=10, min_delta=0.000100)
-[20:30:47] train epoch 008/030 batch 0020/0220 loss=0.06291 acc=0.9846 prec=0.8658 recall=0.9499
-[20:30:47] train epoch 008/030 batch 0040/0220 loss=0.06413 acc=0.9842 prec=0.8534 recall=0.9514
-[20:30:47] train epoch 008/030 batch 0060/0220 loss=0.06700 acc=0.9838 prec=0.8511 recall=0.9493
-[20:30:47] train epoch 008/030 batch 0080/0220 loss=0.06751 acc=0.9838 prec=0.8542 recall=0.9500
-[20:30:48] train epoch 008/030 batch 0100/0220 loss=0.06673 acc=0.9840 prec=0.8560 recall=0.9504
-[20:30:48] train epoch 008/030 batch 0120/0220 loss=0.06696 acc=0.9838 prec=0.8519 recall=0.9493
-[20:30:48] train epoch 008/030 batch 0140/0220 loss=0.06675 acc=0.9841 prec=0.8554 recall=0.9486
-[20:30:48] train epoch 008/030 batch 0160/0220 loss=0.06606 acc=0.9842 prec=0.8565 recall=0.9497
-[20:30:48] train epoch 008/030 batch 0180/0220 loss=0.06583 acc=0.9843 prec=0.8565 recall=0.9497
-[20:30:49] train epoch 008/030 batch 0200/0220 loss=0.06608 acc=0.9843 prec=0.8576 recall=0.9499
-[20:30:49] train epoch 008/030 batch 0220/0220 loss=0.06553 acc=0.9844 prec=0.8585 recall=0.9497
-[20:30:50] epoch 008/030 train_loss=0.06553 train_acc=0.9844 train_f1=0.9018 train_spec=0.9872 train_cm=[[217605,2816],[905,17082]] val_loss=0.57739 val_acc=0.9592 val_prec=0.7667 val_recall=0.5747 val_f1=0.6570 val_spec=0.9798 val_fpr=0.0202 thr=0.90 val_cm=[[80143,1037],[2521,3407]] lr=0.000250
-[20:30:50] no val improvement for 2 epoch(s) (patience=10, min_delta=0.000100)
-[20:30:50] train epoch 009/030 batch 0020/0220 loss=0.05428 acc=0.9866 prec=0.8687 recall=0.9616
-[20:30:50] train epoch 009/030 batch 0040/0220 loss=0.05052 acc=0.9879 prec=0.8795 recall=0.9624
-[20:30:50] train epoch 009/030 batch 0060/0220 loss=0.04947 acc=0.9881 prec=0.8812 recall=0.9636
-[20:30:51] train epoch 009/030 batch 0080/0220 loss=0.05031 acc=0.9880 prec=0.8816 recall=0.9628
-[20:30:51] train epoch 009/030 batch 0100/0220 loss=0.05080 acc=0.9880 prec=0.8828 recall=0.9636
-[20:30:51] train epoch 009/030 batch 0120/0220 loss=0.05115 acc=0.9879 prec=0.8835 recall=0.9650
-[20:30:51] train epoch 009/030 batch 0140/0220 loss=0.05100 acc=0.9879 prec=0.8850 recall=0.9650
-[20:30:52] train epoch 009/030 batch 0160/0220 loss=0.05024 acc=0.9880 prec=0.8854 recall=0.9655
-[20:30:52] train epoch 009/030 batch 0180/0220 loss=0.05033 acc=0.9880 prec=0.8859 recall=0.9654
-[20:30:52] train epoch 009/030 batch 0200/0220 loss=0.04987 acc=0.9880 prec=0.8856 recall=0.9657
-[20:30:52] train epoch 009/030 batch 0220/0220 loss=0.04975 acc=0.9881 prec=0.8864 recall=0.9654
-[20:30:53] epoch 009/030 train_loss=0.04975 train_acc=0.9881 train_f1=0.9242 train_spec=0.9899 train_cm=[[218196,2225],[623,17364]] val_loss=0.62001 val_acc=0.9578 val_prec=0.7856 val_recall=0.5228 val_f1=0.6278 val_spec=0.9827 val_fpr=0.0173 thr=0.90 val_cm=[[80334,846],[2829,3099]] lr=0.000250
-[20:30:53] no val improvement for 3 epoch(s) (patience=10, min_delta=0.000100)
-[20:30:53] train epoch 010/030 batch 0020/0220 loss=0.04961 acc=0.9889 prec=0.8985 recall=0.9679
-[20:30:54] train epoch 010/030 batch 0040/0220 loss=0.04809 acc=0.9887 prec=0.8946 recall=0.9697
-[20:30:54] train epoch 010/030 batch 0060/0220 loss=0.04612 acc=0.9892 prec=0.8981 recall=0.9687
-[20:30:54] train epoch 010/030 batch 0080/0220 loss=0.04509 acc=0.9893 prec=0.8977 recall=0.9684
-[20:30:54] train epoch 010/030 batch 0100/0220 loss=0.04482 acc=0.9893 prec=0.8973 recall=0.9684
-[20:30:55] train epoch 010/030 batch 0120/0220 loss=0.04503 acc=0.9892 prec=0.8967 recall=0.9686
-[20:30:55] train epoch 010/030 batch 0140/0220 loss=0.04439 acc=0.9894 prec=0.8992 recall=0.9692
-[20:30:55] train epoch 010/030 batch 0160/0220 loss=0.04404 acc=0.9895 prec=0.8991 recall=0.9696
-[20:30:55] train epoch 010/030 batch 0180/0220 loss=0.04380 acc=0.9895 prec=0.8989 recall=0.9698
-[20:30:56] train epoch 010/030 batch 0200/0220 loss=0.04404 acc=0.9895 prec=0.8996 recall=0.9694
-[20:30:56] train epoch 010/030 batch 0220/0220 loss=0.04427 acc=0.9894 prec=0.8982 recall=0.9693
-[20:30:57] epoch 010/030 train_loss=0.04427 train_acc=0.9894 train_f1=0.9324 train_spec=0.9910 train_cm=[[218446,1975],[552,17435]] val_loss=0.64543 val_acc=0.9562 val_prec=0.7753 val_recall=0.5019 val_f1=0.6093 val_spec=0.9831 val_fpr=0.0169 thr=0.90 val_cm=[[80318,862],[2953,2975]] lr=0.000250
-[20:30:57] no val improvement for 4 epoch(s) (patience=10, min_delta=0.000100)
-[20:30:57] train epoch 011/030 batch 0020/0220 loss=0.04067 acc=0.9905 prec=0.9110 recall=0.9719
-[20:30:57] train epoch 011/030 batch 0040/0220 loss=0.04073 acc=0.9904 prec=0.9073 recall=0.9735
-[20:30:57] train epoch 011/030 batch 0060/0220 loss=0.04019 acc=0.9908 prec=0.9117 recall=0.9748
-[20:30:58] train epoch 011/030 batch 0080/0220 loss=0.04140 acc=0.9903 prec=0.9068 recall=0.9733
-[20:30:58] train epoch 011/030 batch 0100/0220 loss=0.04108 acc=0.9904 prec=0.9075 recall=0.9732
-[20:30:58] train epoch 011/030 batch 0120/0220 loss=0.04115 acc=0.9905 prec=0.9089 recall=0.9725
-[20:30:58] train epoch 011/030 batch 0140/0220 loss=0.04130 acc=0.9904 prec=0.9089 recall=0.9725
-[20:30:59] train epoch 011/030 batch 0160/0220 loss=0.04103 acc=0.9904 prec=0.9077 recall=0.9729
-[20:30:59] train epoch 011/030 batch 0180/0220 loss=0.04106 acc=0.9904 prec=0.9076 recall=0.9730
-[20:30:59] train epoch 011/030 batch 0200/0220 loss=0.04070 acc=0.9904 prec=0.9076 recall=0.9730
-[20:30:59] train epoch 011/030 batch 0220/0220 loss=0.04023 acc=0.9905 prec=0.9083 recall=0.9730
-[20:31:00] epoch 011/030 train_loss=0.04023 train_acc=0.9905 train_f1=0.9395 train_spec=0.9920 train_cm=[[218653,1768],[485,17502]] val_loss=0.66555 val_acc=0.9581 val_prec=0.7621 val_recall=0.5594 val_f1=0.6452 val_spec=0.9810 val_fpr=0.0190 thr=0.90 val_cm=[[80145,1035],[2612,3316]] lr=0.000125
-[20:31:00] no val improvement for 5 epoch(s) (patience=10, min_delta=0.000100)
-[20:31:00] train epoch 012/030 batch 0020/0220 loss=0.03178 acc=0.9920 prec=0.9150 recall=0.9786
-[20:31:01] train epoch 012/030 batch 0040/0220 loss=0.03124 acc=0.9921 prec=0.9179 recall=0.9810
-[20:31:01] train epoch 012/030 batch 0060/0220 loss=0.03283 acc=0.9919 prec=0.9177 recall=0.9801
-[20:31:01] train epoch 012/030 batch 0080/0220 loss=0.03248 acc=0.9920 prec=0.9179 recall=0.9802
-[20:31:01] train epoch 012/030 batch 0100/0220 loss=0.03239 acc=0.9922 prec=0.9200 recall=0.9805
-[20:31:02] train epoch 012/030 batch 0120/0220 loss=0.03284 acc=0.9920 prec=0.9194 recall=0.9805
-[20:31:02] train epoch 012/030 batch 0140/0220 loss=0.03279 acc=0.9921 prec=0.9194 recall=0.9807
-[20:31:02] train epoch 012/030 batch 0160/0220 loss=0.03237 acc=0.9922 prec=0.9200 recall=0.9811
-[20:31:02] train epoch 012/030 batch 0180/0220 loss=0.03246 acc=0.9922 prec=0.9203 recall=0.9816
-[20:31:02] train epoch 012/030 batch 0200/0220 loss=0.03255 acc=0.9922 prec=0.9201 recall=0.9812
-[20:31:03] train epoch 012/030 batch 0220/0220 loss=0.03246 acc=0.9921 prec=0.9200 recall=0.9810
-[20:31:04] epoch 012/030 train_loss=0.03246 train_acc=0.9921 train_f1=0.9495 train_spec=0.9930 train_cm=[[218886,1535],[341,17646]] val_loss=0.73142 val_acc=0.9554 val_prec=0.7629 val_recall=0.5010 val_f1=0.6048 val_spec=0.9828 val_fpr=0.0172 thr=0.90 val_cm=[[80257,923],[2958,2970]] lr=0.000125
-[20:31:04] no val improvement for 6 epoch(s) (patience=10, min_delta=0.000100)
-[20:31:04] train epoch 013/030 batch 0020/0220 loss=0.02647 acc=0.9935 prec=0.9366 recall=0.9849
-[20:31:04] train epoch 013/030 batch 0040/0220 loss=0.02681 acc=0.9934 prec=0.9331 recall=0.9854
-[20:31:04] train epoch 013/030 batch 0060/0220 loss=0.02815 acc=0.9932 prec=0.9318 recall=0.9836
-[20:31:05] train epoch 013/030 batch 0080/0220 loss=0.02919 acc=0.9929 prec=0.9280 recall=0.9834
-[20:31:05] train epoch 013/030 batch 0100/0220 loss=0.02988 acc=0.9927 prec=0.9276 recall=0.9818
-[20:31:05] train epoch 013/030 batch 0120/0220 loss=0.03008 acc=0.9925 prec=0.9249 recall=0.9820
-[20:31:05] train epoch 013/030 batch 0140/0220 loss=0.03006 acc=0.9925 prec=0.9241 recall=0.9816
-[20:31:05] train epoch 013/030 batch 0160/0220 loss=0.03031 acc=0.9925 prec=0.9246 recall=0.9804
-[20:31:06] train epoch 013/030 batch 0180/0220 loss=0.03014 acc=0.9925 prec=0.9250 recall=0.9807
-[20:31:06] train epoch 013/030 batch 0200/0220 loss=0.03081 acc=0.9923 prec=0.9235 recall=0.9800
-[20:31:06] train epoch 013/030 batch 0220/0220 loss=0.03092 acc=0.9924 prec=0.9235 recall=0.9800
-[20:31:07] epoch 013/030 train_loss=0.03092 train_acc=0.9924 train_f1=0.9509 train_spec=0.9934 train_cm=[[218960,1461],[360,17627]] val_loss=0.71176 val_acc=0.9578 val_prec=0.7541 val_recall=0.5644 val_f1=0.6456 val_spec=0.9788 val_fpr=0.0212 thr=0.90 val_cm=[[80089,1091],[2582,3346]] lr=0.000125
-[20:31:07] no val improvement for 7 epoch(s) (patience=10, min_delta=0.000100)
-[20:31:07] train epoch 014/030 batch 0020/0220 loss=0.02796 acc=0.9933 prec=0.9353 recall=0.9824
-[20:31:08] train epoch 014/030 batch 0040/0220 loss=0.02928 acc=0.9928 prec=0.9286 recall=0.9796
-[20:31:08] train epoch 014/030 batch 0060/0220 loss=0.03039 acc=0.9925 prec=0.9268 recall=0.9806
-[20:31:08] train epoch 014/030 batch 0080/0220 loss=0.03107 acc=0.9922 prec=0.9242 recall=0.9796
-[20:31:08] train epoch 014/030 batch 0100/0220 loss=0.03046 acc=0.9925 prec=0.9263 recall=0.9808
-[20:31:08] train epoch 014/030 batch 0120/0220 loss=0.03037 acc=0.9925 prec=0.9264 recall=0.9800
-[20:31:09] train epoch 014/030 batch 0140/0220 loss=0.03098 acc=0.9923 prec=0.9249 recall=0.9798
-[20:31:09] train epoch 014/030 batch 0160/0220 loss=0.03042 acc=0.9925 prec=0.9251 recall=0.9804
-[20:31:09] train epoch 014/030 batch 0180/0220 loss=0.03049 acc=0.9925 prec=0.9255 recall=0.9800
-[20:31:09] train epoch 014/030 batch 0200/0220 loss=0.03016 acc=0.9926 prec=0.9265 recall=0.9803
-[20:31:09] train epoch 014/030 batch 0220/0220 loss=0.03026 acc=0.9926 prec=0.9256 recall=0.9803
-[20:31:10] epoch 014/030 train_loss=0.03026 train_acc=0.9926 train_f1=0.9522 train_spec=0.9936 train_cm=[[219003,1418],[354,17633]] val_loss=0.74959 val_acc=0.9573 val_prec=0.7949 val_recall=0.5013 val_f1=0.6149 val_spec=0.9849 val_fpr=0.0151 thr=0.90 val_cm=[[80413,767],[2956,2972]] lr=0.000063
-[20:31:10] no val improvement for 8 epoch(s) (patience=10, min_delta=0.000100)
-[20:31:11] train epoch 015/030 batch 0020/0220 loss=0.02585 acc=0.9938 prec=0.9345 recall=0.9836
-[20:31:11] train epoch 015/030 batch 0040/0220 loss=0.02658 acc=0.9936 prec=0.9345 recall=0.9852
-[20:31:11] train epoch 015/030 batch 0060/0220 loss=0.02656 acc=0.9937 prec=0.9365 recall=0.9848
-[20:31:11] train epoch 015/030 batch 0080/0220 loss=0.02611 acc=0.9937 prec=0.9352 recall=0.9846
-[20:31:11] train epoch 015/030 batch 0100/0220 loss=0.02529 acc=0.9939 prec=0.9353 recall=0.9852
-[20:31:12] train epoch 015/030 batch 0120/0220 loss=0.02548 acc=0.9938 prec=0.9356 recall=0.9853
-[20:31:12] train epoch 015/030 batch 0140/0220 loss=0.02537 acc=0.9939 prec=0.9364 recall=0.9850
-[20:31:12] train epoch 015/030 batch 0160/0220 loss=0.02580 acc=0.9937 prec=0.9350 recall=0.9852
-[20:31:12] train epoch 015/030 batch 0180/0220 loss=0.02597 acc=0.9937 prec=0.9343 recall=0.9849
-[20:31:13] train epoch 015/030 batch 0200/0220 loss=0.02608 acc=0.9936 prec=0.9342 recall=0.9850
-[20:31:13] train epoch 015/030 batch 0220/0220 loss=0.02617 acc=0.9936 prec=0.9338 recall=0.9850
-[20:31:14] epoch 015/030 train_loss=0.02617 train_acc=0.9936 train_f1=0.9587 train_spec=0.9943 train_cm=[[219164,1257],[270,17717]] val_loss=0.75893 val_acc=0.9579 val_prec=0.7826 val_recall=0.5282 val_f1=0.6307 val_spec=0.9832 val_fpr=0.0168 thr=0.90 val_cm=[[80310,870],[2797,3131]] lr=0.000063
-[20:31:14] no val improvement for 9 epoch(s) (patience=10, min_delta=0.000100)
-[20:31:14] train epoch 016/030 batch 0020/0220 loss=0.02212 acc=0.9943 prec=0.9375 recall=0.9896
-[20:31:14] train epoch 016/030 batch 0040/0220 loss=0.02306 acc=0.9940 prec=0.9365 recall=0.9879
-[20:31:14] train epoch 016/030 batch 0060/0220 loss=0.02322 acc=0.9938 prec=0.9340 recall=0.9875
-[20:31:15] train epoch 016/030 batch 0080/0220 loss=0.02296 acc=0.9940 prec=0.9365 recall=0.9868
-[20:31:15] train epoch 016/030 batch 0100/0220 loss=0.02328 acc=0.9939 prec=0.9338 recall=0.9864
-[20:31:15] train epoch 016/030 batch 0120/0220 loss=0.02389 acc=0.9939 prec=0.9353 recall=0.9857
-[20:31:15] train epoch 016/030 batch 0140/0220 loss=0.02436 acc=0.9938 prec=0.9350 recall=0.9851
-[20:31:15] train epoch 016/030 batch 0160/0220 loss=0.02440 acc=0.9938 prec=0.9347 recall=0.9855
-[20:31:16] train epoch 016/030 batch 0180/0220 loss=0.02445 acc=0.9938 prec=0.9360 recall=0.9853
-[20:31:16] train epoch 016/030 batch 0200/0220 loss=0.02462 acc=0.9938 prec=0.9360 recall=0.9853
-[20:31:16] train epoch 016/030 batch 0220/0220 loss=0.02475 acc=0.9938 prec=0.9362 recall=0.9849
-[20:31:17] epoch 016/030 train_loss=0.02475 train_acc=0.9938 train_f1=0.9599 train_spec=0.9945 train_cm=[[219213,1208],[272,17715]] val_loss=0.75084 val_acc=0.9580 val_prec=0.7617 val_recall=0.5565 val_f1=0.6431 val_spec=0.9809 val_fpr=0.0191 thr=0.90 val_cm=[[80148,1032],[2629,3299]] lr=0.000063
-[20:31:17] no val improvement for 10 epoch(s) (patience=10, min_delta=0.000100)
-[20:31:17] Early stopping at epoch 016: best_val_precision=0.831550 best_val_f1=0.633239 from epoch 006
-saved checkpoint: runs/realdatabeam_unet.pt
-saved split manifest: runs/realdatabeam_unet.split.json
-saved metrics: runs/realdatabeam_unet.metrics.csv
-saved val report: runs/realdatabeam_unet.val_report.json
-saved log: runs/realdatabeam_unet.log.txt
+[20:39:11] Starting real cleanlog temporal beam-transformer trainer
+[20:39:11] Device selected: cuda -> cuda
+[20:39:12] Dataset split summary: train_files=36 val_files=12 train_windows=14024 val_windows=5124
+[20:39:12] Beam stats: num_sensors=17 history_steps=30 window_size=31 pos_weight=3.568
+[20:39:12] Positive fractions from train split: window_has_obstacle=0.4629 beam_is_obstacle=0.0728
+[20:39:12] Augmentation: xy_offset=[-10000.0,10000.0]cm z_offset=[-10.0,10.0]cm
+[20:39:12] Validation threshold sweep: 0.60..0.90 step~0.02 default_eval=0.70 min_recall=0.50
+[20:39:12] Wrote split manifest: runs/realdatabeam_transformer.split.json
+/content/lidarmodeltesting/realdatatrain.py:419: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.beam_encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.transformer_layers)
+[20:39:13] Model summary: type=real_cleanlog_temporal_beam_transformer hidden_dim=48 temporal_layers=1 transformer_layers=2 attention_heads=4 dropout=0.15 params=78601
+[20:39:15] train epoch 001/030 batch 0020/0220 loss=0.62062 acc=0.8936 prec=0.1151 recall=0.0660
+[20:39:15] train epoch 001/030 batch 0040/0220 loss=0.54438 acc=0.8993 prec=0.2946 recall=0.2671
+[20:39:15] train epoch 001/030 batch 0060/0220 loss=0.50699 acc=0.9028 prec=0.3634 recall=0.3830
+[20:39:15] train epoch 001/030 batch 0080/0220 loss=0.47511 acc=0.9069 prec=0.3996 recall=0.4473
+[20:39:16] train epoch 001/030 batch 0100/0220 loss=0.45411 acc=0.9112 prec=0.4262 recall=0.4821
+[20:39:16] train epoch 001/030 batch 0120/0220 loss=0.43487 acc=0.9151 prec=0.4486 recall=0.5106
+[20:39:16] train epoch 001/030 batch 0140/0220 loss=0.42135 acc=0.9181 prec=0.4631 recall=0.5270
+[20:39:16] train epoch 001/030 batch 0160/0220 loss=0.41318 acc=0.9200 prec=0.4746 recall=0.5382
+[20:39:17] train epoch 001/030 batch 0180/0220 loss=0.40238 acc=0.9222 prec=0.4866 recall=0.5510
+[20:39:17] train epoch 001/030 batch 0200/0220 loss=0.39453 acc=0.9239 prec=0.4974 recall=0.5617
+[20:39:17] train epoch 001/030 batch 0220/0220 loss=0.38712 acc=0.9256 prec=0.5063 recall=0.5702
+[20:39:18] epoch 001/030 train_loss=0.38712 train_acc=0.9256 train_f1=0.5363 train_spec=0.9546 train_cm=[[210420,10001],[7731,10256]] val_loss=0.31889 val_acc=0.9501 val_prec=0.6675 val_recall=0.5321 val_f1=0.5921 val_spec=0.9722 val_fpr=0.0278 thr=0.88 val_cm=[[79609,1571],[2774,3154]] lr=0.001000
+[20:39:18] New best validation precision at epoch 001: 0.667513 with F1=0.592134 at threshold 0.88. Saved checkpoint -> runs/realdatabeam_transformer.pt
+[20:39:19] train epoch 002/030 batch 0020/0220 loss=0.29661 acc=0.9449 prec=0.6116 recall=0.6769
+[20:39:19] train epoch 002/030 batch 0040/0220 loss=0.29304 acc=0.9465 prec=0.6223 recall=0.6858
+[20:39:19] train epoch 002/030 batch 0060/0220 loss=0.29227 acc=0.9460 prec=0.6191 recall=0.6877
+[20:39:20] train epoch 002/030 batch 0080/0220 loss=0.28834 acc=0.9474 prec=0.6272 recall=0.6930
+[20:39:20] train epoch 002/030 batch 0100/0220 loss=0.28905 acc=0.9473 prec=0.6305 recall=0.6961
+[20:39:20] train epoch 002/030 batch 0120/0220 loss=0.28647 acc=0.9479 prec=0.6356 recall=0.7017
+[20:39:20] train epoch 002/030 batch 0140/0220 loss=0.28871 acc=0.9471 prec=0.6328 recall=0.6999
+[20:39:21] train epoch 002/030 batch 0160/0220 loss=0.28704 acc=0.9471 prec=0.6310 recall=0.7028
+[20:39:21] train epoch 002/030 batch 0180/0220 loss=0.28616 acc=0.9472 prec=0.6329 recall=0.7053
+[20:39:21] train epoch 002/030 batch 0200/0220 loss=0.28385 acc=0.9472 prec=0.6331 recall=0.7087
+[20:39:21] train epoch 002/030 batch 0220/0220 loss=0.28177 acc=0.9474 prec=0.6352 recall=0.7120
+[20:39:22] epoch 002/030 train_loss=0.28177 train_acc=0.9474 train_f1=0.6714 train_spec=0.9666 train_cm=[[213066,7355],[5181,12806]] val_loss=0.32167 val_acc=0.9556 val_prec=0.7506 val_recall=0.5214 val_f1=0.6154 val_spec=0.9791 val_fpr=0.0209 thr=0.90 val_cm=[[80153,1027],[2837,3091]] lr=0.001000
+[20:39:22] New best validation precision at epoch 002: 0.750607 with F1=0.615369 at threshold 0.90. Saved checkpoint -> runs/realdatabeam_transformer.pt
+[20:39:23] train epoch 003/030 batch 0020/0220 loss=0.24540 acc=0.9557 prec=0.6764 recall=0.7475
+[20:39:23] train epoch 003/030 batch 0040/0220 loss=0.24718 acc=0.9541 prec=0.6684 recall=0.7504
+[20:39:23] train epoch 003/030 batch 0060/0220 loss=0.24968 acc=0.9526 prec=0.6613 recall=0.7490
+[20:39:23] train epoch 003/030 batch 0080/0220 loss=0.24675 acc=0.9532 prec=0.6656 recall=0.7533
+[20:39:24] train epoch 003/030 batch 0100/0220 loss=0.24600 acc=0.9534 prec=0.6654 recall=0.7551
+[20:39:24] train epoch 003/030 batch 0120/0220 loss=0.24716 acc=0.9525 prec=0.6609 recall=0.7559
+[20:39:24] train epoch 003/030 batch 0140/0220 loss=0.24739 acc=0.9519 prec=0.6589 recall=0.7594
+[20:39:24] train epoch 003/030 batch 0160/0220 loss=0.24671 acc=0.9518 prec=0.6575 recall=0.7611
+[20:39:25] train epoch 003/030 batch 0180/0220 loss=0.24480 acc=0.9522 prec=0.6596 recall=0.7630
+[20:39:25] train epoch 003/030 batch 0200/0220 loss=0.24270 acc=0.9523 prec=0.6585 recall=0.7660
+[20:39:25] train epoch 003/030 batch 0220/0220 loss=0.23956 acc=0.9529 prec=0.6613 recall=0.7691
+[20:39:26] epoch 003/030 train_loss=0.23956 train_acc=0.9529 train_f1=0.7111 train_spec=0.9679 train_cm=[[213335,7086],[4153,13834]] val_loss=0.30431 val_acc=0.9605 val_prec=0.8155 val_recall=0.5428 val_f1=0.6518 val_spec=0.9826 val_fpr=0.0174 thr=0.90 val_cm=[[80452,728],[2710,3218]] lr=0.001000
+[20:39:26] New best validation precision at epoch 003: 0.815509 with F1=0.651813 at threshold 0.90. Saved checkpoint -> runs/realdatabeam_transformer.pt
+[20:39:26] train epoch 004/030 batch 0020/0220 loss=0.21773 acc=0.9552 prec=0.6602 recall=0.7913
+[20:39:27] train epoch 004/030 batch 0040/0220 loss=0.21380 acc=0.9547 prec=0.6520 recall=0.7937
+[20:39:27] train epoch 004/030 batch 0060/0220 loss=0.21505 acc=0.9542 prec=0.6509 recall=0.7970
+[20:39:27] train epoch 004/030 batch 0080/0220 loss=0.21760 acc=0.9540 prec=0.6567 recall=0.8001
+[20:39:27] train epoch 004/030 batch 0100/0220 loss=0.21389 acc=0.9551 prec=0.6620 recall=0.8032
+[20:39:28] train epoch 004/030 batch 0120/0220 loss=0.21073 acc=0.9560 prec=0.6684 recall=0.8055
+[20:39:28] train epoch 004/030 batch 0140/0220 loss=0.20829 acc=0.9564 prec=0.6701 recall=0.8086
+[20:39:28] train epoch 004/030 batch 0160/0220 loss=0.20901 acc=0.9563 prec=0.6720 recall=0.8101
+[20:39:28] train epoch 004/030 batch 0180/0220 loss=0.20806 acc=0.9568 prec=0.6770 recall=0.8093
+[20:39:29] train epoch 004/030 batch 0200/0220 loss=0.20547 acc=0.9571 prec=0.6783 recall=0.8123
+[20:39:29] train epoch 004/030 batch 0220/0220 loss=0.20629 acc=0.9571 prec=0.6809 recall=0.8109
+[20:39:30] epoch 004/030 train_loss=0.20629 train_acc=0.9571 train_f1=0.7402 train_spec=0.9690 train_cm=[[213584,6837],[3401,14586]] val_loss=0.30137 val_acc=0.9599 val_prec=0.7521 val_recall=0.6120 val_f1=0.6749 val_spec=0.9746 val_fpr=0.0254 thr=0.90 val_cm=[[79984,1196],[2300,3628]] lr=0.001000
+[20:39:30] no val improvement for 1 epoch(s) (patience=10, min_delta=0.000100)
+[20:39:30] train epoch 005/030 batch 0020/0220 loss=0.20520 acc=0.9581 prec=0.6905 recall=0.8001
+[20:39:30] train epoch 005/030 batch 0040/0220 loss=0.19238 acc=0.9615 prec=0.7112 recall=0.8191
+[20:39:30] train epoch 005/030 batch 0060/0220 loss=0.19057 acc=0.9612 prec=0.7088 recall=0.8245
+[20:39:31] train epoch 005/030 batch 0080/0220 loss=0.19434 acc=0.9603 prec=0.7031 recall=0.8203
+[20:39:31] train epoch 005/030 batch 0100/0220 loss=0.19277 acc=0.9603 prec=0.7003 recall=0.8203
+[20:39:31] train epoch 005/030 batch 0120/0220 loss=0.19393 acc=0.9606 prec=0.7032 recall=0.8169
+[20:39:32] train epoch 005/030 batch 0140/0220 loss=0.19203 acc=0.9610 prec=0.7066 recall=0.8213
+[20:39:32] train epoch 005/030 batch 0160/0220 loss=0.19132 acc=0.9609 prec=0.7063 recall=0.8241
+[20:39:32] train epoch 005/030 batch 0180/0220 loss=0.18964 acc=0.9612 prec=0.7076 recall=0.8259
+[20:39:32] train epoch 005/030 batch 0200/0220 loss=0.18982 acc=0.9609 prec=0.7052 recall=0.8261
+[20:39:33] train epoch 005/030 batch 0220/0220 loss=0.18911 acc=0.9608 prec=0.7047 recall=0.8277
+[20:39:33] epoch 005/030 train_loss=0.18911 train_acc=0.9608 train_f1=0.7612 train_spec=0.9717 train_cm=[[214183,6238],[3100,14887]] val_loss=0.30482 val_acc=0.9613 val_prec=0.7763 val_recall=0.6059 val_f1=0.6806 val_spec=0.9787 val_fpr=0.0213 thr=0.90 val_cm=[[80145,1035],[2336,3592]] lr=0.001000
+[20:39:33] no val improvement for 2 epoch(s) (patience=10, min_delta=0.000100)
+[20:39:34] train epoch 006/030 batch 0020/0220 loss=0.17671 acc=0.9642 prec=0.7279 recall=0.8433
+[20:39:34] train epoch 006/030 batch 0040/0220 loss=0.17782 acc=0.9641 prec=0.7266 recall=0.8333
+[20:39:34] train epoch 006/030 batch 0060/0220 loss=0.17724 acc=0.9633 prec=0.7219 recall=0.8395
+[20:39:34] train epoch 006/030 batch 0080/0220 loss=0.17499 acc=0.9640 prec=0.7247 recall=0.8399
+[20:39:35] train epoch 006/030 batch 0100/0220 loss=0.17404 acc=0.9635 prec=0.7212 recall=0.8462
+[20:39:35] train epoch 006/030 batch 0120/0220 loss=0.17342 acc=0.9639 prec=0.7232 recall=0.8451
+[20:39:35] train epoch 006/030 batch 0140/0220 loss=0.17201 acc=0.9642 prec=0.7260 recall=0.8466
+[20:39:35] train epoch 006/030 batch 0160/0220 loss=0.17074 acc=0.9644 prec=0.7260 recall=0.8480
+[20:39:36] train epoch 006/030 batch 0180/0220 loss=0.17068 acc=0.9646 prec=0.7259 recall=0.8471
+[20:39:36] train epoch 006/030 batch 0200/0220 loss=0.17034 acc=0.9644 prec=0.7249 recall=0.8470
+[20:39:36] train epoch 006/030 batch 0220/0220 loss=0.17033 acc=0.9644 prec=0.7263 recall=0.8482
+[20:39:37] epoch 006/030 train_loss=0.17033 train_acc=0.9644 train_f1=0.7825 train_spec=0.9739 train_cm=[[214672,5749],[2731,15256]] val_loss=0.35064 val_acc=0.9578 val_prec=0.7218 val_recall=0.6176 val_f1=0.6656 val_spec=0.9703 val_fpr=0.0297 thr=0.90 val_cm=[[79769,1411],[2267,3661]] lr=0.001000
+[20:39:37] no val improvement for 3 epoch(s) (patience=10, min_delta=0.000100)
+[20:39:37] train epoch 007/030 batch 0020/0220 loss=0.17170 acc=0.9616 prec=0.6850 recall=0.8422
+[20:39:38] train epoch 007/030 batch 0040/0220 loss=0.17009 acc=0.9631 prec=0.6992 recall=0.8409
+[20:39:38] train epoch 007/030 batch 0060/0220 loss=0.16656 acc=0.9649 prec=0.7191 recall=0.8450
+[20:39:38] train epoch 007/030 batch 0080/0220 loss=0.16232 acc=0.9656 prec=0.7242 recall=0.8498
+[20:39:39] train epoch 007/030 batch 0100/0220 loss=0.16230 acc=0.9658 prec=0.7283 recall=0.8483
+[20:39:39] train epoch 007/030 batch 0120/0220 loss=0.16228 acc=0.9656 prec=0.7279 recall=0.8525
+[20:39:39] train epoch 007/030 batch 0140/0220 loss=0.16166 acc=0.9658 prec=0.7315 recall=0.8539
+[20:39:39] train epoch 007/030 batch 0160/0220 loss=0.16083 acc=0.9658 prec=0.7309 recall=0.8546
+[20:39:40] train epoch 007/030 batch 0180/0220 loss=0.16028 acc=0.9660 prec=0.7329 recall=0.8560
+[20:39:40] train epoch 007/030 batch 0200/0220 loss=0.16044 acc=0.9658 prec=0.7337 recall=0.8567
+[20:39:40] train epoch 007/030 batch 0220/0220 loss=0.16024 acc=0.9658 prec=0.7334 recall=0.8585
+[20:39:41] epoch 007/030 train_loss=0.16024 train_acc=0.9658 train_f1=0.7910 train_spec=0.9745 train_cm=[[214809,5612],[2546,15441]] val_loss=0.34355 val_acc=0.9617 val_prec=0.7579 val_recall=0.6425 val_f1=0.6955 val_spec=0.9763 val_fpr=0.0237 thr=0.90 val_cm=[[79963,1217],[2119,3809]] lr=0.000500
+[20:39:41] no val improvement for 4 epoch(s) (patience=10, min_delta=0.000100)
+[20:39:41] train epoch 008/030 batch 0020/0220 loss=0.15260 acc=0.9699 prec=0.7562 recall=0.8520
+[20:39:41] train epoch 008/030 batch 0040/0220 loss=0.14455 acc=0.9713 prec=0.7721 recall=0.8629
+[20:39:42] train epoch 008/030 batch 0060/0220 loss=0.14094 acc=0.9707 prec=0.7599 recall=0.8690
+[20:39:42] train epoch 008/030 batch 0080/0220 loss=0.13938 acc=0.9707 prec=0.7627 recall=0.8760
+[20:39:42] train epoch 008/030 batch 0100/0220 loss=0.14027 acc=0.9704 prec=0.7616 recall=0.8739
+[20:39:43] train epoch 008/030 batch 0120/0220 loss=0.14191 acc=0.9700 prec=0.7601 recall=0.8738
+[20:39:43] train epoch 008/030 batch 0140/0220 loss=0.14072 acc=0.9702 prec=0.7622 recall=0.8757
+[20:39:43] train epoch 008/030 batch 0160/0220 loss=0.14030 acc=0.9703 prec=0.7621 recall=0.8760
+[20:39:43] train epoch 008/030 batch 0180/0220 loss=0.14042 acc=0.9702 prec=0.7621 recall=0.8768
+[20:39:44] train epoch 008/030 batch 0200/0220 loss=0.13969 acc=0.9701 prec=0.7622 recall=0.8786
+[20:39:44] train epoch 008/030 batch 0220/0220 loss=0.13968 acc=0.9700 prec=0.7605 recall=0.8791
+[20:39:45] epoch 008/030 train_loss=0.13968 train_acc=0.9700 train_f1=0.8155 train_spec=0.9774 train_cm=[[215440,4981],[2174,15813]] val_loss=0.37121 val_acc=0.9613 val_prec=0.7586 val_recall=0.6317 val_f1=0.6894 val_spec=0.9770 val_fpr=0.0230 thr=0.90 val_cm=[[79988,1192],[2183,3745]] lr=0.000500
+[20:39:45] no val improvement for 5 epoch(s) (patience=10, min_delta=0.000100)
+[20:39:45] train epoch 009/030 batch 0020/0220 loss=0.12793 acc=0.9721 prec=0.7699 recall=0.8867
+[20:39:45] train epoch 009/030 batch 0040/0220 loss=0.13488 acc=0.9709 prec=0.7651 recall=0.8821
+[20:39:46] train epoch 009/030 batch 0060/0220 loss=0.13438 acc=0.9705 prec=0.7562 recall=0.8839
+[20:39:46] train epoch 009/030 batch 0080/0220 loss=0.13411 acc=0.9707 prec=0.7604 recall=0.8840
+[20:39:46] train epoch 009/030 batch 0100/0220 loss=0.13388 acc=0.9705 prec=0.7643 recall=0.8872
+[20:39:47] train epoch 009/030 batch 0120/0220 loss=0.13417 acc=0.9705 prec=0.7641 recall=0.8868
+[20:39:47] train epoch 009/030 batch 0140/0220 loss=0.13269 acc=0.9709 prec=0.7656 recall=0.8867
+[20:39:47] train epoch 009/030 batch 0160/0220 loss=0.13443 acc=0.9704 prec=0.7626 recall=0.8858
+[20:39:47] train epoch 009/030 batch 0180/0220 loss=0.13430 acc=0.9704 prec=0.7622 recall=0.8857
+[20:39:48] train epoch 009/030 batch 0200/0220 loss=0.13407 acc=0.9705 prec=0.7625 recall=0.8849
+[20:39:48] train epoch 009/030 batch 0220/0220 loss=0.13304 acc=0.9708 prec=0.7643 recall=0.8861
+[20:39:49] epoch 009/030 train_loss=0.13304 train_acc=0.9708 train_f1=0.8207 train_spec=0.9777 train_cm=[[215505,4916],[2049,15938]] val_loss=0.36989 val_acc=0.9630 val_prec=0.7820 val_recall=0.6319 val_f1=0.6990 val_spec=0.9778 val_fpr=0.0222 thr=0.90 val_cm=[[80136,1044],[2182,3746]] lr=0.000500
+[20:39:49] no val improvement for 6 epoch(s) (patience=10, min_delta=0.000100)
+[20:39:49] train epoch 010/030 batch 0020/0220 loss=0.13396 acc=0.9717 prec=0.7942 recall=0.8969
+[20:39:49] train epoch 010/030 batch 0040/0220 loss=0.13177 acc=0.9719 prec=0.7872 recall=0.8963
+[20:39:50] train epoch 010/030 batch 0060/0220 loss=0.13262 acc=0.9717 prec=0.7806 recall=0.8919
+[20:39:50] train epoch 010/030 batch 0080/0220 loss=0.13144 acc=0.9717 prec=0.7823 recall=0.8955
+[20:39:50] train epoch 010/030 batch 0100/0220 loss=0.13384 acc=0.9711 prec=0.7774 recall=0.8944
+[20:39:51] train epoch 010/030 batch 0120/0220 loss=0.13284 acc=0.9711 prec=0.7764 recall=0.8928
+[20:39:51] train epoch 010/030 batch 0140/0220 loss=0.13275 acc=0.9711 prec=0.7731 recall=0.8906
+[20:39:51] train epoch 010/030 batch 0160/0220 loss=0.13145 acc=0.9712 prec=0.7691 recall=0.8904
+[20:39:51] train epoch 010/030 batch 0180/0220 loss=0.13097 acc=0.9715 prec=0.7687 recall=0.8892
+[20:39:52] train epoch 010/030 batch 0200/0220 loss=0.12965 acc=0.9718 prec=0.7714 recall=0.8905
+[20:39:52] train epoch 010/030 batch 0220/0220 loss=0.12934 acc=0.9719 prec=0.7720 recall=0.8904
+[20:39:53] epoch 010/030 train_loss=0.12934 train_acc=0.9719 train_f1=0.8270 train_spec=0.9785 train_cm=[[215691,4730],[1971,16016]] val_loss=0.36465 val_acc=0.9624 val_prec=0.7709 val_recall=0.6363 val_f1=0.6972 val_spec=0.9766 val_fpr=0.0234 thr=0.90 val_cm=[[80059,1121],[2156,3772]] lr=0.000250
+[20:39:53] no val improvement for 7 epoch(s) (patience=10, min_delta=0.000100)
+[20:39:53] train epoch 011/030 batch 0020/0220 loss=0.12320 acc=0.9716 prec=0.7633 recall=0.8949
+[20:39:53] train epoch 011/030 batch 0040/0220 loss=0.12104 acc=0.9727 prec=0.7734 recall=0.8964
+[20:39:54] train epoch 011/030 batch 0060/0220 loss=0.12333 acc=0.9724 prec=0.7710 recall=0.8915
+[20:39:54] train epoch 011/030 batch 0080/0220 loss=0.12484 acc=0.9714 prec=0.7613 recall=0.8919
+[20:39:54] train epoch 011/030 batch 0100/0220 loss=0.12449 acc=0.9716 prec=0.7633 recall=0.8904
+[20:39:54] train epoch 011/030 batch 0120/0220 loss=0.12158 acc=0.9724 prec=0.7689 recall=0.8951
+[20:39:55] train epoch 011/030 batch 0140/0220 loss=0.12163 acc=0.9726 prec=0.7715 recall=0.8955
+[20:39:55] train epoch 011/030 batch 0160/0220 loss=0.12202 acc=0.9726 prec=0.7720 recall=0.8967
+[20:39:55] train epoch 011/030 batch 0180/0220 loss=0.12238 acc=0.9726 prec=0.7725 recall=0.8959
+[20:39:56] train epoch 011/030 batch 0200/0220 loss=0.12142 acc=0.9727 prec=0.7747 recall=0.8977
+[20:39:56] train epoch 011/030 batch 0220/0220 loss=0.12168 acc=0.9727 prec=0.7752 recall=0.8984
+[20:39:57] epoch 011/030 train_loss=0.12168 train_acc=0.9727 train_f1=0.8323 train_spec=0.9787 train_cm=[[215735,4686],[1828,16159]] val_loss=0.38061 val_acc=0.9638 val_prec=0.7891 val_recall=0.6387 val_f1=0.7059 val_spec=0.9807 val_fpr=0.0193 thr=0.90 val_cm=[[80168,1012],[2142,3786]] lr=0.000250
+[20:39:57] no val improvement for 8 epoch(s) (patience=10, min_delta=0.000100)
+[20:39:57] train epoch 012/030 batch 0020/0220 loss=0.11734 acc=0.9736 prec=0.7687 recall=0.9008
+[20:39:57] train epoch 012/030 batch 0040/0220 loss=0.11512 acc=0.9747 prec=0.7913 recall=0.9030
+[20:39:57] train epoch 012/030 batch 0060/0220 loss=0.11950 acc=0.9731 prec=0.7799 recall=0.9012
+[20:39:58] train epoch 012/030 batch 0080/0220 loss=0.11938 acc=0.9732 prec=0.7784 recall=0.9006
+[20:39:58] train epoch 012/030 batch 0100/0220 loss=0.12013 acc=0.9730 prec=0.7762 recall=0.8981
+[20:39:58] train epoch 012/030 batch 0120/0220 loss=0.12044 acc=0.9730 prec=0.7784 recall=0.8976
+[20:39:59] train epoch 012/030 batch 0140/0220 loss=0.11925 acc=0.9733 prec=0.7794 recall=0.8986
+[20:39:59] train epoch 012/030 batch 0160/0220 loss=0.11889 acc=0.9735 prec=0.7830 recall=0.9000
+[20:39:59] train epoch 012/030 batch 0180/0220 loss=0.11810 acc=0.9737 prec=0.7837 recall=0.9002
+[20:39:59] train epoch 012/030 batch 0200/0220 loss=0.11711 acc=0.9739 prec=0.7851 recall=0.9000
+[20:40:00] train epoch 012/030 batch 0220/0220 loss=0.11698 acc=0.9738 prec=0.7844 recall=0.9006
+[20:40:01] epoch 012/030 train_loss=0.11698 train_acc=0.9738 train_f1=0.8385 train_spec=0.9798 train_cm=[[215969,4452],[1788,16199]] val_loss=0.38323 val_acc=0.9622 val_prec=0.7615 val_recall=0.6474 val_f1=0.6999 val_spec=0.9780 val_fpr=0.0220 thr=0.90 val_cm=[[79978,1202],[2090,3838]] lr=0.000250
+[20:40:01] no val improvement for 9 epoch(s) (patience=10, min_delta=0.000100)
+[20:40:01] train epoch 013/030 batch 0020/0220 loss=0.11270 acc=0.9745 prec=0.7874 recall=0.9127
+[20:40:01] train epoch 013/030 batch 0040/0220 loss=0.11423 acc=0.9739 prec=0.7787 recall=0.9073
+[20:40:01] train epoch 013/030 batch 0060/0220 loss=0.11506 acc=0.9742 prec=0.7851 recall=0.9090
+[20:40:02] train epoch 013/030 batch 0080/0220 loss=0.11670 acc=0.9734 prec=0.7767 recall=0.9064
+[20:40:02] train epoch 013/030 batch 0100/0220 loss=0.11459 acc=0.9738 prec=0.7798 recall=0.9073
+[20:40:02] train epoch 013/030 batch 0120/0220 loss=0.11399 acc=0.9741 prec=0.7815 recall=0.9046
+[20:40:02] train epoch 013/030 batch 0140/0220 loss=0.11395 acc=0.9738 prec=0.7797 recall=0.9043
+[20:40:03] train epoch 013/030 batch 0160/0220 loss=0.11406 acc=0.9740 prec=0.7830 recall=0.9037
+[20:40:03] train epoch 013/030 batch 0180/0220 loss=0.11540 acc=0.9739 prec=0.7831 recall=0.9027
+[20:40:03] train epoch 013/030 batch 0200/0220 loss=0.11604 acc=0.9738 prec=0.7828 recall=0.9025
+[20:40:04] train epoch 013/030 batch 0220/0220 loss=0.11614 acc=0.9737 prec=0.7820 recall=0.9027
+[20:40:04] epoch 013/030 train_loss=0.11614 train_acc=0.9737 train_f1=0.8380 train_spec=0.9795 train_cm=[[215894,4527],[1750,16237]] val_loss=0.39803 val_acc=0.9635 val_prec=0.7946 val_recall=0.6253 val_f1=0.6999 val_spec=0.9801 val_fpr=0.0199 thr=0.90 val_cm=[[80222,958],[2221,3707]] lr=0.000125
+[20:40:04] no val improvement for 10 epoch(s) (patience=10, min_delta=0.000100)
+[20:40:04] Early stopping at epoch 013: best_val_precision=0.815509 best_val_f1=0.651813 from epoch 003
+saved checkpoint: runs/realdatabeam_transformer.pt
+saved split manifest: runs/realdatabeam_transformer.split.json
+saved metrics: runs/realdatabeam_transformer.metrics.csv
+saved val report: runs/realdatabeam_transformer.val_report.json
+saved log: runs/realdatabeam_transformer.log.txt
 FINAL_SUMMARY_BEGIN
 config history_steps=30 batch_size=64 lr=0.001 dropout=0.15 weight_decay=0.0001 pos_weight=3.5681 min_recall=0.50 threshold_sweep=0.60:0.02:0.90
 data train_files=36 val_files=12 train_windows=14024 val_windows=5124 beam_positive_fraction=0.0728 window_positive_fraction=0.4629
-best epoch=6 val_loss=0.534274 val_precision=0.831550 val_f1=0.633239 threshold=0.90 precision=0.8316 recall=0.5113 specificity=0.9850 fpr=0.0150
-best_confusion tn=80566 fp=614 fn=2897 tp=3031
-artifacts checkpoint=runs/realdatabeam_unet.pt split=runs/realdatabeam_unet.split.json metrics=runs/realdatabeam_unet.metrics.csv val_report=runs/realdatabeam_unet.val_report.json log=runs/realdatabeam_unet.log.txt
+best epoch=3 val_loss=0.304306 val_precision=0.815509 val_f1=0.651813 threshold=0.90 precision=0.8155 recall=0.5428 specificity=0.9826 fpr=0.0174
+best_confusion tn=80452 fp=728 fn=2710 tp=3218
+artifacts checkpoint=runs/realdatabeam_transformer.pt split=runs/realdatabeam_transformer.split.json metrics=runs/realdatabeam_transformer.metrics.csv val_report=runs/realdatabeam_transformer.val_report.json log=runs/realdatabeam_transformer.log.txt
 FINAL_SUMMARY_END
