@@ -25,7 +25,7 @@ from train import (
 SHOW_LIDAR = True
 ENABLE_MODEL_INFERENCE = True
 USE_SIMPLE_MODEL_INFERENCE = True
-MODEL_INFERENCE_HISTORY_STEP_GAP = 20
+MODEL_INFERENCE_HISTORY_STEP_GAP = 5
 WINDOW_WIDTH = 1600
 WINDOW_HEIGHT = 900
 CAMERA_DISTANCE = 4.8
@@ -43,6 +43,44 @@ LEGACY_MODEL_CHECKPOINT = RUNS_DIR / 'gru_lidar_classifier.pt'
 SIMPLE_MODEL_CHECKPOINT = SIMPLE_RUNS_DIR / 'pose_aligned_beam_transformer.pt'
 MODEL_DEVICE = 'auto'
 MODEL_MAX_HISTORY: int | None = None
+LIDAR_SENSOR_LABELS: tuple[str, ...] = (
+    'FL wheel 30L',
+    'Front left d20',
+    'Front center',
+    'Front right d20',
+    'FR wheel 30R',
+    'Front left d25',
+    'Front right d25',
+    'Left side d20',
+    'Right side d20',
+    'BL wheel 40L',
+    'Rear left',
+    'Rear right',
+    'BR wheel 40R',
+    'Front left d10',
+    'Front right d10',
+    'FL wheel 15L',
+    'FR wheel 15R',
+)
+LIDAR_SENSOR_SHORT_LABELS: tuple[str, ...] = (
+    'FL30L',
+    'FL20d',
+    'Front',
+    'FR20d',
+    'FR30R',
+    'FL25d',
+    'FR25d',
+    'LS20d',
+    'RS20d',
+    'BL40L',
+    'RearL',
+    'RearR',
+    'BR40R',
+    'FL10d',
+    'FR10d',
+    'FL15L',
+    'FR15R',
+)
 
 
 @dataclass(frozen=True)
@@ -169,6 +207,35 @@ def _append_persistent_hit_overlay(scene: mujoco.MjvScene, hit_points_cm: list[n
             (end_pt_cm / 100.0).astype(np.float64),
         )
         scene.ngeom += 1
+
+
+def _format_lidar_distance_cm(distance_cm: float) -> tuple[str, str]:
+    distance_cm_f = float(distance_cm)
+    if distance_cm_f < 0.0:
+        return '--', '--'
+    return f'{distance_cm_f:6.1f}', f'{distance_cm_f / 100.0:5.2f}'
+
+
+def _build_lidar_readings_overlay(scan) -> tuple[str, str]:
+    left_lines = ['Rover LIDAR', 'id label  hit    cm    m']
+    right_lines = ['', '']
+    distances_cm = np.asarray(scan.distances_cm, dtype=np.float32)
+    class_ids = np.asarray(scan.class_ids, dtype=np.int64)
+    sensor_count = int(distances_cm.shape[0])
+    for idx in range(sensor_count):
+        label = LIDAR_SENSOR_SHORT_LABELS[idx] if idx < len(LIDAR_SENSOR_SHORT_LABELS) else f'S{idx:02d}'
+        cm_text, m_text = _format_lidar_distance_cm(float(distances_cm[idx]))
+        hit_text = 'yes' if float(distances_cm[idx]) >= 0.0 else 'no'
+        class_id = int(class_ids[idx]) if idx < class_ids.shape[0] else LIDAR_CLASS_NONE
+        if class_id == 1:
+            kind_text = 'obst'
+        elif class_id == 0:
+            kind_text = 'grnd'
+        else:
+            kind_text = 'none'
+        left_lines.append(f'{idx:02d} {label:<6} {hit_text:>3} {cm_text:>6} {m_text:>5}')
+        right_lines.append(kind_text)
+    return '\n'.join(left_lines), '\n'.join(right_lines)
 
 
 class CheckpointDemoInferencer:
@@ -478,6 +545,15 @@ def main() -> None:
                     viewport,
                     status_left,
                     status_right,
+                    context,
+                )
+                lidar_overlay_left, lidar_overlay_right = _build_lidar_readings_overlay(scan)
+                mujoco.mjr_overlay(
+                    int(mujoco.mjtFontScale.mjFONTSCALE_150),
+                    int(mujoco.mjtGridPos.mjGRID_TOPRIGHT),
+                    viewport,
+                    lidar_overlay_left,
+                    lidar_overlay_right,
                     context,
                 )
                 glfw.swap_buffers(window)
