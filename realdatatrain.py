@@ -342,59 +342,118 @@ class RealLidarSequenceDataset(Dataset):
         return torch.from_numpy(features), torch.from_numpy(target.astype(np.float32))
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
+class TemporalBeamTransformerClassifier(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        num_sensors: int,
+        hidden_dim: int = 48,
+        dropout: float = 0.15,
+        temporal_layers: int = 1,
+        transformer_layers: int = 2,
+        attention_heads: int = 4,
+    ):
         super().__init__()
-        groups = 8 if out_ch >= 8 and out_ch % 8 == 0 else 1
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(groups, out_ch),
+        self.model_type = "real_cleanlog_temporal_beam_transformer"
+        self.in_channels = int(in_channels)
+        self.num_sensors = int(num_sensors)
+        self.hidden_dim = int(hidden_dim)
+        self.temporal_layers = int(max(temporal_layers, 1))
+        self.transformer_layers = int(max(transformer_layers, 1))
+        self.attention_heads = int(max(attention_heads, 1))
+        if self.hidden_dim % self.attention_heads != 0:
+            raise ValueError("hidden_dim must be divisible by attention_heads")
+
+        sensor_geom = MODEL_SENSOR_YAW_PITCH_DEG[: self.num_sensors].astype(np.float32)
+        sensor_geom_rad = np.deg2rad(sensor_geom)
+        sensor_geom_feats = np.concatenate(
+            [
+                np.sin(sensor_geom_rad[:, :1]),
+                np.cos(sensor_geom_rad[:, :1]),
+                np.sin(sensor_geom_rad[:, 1:2]),
+                np.cos(sensor_geom_rad[:, 1:2]),
+            ],
+            axis=1,
+        ).astype(np.float32)
+        self.register_buffer("sensor_geom_feats", torch.from_numpy(sensor_geom_feats), persistent=False)
+        self.register_buffer("sensor_ids", torch.arange(self.num_sensors, dtype=torch.long), persistent=False)
+
+        temporal_hidden = max(self.hidden_dim // 2, 16)
+        self.temporal_input = nn.Sequential(
+            nn.Linear(self.in_channels, temporal_hidden),
+            nn.LayerNorm(temporal_hidden),
             nn.GELU(),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(groups, out_ch),
+            nn.Dropout(dropout),
+        )
+        self.temporal_gru = nn.GRU(
+            input_size=temporal_hidden,
+            hidden_size=temporal_hidden,
+            num_layers=self.temporal_layers,
+            batch_first=True,
+            dropout=dropout if self.temporal_layers > 1 else 0.0,
+            bidirectional=True,
+        )
+        self.current_mlp = nn.Sequential(
+            nn.Linear(self.in_channels, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
             nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        self.sensor_embedding = nn.Embedding(self.num_sensors, self.hidden_dim)
+        self.sensor_geom_mlp = nn.Sequential(
+            nn.Linear(4, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=self.attention_heads,
+            dim_feedforward=self.hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.beam_encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.transformer_layers)
+        self.beam_fuse = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim * 2),
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        batch_size, channels, time_steps, sensor_count = x.shape
+        if sensor_count != self.num_sensors:
+            raise ValueError(f"Expected {self.num_sensors} sensors, got {sensor_count}")
 
+        beam_sequences = x.permute(0, 3, 2, 1).reshape(batch_size * sensor_count, time_steps, channels)
+        temporal_inputs = self.temporal_input(beam_sequences)
+        temporal_outputs, _ = self.temporal_gru(temporal_inputs)
+        temporal_tokens = temporal_outputs[:, -1, :].reshape(batch_size, sensor_count, self.hidden_dim)
 
-class SmallTemporalUNet(nn.Module):
-    def __init__(self, in_channels: int, base_channels: int = 32, dropout: float = 0.10):
-        super().__init__()
-        self.model_type = "real_cleanlog_temporal_unet"
-        self.in_channels = int(in_channels)
-        self.base_channels = int(base_channels)
+        current_features = x[:, :, -1, :].permute(0, 2, 1).reshape(batch_size * sensor_count, channels)
+        current_tokens = self.current_mlp(current_features).reshape(batch_size, sensor_count, self.hidden_dim)
 
-        self.enc1 = ConvBlock(in_channels, base_channels)
-        self.enc2 = ConvBlock(base_channels, base_channels * 2)
-        self.enc3 = ConvBlock(base_channels * 2, base_channels * 4)
-        self.bottleneck = ConvBlock(base_channels * 4, base_channels * 4)
-        self.pool = nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1))
-        self.drop = nn.Dropout2d(dropout)
-        self.dec3 = ConvBlock(base_channels * 8, base_channels * 2)
-        self.dec2 = ConvBlock(base_channels * 4, base_channels)
-        self.dec1 = ConvBlock(base_channels * 2, base_channels)
-        self.head = nn.Conv2d(base_channels, 1, kernel_size=1)
+        beam_ids = self.sensor_ids.to(device=x.device)
+        beam_embed = self.sensor_embedding(beam_ids).unsqueeze(0).expand(batch_size, -1, -1)
+        geom_embed = self.sensor_geom_mlp(self.sensor_geom_feats.to(device=x.device)).unsqueeze(0).expand(batch_size, -1, -1)
 
-    def _upsample_to(self, x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-        return F.interpolate(x, size=ref.shape[-2:], mode="bilinear", align_corners=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool(self.drop(e1)))
-        e3 = self.enc3(self.pool(self.drop(e2)))
-        b = self.bottleneck(self.pool(self.drop(e3)))
-
-        d3 = self._upsample_to(b, e3)
-        d3 = self.dec3(torch.cat([d3, e3], dim=1))
-        d2 = self._upsample_to(d3, e2)
-        d2 = self.dec2(torch.cat([d2, e2], dim=1))
-        d1 = self._upsample_to(d2, e1)
-        d1 = self.dec1(torch.cat([d1, e1], dim=1))
-
-        logits = self.head(d1).squeeze(1)
-        return logits[:, -1, :]
+        tokens = temporal_tokens + current_tokens + beam_embed + geom_embed
+        encoded = self.beam_encoder(tokens)
+        global_context = encoded.mean(dim=1, keepdim=True).expand(-1, sensor_count, -1)
+        fused = self.beam_fuse(torch.cat([encoded, global_context], dim=-1))
+        logits = self.head(fused).squeeze(-1)
+        return logits
 
 
 def build_sampler(dataset: RealLidarSequenceDataset) -> WeightedRandomSampler | None:
@@ -767,7 +826,7 @@ def parse_args() -> argparse.Namespace:
         description="Train a real cleanlog beam classifier on the last N lidar frames plus the current frame."
     )
     parser.add_argument("--cleanlog-dir", type=Path, default=Path("cleanlog"))
-    parser.add_argument("--output", type=Path, default=Path("runs/realdatabeam_unet.pt"))
+    parser.add_argument("--output", type=Path, default=Path("runs/realdatabeam_transformer.pt"))
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -777,8 +836,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-fraction", type=float, default=0.25)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--workers", type=int, default=-1)
-    parser.add_argument("--base-channels", type=int, default=24)
+    parser.add_argument("--base-channels", type=int, default=48)
     parser.add_argument("--dropout", type=float, default=0.15)
+    parser.add_argument("--temporal-layers", type=int, default=1)
+    parser.add_argument("--transformer-layers", type=int, default=2)
+    parser.add_argument("--attention-heads", type=int, default=4)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--max-range-cm", type=float, default=DEFAULT_LIDAR_MAX_RANGE_CM)
     parser.add_argument("--xy-offset-max-cm", type=float, default=10000.0)
@@ -820,7 +882,7 @@ def main() -> None:
         try:
             device, device_kind = select_runtime_device(args.device)
             configure_runtime_for_device(device_kind)
-            log("Starting real cleanlog temporal U-Net trainer")
+            log("Starting real cleanlog temporal beam-transformer trainer")
             log(f"Device selected: {device_kind} -> {device}")
 
             train_loader, val_loader, meta, sensor_names, input_channels = build_loaders(args)
@@ -882,15 +944,20 @@ def main() -> None:
                 )
             log(f"Wrote split manifest: {split_path}")
 
-            model = SmallTemporalUNet(
+            model = TemporalBeamTransformerClassifier(
                 in_channels=input_channels,
-                base_channels=args.base_channels,
+                num_sensors=meta.num_sensors,
+                hidden_dim=args.base_channels,
                 dropout=args.dropout,
+                temporal_layers=args.temporal_layers,
+                transformer_layers=args.transformer_layers,
+                attention_heads=args.attention_heads,
             ).to(device)
             param_count = sum(p.numel() for p in model.parameters())
             log(
-                f"Model summary: type={model.model_type} base_channels={args.base_channels} "
-                f"dropout={args.dropout:.2f} params={param_count}"
+                f"Model summary: type={model.model_type} hidden_dim={args.base_channels} "
+                f"temporal_layers={args.temporal_layers} transformer_layers={args.transformer_layers} "
+                f"attention_heads={args.attention_heads} dropout={args.dropout:.2f} params={param_count}"
             )
             optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -1054,11 +1121,14 @@ def main() -> None:
                             "model_config": {
                                 "model_type": model.model_type,
                                 "in_channels": input_channels,
-                                "base_channels": args.base_channels,
+                                "hidden_dim": args.base_channels,
                                 "dropout": args.dropout,
                                 "num_sensors": meta.num_sensors,
                                 "history_steps": meta.history_steps,
                                 "max_range_cm": args.max_range_cm,
+                                "temporal_layers": args.temporal_layers,
+                                "transformer_layers": args.transformer_layers,
+                                "attention_heads": args.attention_heads,
                             },
                             "meta": {
                                 "train_files": meta.train_files,
