@@ -1365,7 +1365,7 @@ def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, Dat
 
 
 def build_experiment_suite() -> list[ExperimentConfig]:
-    return [
+    experiments = [
         ExperimentConfig(
             name="conv_unet_balanced",
             model_type="conv_unet",
@@ -2204,6 +2204,11 @@ def build_experiment_suite() -> list[ExperimentConfig]:
             label_smoothing=0.04,
         ),
     ]
+    resume_from = "beam_transformer_xl_smooth_tight"
+    for idx, exp in enumerate(experiments):
+        if exp.name == resume_from:
+            return experiments[idx:]
+    return experiments
 
 
 def parse_args() -> argparse.Namespace:
