@@ -68,6 +68,7 @@ class ExperimentConfig:
     loss_type: str = "bce"
     focal_gamma: float = 0.0
     label_smoothing: float = 0.0
+    aux_hit_loss_weight: float = 0.0
     temporal_layers: int = 1
     transformer_layers: int = 2
     attention_heads: int = 4
@@ -860,6 +861,12 @@ def _sample_bev_ray_profile(
     return sampled.permute(0, 2, 3, 1)
 
 
+def _flatten_time_sensor_rays(values: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int, int]]:
+    batch_size, time_steps, sensor_count = values.shape
+    flat = values.reshape(batch_size, time_steps * sensor_count)
+    return flat, (batch_size, time_steps, sensor_count)
+
+
 class TemporalBEVUNetClassifier(nn.Module):
     def __init__(
         self,
@@ -1030,8 +1037,15 @@ class TemporalBEVFusionClassifier(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(self.hidden_dim, 1),
         )
+        self.aux_hit_head = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim * 2),
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 1),
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         batch_size, _, _, sensor_count = x.shape
         if sensor_count != self.num_sensors:
             raise ValueError(f"Expected {self.num_sensors} sensors, got {sensor_count}")
@@ -1072,7 +1086,24 @@ class TemporalBEVFusionClassifier(nn.Module):
         beam_embed = self.sensor_embedding(beam_ids).unsqueeze(0).expand(batch_size, -1, -1)
         tokens = endpoint_tokens + ray_mean + current_tokens + beam_embed
         encoded = self.beam_encoder(tokens)
-        return self.head(torch.cat([encoded, ray_max, global_tokens], dim=-1)).squeeze(-1)
+        logits = self.head(torch.cat([encoded, ray_max, global_tokens], dim=-1)).squeeze(-1)
+
+        flat_endpoint_x, aux_shape = _flatten_time_sensor_rays(endpoint_x)
+        flat_endpoint_y, _ = _flatten_time_sensor_rays(endpoint_y)
+        flat_dir_x, _ = _flatten_time_sensor_rays(dir_x)
+        flat_dir_y, _ = _flatten_time_sensor_rays(dir_y)
+        aux_endpoint = self.bev_proj(_sample_bev_features(bev_features, flat_endpoint_x, flat_endpoint_y, self.grid_extent_cm))
+        aux_profile = _sample_bev_ray_profile(
+            bev_features,
+            flat_dir_x,
+            flat_dir_y,
+            max_range_cm=self.max_range_cm,
+            grid_extent_cm=self.grid_extent_cm,
+        )
+        aux_ray_mean = self.bev_proj(aux_profile.mean(dim=2))
+        aux_logits = self.aux_hit_head(torch.cat([aux_endpoint, aux_ray_mean], dim=-1)).squeeze(-1)
+        aux_logits = aux_logits.reshape(aux_shape)
+        return {"logits": logits, "aux_hit_logits": aux_logits}
 
 
 def build_sampler(dataset: RealLidarSequenceDataset) -> WeightedRandomSampler | None:
@@ -1108,12 +1139,14 @@ def compute_pos_weight(sequences: list[RealSequence], max_weight: float) -> tupl
 
 
 def compute_experiment_loss(
-    logits: torch.Tensor,
+    outputs: torch.Tensor | dict[str, torch.Tensor],
+    inputs: torch.Tensor,
     targets: torch.Tensor,
     pos_weight_t: torch.Tensor,
     exp: ExperimentConfig,
     training: bool,
 ) -> torch.Tensor:
+    logits = outputs["logits"] if isinstance(outputs, dict) else outputs
     smooth = float(exp.label_smoothing) if training else 0.0
     if smooth > 0.0:
         clamped = min(max(smooth, 0.0), 0.49)
@@ -1128,13 +1161,22 @@ def compute_experiment_loss(
         reduction="none",
     )
     if exp.loss_type != "focal":
-        return per_entry.mean()
+        main_loss = per_entry.mean()
+    else:
+        gamma = max(float(exp.focal_gamma), 0.0)
+        probs = torch.sigmoid(logits)
+        pt = probs * targets + (1.0 - probs) * (1.0 - targets)
+        focal_weight = torch.pow(torch.clamp(1.0 - pt, min=1e-6), gamma)
+        main_loss = (per_entry * focal_weight).mean()
 
-    gamma = max(float(exp.focal_gamma), 0.0)
-    probs = torch.sigmoid(logits)
-    pt = probs * targets + (1.0 - probs) * (1.0 - targets)
-    focal_weight = torch.pow(torch.clamp(1.0 - pt, min=1e-6), gamma)
-    return (per_entry * focal_weight).mean()
+    aux_weight = float(exp.aux_hit_loss_weight)
+    if aux_weight <= 0.0 or not isinstance(outputs, dict) or "aux_hit_logits" not in outputs:
+        return main_loss
+
+    aux_targets = inputs[:, 1]
+    aux_logits = outputs["aux_hit_logits"]
+    aux_loss = F.binary_cross_entropy_with_logits(aux_logits, aux_targets, reduction="mean")
+    return main_loss + aux_weight * aux_loss
 
 
 def evaluate(
@@ -1158,8 +1200,9 @@ def evaluate(
         for x, y in loader:
             x = x.to(device)
             y = y.to(device)
-            logits = model(x)
-            loss = compute_experiment_loss(logits, y, pos_weight_t, exp, training=False)
+            outputs = model(x)
+            logits = outputs["logits"] if isinstance(outputs, dict) else outputs
+            loss = compute_experiment_loss(outputs, x, y, pos_weight_t, exp, training=False)
 
             total_loss += float(loss.item()) * float(y.shape[0])
             total_samples += int(y.shape[0])
@@ -1254,7 +1297,8 @@ def sweep_validation_thresholds(
     with torch.inference_mode():
         for x, y in loader:
             x = x.to(device)
-            logits = model(x)
+            outputs = model(x)
+            logits = outputs["logits"] if isinstance(outputs, dict) else outputs
             logits_chunks.append(logits.detach().cpu().numpy().astype(np.float32, copy=False))
             target_chunks.append(y.detach().cpu().numpy().astype(np.float32, copy=False))
 
@@ -1344,8 +1388,9 @@ def train_epoch(
             else nullcontext()
         )
         with amp_context:
-            logits = model(x)
-            loss = compute_experiment_loss(logits, y, pos_weight_t, exp, training=True)
+            outputs = model(x)
+            logits = outputs["logits"] if isinstance(outputs, dict) else outputs
+            loss = compute_experiment_loss(outputs, x, y, pos_weight_t, exp, training=True)
 
         optimizer.zero_grad(set_to_none=True)
         if scaler.is_enabled():
@@ -1475,22 +1520,6 @@ def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, Dat
 def build_experiment_suite() -> list[ExperimentConfig]:
     return [
         ExperimentConfig(
-            name="beam_transformer_recall_anchor",
-            model_type="beam_transformer",
-            hidden_dim=160,
-            dropout=0.18,
-            lr=7e-4,
-            weight_decay=2e-4,
-            pos_weight_scale=1.00,
-            threshold_min_recall=0.65,
-            threshold_sweep_start=0.70,
-            threshold_sweep_end=0.95,
-            threshold_sweep_step=0.02,
-            temporal_layers=3,
-            transformer_layers=5,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
             name="bev_fusion_occ_balanced",
             model_type="bev_fusion",
             hidden_dim=160,
@@ -1504,6 +1533,38 @@ def build_experiment_suite() -> list[ExperimentConfig]:
             threshold_sweep_step=0.01,
             transformer_layers=4,
             attention_heads=8,
+        ),
+        ExperimentConfig(
+            name="bev_fusion_occ_balanced_aux025",
+            model_type="bev_fusion",
+            hidden_dim=160,
+            dropout=0.18,
+            lr=6.5e-4,
+            weight_decay=2.5e-4,
+            pos_weight_scale=0.95,
+            threshold_min_recall=0.55,
+            threshold_sweep_start=0.80,
+            threshold_sweep_end=0.98,
+            threshold_sweep_step=0.01,
+            transformer_layers=4,
+            attention_heads=8,
+            aux_hit_loss_weight=0.25,
+        ),
+        ExperimentConfig(
+            name="bev_fusion_occ_balanced_aux050",
+            model_type="bev_fusion",
+            hidden_dim=160,
+            dropout=0.18,
+            lr=6.5e-4,
+            weight_decay=2.5e-4,
+            pos_weight_scale=0.95,
+            threshold_min_recall=0.55,
+            threshold_sweep_start=0.80,
+            threshold_sweep_end=0.98,
+            threshold_sweep_step=0.01,
+            transformer_layers=4,
+            attention_heads=8,
+            aux_hit_loss_weight=0.50,
         ),
         ExperimentConfig(
             name="bev_fusion_occ_recall",
@@ -1520,6 +1581,40 @@ def build_experiment_suite() -> list[ExperimentConfig]:
             transformer_layers=4,
             attention_heads=8,
             label_smoothing=0.02,
+        ),
+        ExperimentConfig(
+            name="bev_fusion_occ_recall_aux025",
+            model_type="bev_fusion",
+            hidden_dim=160,
+            dropout=0.18,
+            lr=6e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=1.10,
+            threshold_min_recall=0.65,
+            threshold_sweep_start=0.65,
+            threshold_sweep_end=0.92,
+            threshold_sweep_step=0.02,
+            transformer_layers=4,
+            attention_heads=8,
+            label_smoothing=0.02,
+            aux_hit_loss_weight=0.25,
+        ),
+        ExperimentConfig(
+            name="bev_fusion_occ_recall_aux050",
+            model_type="bev_fusion",
+            hidden_dim=160,
+            dropout=0.18,
+            lr=6e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=1.10,
+            threshold_min_recall=0.65,
+            threshold_sweep_start=0.65,
+            threshold_sweep_end=0.92,
+            threshold_sweep_step=0.02,
+            transformer_layers=4,
+            attention_heads=8,
+            label_smoothing=0.02,
+            aux_hit_loss_weight=0.50,
         ),
         ExperimentConfig(
             name="bev_fusion_occ_recall_harder",
@@ -1553,6 +1648,38 @@ def build_experiment_suite() -> list[ExperimentConfig]:
             attention_heads=8,
         ),
         ExperimentConfig(
+            name="bev_fusion_occ_deep_aux025",
+            model_type="bev_fusion",
+            hidden_dim=192,
+            dropout=0.20,
+            lr=5.5e-4,
+            weight_decay=3e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.60,
+            threshold_sweep_start=0.72,
+            threshold_sweep_end=0.96,
+            threshold_sweep_step=0.02,
+            transformer_layers=5,
+            attention_heads=8,
+            aux_hit_loss_weight=0.25,
+        ),
+        ExperimentConfig(
+            name="bev_fusion_occ_deep_aux050",
+            model_type="bev_fusion",
+            hidden_dim=192,
+            dropout=0.20,
+            lr=5.5e-4,
+            weight_decay=3e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.60,
+            threshold_sweep_start=0.72,
+            threshold_sweep_end=0.96,
+            threshold_sweep_step=0.02,
+            transformer_layers=5,
+            attention_heads=8,
+            aux_hit_loss_weight=0.50,
+        ),
+        ExperimentConfig(
             name="bev_fusion_occ_deep_recall",
             model_type="bev_fusion",
             hidden_dim=192,
@@ -1563,37 +1690,6 @@ def build_experiment_suite() -> list[ExperimentConfig]:
             threshold_min_recall=0.68,
             threshold_sweep_start=0.58,
             threshold_sweep_end=0.90,
-            threshold_sweep_step=0.02,
-            transformer_layers=5,
-            attention_heads=8,
-            label_smoothing=0.02,
-        ),
-        ExperimentConfig(
-            name="bev_fusion_occ_xl_balanced",
-            model_type="bev_fusion",
-            hidden_dim=224,
-            dropout=0.20,
-            lr=5.0e-4,
-            weight_decay=3e-4,
-            pos_weight_scale=1.00,
-            threshold_min_recall=0.60,
-            threshold_sweep_start=0.72,
-            threshold_sweep_end=0.96,
-            threshold_sweep_step=0.02,
-            transformer_layers=5,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="bev_fusion_occ_xl_recall",
-            model_type="bev_fusion",
-            hidden_dim=224,
-            dropout=0.22,
-            lr=4.8e-4,
-            weight_decay=3.5e-4,
-            pos_weight_scale=1.15,
-            threshold_min_recall=0.68,
-            threshold_sweep_start=0.58,
-            threshold_sweep_end=0.88,
             threshold_sweep_step=0.02,
             transformer_layers=5,
             attention_heads=8,
@@ -1612,23 +1708,6 @@ def build_experiment_suite() -> list[ExperimentConfig]:
             threshold_sweep_end=0.96,
             threshold_sweep_step=0.02,
             transformer_layers=4,
-            attention_heads=8,
-            loss_type="focal",
-            focal_gamma=1.0,
-        ),
-        ExperimentConfig(
-            name="bev_fusion_occ_focal_mid",
-            model_type="bev_fusion",
-            hidden_dim=192,
-            dropout=0.20,
-            lr=5.5e-4,
-            weight_decay=3e-4,
-            pos_weight_scale=1.05,
-            threshold_min_recall=0.65,
-            threshold_sweep_start=0.65,
-            threshold_sweep_end=0.92,
-            threshold_sweep_step=0.02,
-            transformer_layers=5,
             attention_heads=8,
             loss_type="focal",
             focal_gamma=1.0,
@@ -1971,6 +2050,7 @@ def run_experiment(
         "loss_type": exp.loss_type,
         "focal_gamma": exp.focal_gamma,
         "label_smoothing": exp.label_smoothing,
+        "aux_hit_loss_weight": exp.aux_hit_loss_weight,
         "threshold_min_recall": exp.threshold_min_recall,
         "threshold_range": [exp.threshold_sweep_start, exp.threshold_sweep_end, exp.threshold_sweep_step],
         "best_epoch": int(best["epoch"]),
@@ -2059,6 +2139,7 @@ def main() -> None:
                     f"Experiment start: {exp.name} model={exp.model_type} hidden={exp.hidden_dim} "
                     f"dropout={exp.dropout:.2f} lr={exp.lr:.5f} pos_weight_scale={exp.pos_weight_scale:.2f} "
                     f"loss={exp.loss_type} gamma={exp.focal_gamma:.2f} smooth={exp.label_smoothing:.3f} "
+                    f"aux_hit={exp.aux_hit_loss_weight:.2f} "
                     f"recall_floor={exp.threshold_min_recall:.2f}"
                 )
                 try:
@@ -2188,7 +2269,8 @@ def main() -> None:
                 f"fpr={float(best_precision['best_metrics']['false_positive_rate']):.4f} "
                 f"threshold={float(best_precision['best_metrics']['threshold']):.2f} "
                 f"loss={best_precision['loss_type']} gamma={best_precision['focal_gamma']:.2f} "
-                f"smooth={best_precision['label_smoothing']:.3f}"
+                f"smooth={best_precision['label_smoothing']:.3f} "
+                f"aux_hit={best_precision['aux_hit_loss_weight']:.2f}"
             )
             log_plain(
                 "best_f1 "
@@ -2199,7 +2281,8 @@ def main() -> None:
                 f"fpr={float(best_f1['best_metrics']['false_positive_rate']):.4f} "
                 f"threshold={float(best_f1['best_metrics']['threshold']):.2f} "
                 f"loss={best_f1['loss_type']} gamma={best_f1['focal_gamma']:.2f} "
-                f"smooth={best_f1['label_smoothing']:.3f}"
+                f"smooth={best_f1['label_smoothing']:.3f} "
+                f"aux_hit={best_f1['aux_hit_loss_weight']:.2f}"
             )
             for rank, result in enumerate(sorted_by_precision, start=1):
                 metrics = result["best_metrics"]
@@ -2215,6 +2298,7 @@ def main() -> None:
                     f"cfg=modeltype:{result['model_type']},hidden:{result['hidden_dim']},dropout:{result['dropout']},"
                     f"lr:{result['lr']},wd:{result['weight_decay']},pws:{result['pos_weight_scale']},"
                     f"loss:{result['loss_type']},gamma:{result['focal_gamma']},smooth:{result['label_smoothing']},"
+                    f"aux_hit:{result['aux_hit_loss_weight']},"
                     f"recall_floor:{result['threshold_min_recall']}"
                 )
             for failed in failed_results:
