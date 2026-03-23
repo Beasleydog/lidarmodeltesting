@@ -705,11 +705,11 @@ class TemporalConvTransformerClassifier(nn.Module):
         return self.head(torch.cat([encoded, global_context], dim=-1)).squeeze(-1)
 
 
-def _compute_local_beam_endpoints(
+def _compute_local_beam_geometry(
     x: torch.Tensor,
     max_range_cm: float,
     relative_xy_scale_cm: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     range_cm = torch.clamp(x[:, 0], 0.0, 1.0) * float(max_range_cm)
     hit = x[:, 1] > 0.5
     rel_x_global = x[:, 5] * float(relative_xy_scale_cm)
@@ -724,50 +724,101 @@ def _compute_local_beam_endpoints(
     current_heading = heading[:, -1:, :1]
     cos_h = torch.cos(current_heading)
     sin_h = torch.sin(current_heading)
-    local_x = cos_h * endpoint_x_global_rel + sin_h * endpoint_y_global_rel
-    local_y = -sin_h * endpoint_x_global_rel + cos_h * endpoint_y_global_rel
+    origin_x = cos_h * rel_x_global + sin_h * rel_y_global
+    origin_y = -sin_h * rel_x_global + cos_h * rel_y_global
+    endpoint_x = cos_h * endpoint_x_global_rel + sin_h * endpoint_y_global_rel
+    endpoint_y = -sin_h * endpoint_x_global_rel + cos_h * endpoint_y_global_rel
+    dir_x = endpoint_x - origin_x
+    dir_y = endpoint_y - origin_y
+    norm = torch.clamp(torch.sqrt(dir_x.square() + dir_y.square()), min=1.0)
+    dir_x = dir_x / norm
+    dir_y = dir_y / norm
     time_age = 0.5 * (x[:, 19] + 1.0)
-    return local_x, local_y, hit, time_age
+    return origin_x, origin_y, endpoint_x, endpoint_y, dir_x, dir_y, hit, time_age
 
 
-def _rasterize_bev_history(
-    local_x: torch.Tensor,
-    local_y: torch.Tensor,
+def _rasterize_bev_evidence(
+    origin_x: torch.Tensor,
+    origin_y: torch.Tensor,
+    endpoint_x: torch.Tensor,
+    endpoint_y: torch.Tensor,
     hit: torch.Tensor,
     time_age: torch.Tensor,
     grid_size: int,
     grid_extent_cm: float,
+    ray_samples: int = 12,
 ) -> torch.Tensor:
-    batch_size, time_steps, sensor_count = local_x.shape
+    batch_size, time_steps, sensor_count = endpoint_x.shape
     grid_size_i = int(grid_size)
     extent = float(grid_extent_cm)
 
-    norm_x = torch.clamp(local_x / extent, -1.0, 1.0)
-    norm_y = torch.clamp(-local_y / extent, -1.0, 1.0)
-    ix = torch.round((norm_x + 1.0) * 0.5 * float(grid_size_i - 1)).long()
-    iy = torch.round((norm_y + 1.0) * 0.5 * float(grid_size_i - 1)).long()
-    valid = (norm_x >= -1.0) & (norm_x <= 1.0) & (norm_y >= -1.0) & (norm_y <= 1.0)
-
-    batch_idx = torch.arange(batch_size, device=local_x.device).view(batch_size, 1, 1).expand_as(ix)
-    lin = batch_idx * (grid_size_i * grid_size_i) + iy * grid_size_i + ix
+    batch_idx = torch.arange(batch_size, device=endpoint_x.device).view(batch_size, 1, 1).expand_as(endpoint_x)
 
     def scatter_channel(mask: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        flat = torch.zeros(batch_size * grid_size_i * grid_size_i, device=local_x.device, dtype=torch.float32)
+        flat = torch.zeros(batch_size * grid_size_i * grid_size_i, device=endpoint_x.device, dtype=torch.float32)
         if torch.any(mask):
             flat.scatter_add_(0, lin[mask], weight[mask].to(dtype=torch.float32))
         return flat.view(batch_size, 1, grid_size_i, grid_size_i)
 
+    def to_lin(x_cm: torch.Tensor, y_cm: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        norm_x = torch.clamp(x_cm / extent, -1.0, 1.0)
+        norm_y = torch.clamp(-y_cm / extent, -1.0, 1.0)
+        ix = torch.round((norm_x + 1.0) * 0.5 * float(grid_size_i - 1)).long()
+        iy = torch.round((norm_y + 1.0) * 0.5 * float(grid_size_i - 1)).long()
+        valid = (norm_x >= -1.0) & (norm_x <= 1.0) & (norm_y >= -1.0) & (norm_y <= 1.0)
+        lin = batch_idx * (grid_size_i * grid_size_i) + iy * grid_size_i + ix
+        return lin, valid
+
+    recency = torch.clamp(time_age, 0.05, 1.0).to(dtype=torch.float32)
+    endpoint_lin, valid = to_lin(endpoint_x, endpoint_y)
+    lin = endpoint_lin
     current_mask = torch.zeros_like(valid)
     current_mask[:, -1, :] = True
-    hit_f = hit.to(dtype=torch.float32)
-    recency = torch.clamp(time_age, 0.05, 1.0).to(dtype=torch.float32)
 
-    all_endpoints = scatter_channel(valid, recency)
-    hit_endpoints = scatter_channel(valid & hit, recency)
-    current_all = scatter_channel(valid & current_mask, torch.ones_like(recency))
-    current_hit = scatter_channel(valid & current_mask & hit, torch.ones_like(recency))
-    hit_recent = scatter_channel(valid & hit, recency * recency)
-    return torch.cat([all_endpoints, hit_endpoints, current_all, current_hit, hit_recent], dim=1)
+    occupied = scatter_channel(valid & hit, recency)
+    current_occupied = scatter_channel(valid & current_mask & hit, torch.ones_like(recency))
+    recent_occupied = scatter_channel(valid & hit, recency.square())
+    nohit_endpoints = scatter_channel(valid & (~hit), 0.5 * recency)
+
+    fractions = torch.linspace(0.1, 0.95, steps=max(int(ray_samples), 2), device=endpoint_x.device, dtype=torch.float32)
+    free = torch.zeros(batch_size, 1, grid_size_i, grid_size_i, device=endpoint_x.device, dtype=torch.float32)
+    current_free = torch.zeros_like(free)
+    recent_free = torch.zeros_like(free)
+    known = occupied + nohit_endpoints
+    for frac in fractions:
+        sample_x = origin_x + frac * (endpoint_x - origin_x)
+        sample_y = origin_y + frac * (endpoint_y - origin_y)
+        lin, ray_valid = to_lin(sample_x, sample_y)
+        free_mask = ray_valid
+        weight = recency * (1.1 - 0.5 * frac)
+        if torch.any(free_mask):
+            flat = torch.zeros(batch_size * grid_size_i * grid_size_i, device=endpoint_x.device, dtype=torch.float32)
+            flat.scatter_add_(0, lin[free_mask], weight[free_mask])
+            free = free + flat.view(batch_size, 1, grid_size_i, grid_size_i)
+
+            flat_current = torch.zeros_like(flat)
+            current_free_mask = free_mask & current_mask
+            if torch.any(current_free_mask):
+                flat_current.scatter_add_(0, lin[current_free_mask], torch.ones_like(weight[current_free_mask]))
+            current_free = current_free + flat_current.view(batch_size, 1, grid_size_i, grid_size_i)
+
+            flat_recent = torch.zeros_like(flat)
+            flat_recent.scatter_add_(0, lin[free_mask], (weight[free_mask] * weight[free_mask]))
+            recent_free = recent_free + flat_recent.view(batch_size, 1, grid_size_i, grid_size_i)
+    known = known + free
+    return torch.cat(
+        [
+            occupied,
+            free,
+            current_occupied,
+            current_free,
+            recent_occupied,
+            recent_free,
+            nohit_endpoints,
+            known,
+        ],
+        dim=1,
+    )
 
 
 def _sample_bev_features(
@@ -782,6 +833,31 @@ def _sample_bev_features(
     grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(2)
     sampled = F.grid_sample(bev_features, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
     return sampled.squeeze(-1).permute(0, 2, 1)
+
+
+def _sample_bev_ray_profile(
+    bev_features: torch.Tensor,
+    dir_x: torch.Tensor,
+    dir_y: torch.Tensor,
+    max_range_cm: float,
+    grid_extent_cm: float,
+    num_samples: int = 10,
+) -> torch.Tensor:
+    fractions = torch.linspace(
+        0.1,
+        1.0,
+        steps=max(int(num_samples), 2),
+        device=bev_features.device,
+        dtype=torch.float32,
+    ).view(1, 1, -1, 1)
+    sample_x = dir_x.unsqueeze(-1) * float(max_range_cm) * fractions.squeeze(-1)
+    sample_y = dir_y.unsqueeze(-1) * float(max_range_cm) * fractions.squeeze(-1)
+    extent = float(grid_extent_cm)
+    norm_x = torch.clamp(sample_x / extent, -1.0, 1.0)
+    norm_y = torch.clamp(-sample_y / extent, -1.0, 1.0)
+    grid = torch.stack([norm_x, norm_y], dim=-1)
+    sampled = F.grid_sample(bev_features, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+    return sampled.permute(0, 2, 3, 1)
 
 
 class TemporalBEVUNetClassifier(nn.Module):
@@ -806,7 +882,7 @@ class TemporalBEVUNetClassifier(nn.Module):
         self.grid_extent_cm = float(max(self.max_range_cm * 0.9, 6000.0))
 
         bev_channels = max(self.hidden_dim // 2, 32)
-        self.bev_in = ConvBlock(5, bev_channels)
+        self.bev_in = ConvBlock(8, bev_channels)
         self.bev_pool = nn.MaxPool2d(kernel_size=2, stride=2)
         self.bev_mid = ConvBlock(bev_channels, bev_channels * 2)
         self.bev_bottleneck = ConvBlock(bev_channels * 2, bev_channels * 2)
@@ -821,8 +897,8 @@ class TemporalBEVUNetClassifier(nn.Module):
         )
         self.sensor_embedding = nn.Embedding(self.num_sensors, self.hidden_dim)
         self.head = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim * 3),
-            nn.Linear(self.hidden_dim * 3, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim * 4),
+            nn.Linear(self.hidden_dim * 4, self.hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(self.hidden_dim, 1),
@@ -838,12 +914,21 @@ class TemporalBEVUNetClassifier(nn.Module):
         if sensor_count != self.num_sensors:
             raise ValueError(f"Expected {self.num_sensors} sensors, got {sensor_count}")
 
-        local_x, local_y, hit, time_age = _compute_local_beam_endpoints(
+        origin_x, origin_y, endpoint_x, endpoint_y, dir_x, dir_y, hit, time_age = _compute_local_beam_geometry(
             x,
             max_range_cm=self.max_range_cm,
             relative_xy_scale_cm=self.relative_xy_scale_cm,
         )
-        bev = _rasterize_bev_history(local_x, local_y, hit, time_age, self.grid_size, self.grid_extent_cm)
+        bev = _rasterize_bev_evidence(
+            origin_x,
+            origin_y,
+            endpoint_x,
+            endpoint_y,
+            hit,
+            time_age,
+            self.grid_size,
+            self.grid_extent_cm,
+        )
         e1 = self.bev_in(bev)
         e2 = self.bev_mid(self.bev_pool(self.drop(e1)))
         b = self.bev_bottleneck(self.bev_pool(self.drop(e2)))
@@ -851,17 +936,23 @@ class TemporalBEVUNetClassifier(nn.Module):
         up = torch.cat([up, e2], dim=1)
         bev_features = self.bev_out(F.interpolate(up, size=e1.shape[-2:], mode="bilinear", align_corners=False))
 
-        current_x = local_x[:, -1, :]
-        current_y = local_y[:, -1, :]
-        sampled = _sample_bev_features(bev_features, current_x, current_y, self.grid_extent_cm)
-        sampled = self.bev_proj(sampled)
+        current_endpoint = self.bev_proj(_sample_bev_features(bev_features, endpoint_x[:, -1, :], endpoint_y[:, -1, :], self.grid_extent_cm))
+        ray_profile = _sample_bev_ray_profile(
+            bev_features,
+            dir_x[:, -1, :],
+            dir_y[:, -1, :],
+            max_range_cm=self.max_range_cm,
+            grid_extent_cm=self.grid_extent_cm,
+        )
+        ray_mean = self.bev_proj(ray_profile.mean(dim=2))
+        ray_max = self.bev_proj(ray_profile.max(dim=2).values)
         global_bev = self.bev_proj(bev_features.mean(dim=(-2, -1))).unsqueeze(1).expand(-1, sensor_count, -1)
 
         current_features = x[:, :, -1, :].permute(0, 2, 1)
         current_tokens = self.current_mlp(current_features)
         beam_ids = torch.arange(self.num_sensors, device=x.device)
         beam_embed = self.sensor_embedding(beam_ids).unsqueeze(0).expand(batch_size, -1, -1)
-        fused = torch.cat([sampled, current_tokens + beam_embed, global_bev], dim=-1)
+        fused = torch.cat([current_endpoint + ray_mean, ray_max, current_tokens + beam_embed, global_bev], dim=-1)
         return self.head(fused).squeeze(-1)
 
 
@@ -894,7 +985,7 @@ class TemporalBEVFusionClassifier(nn.Module):
 
         bev_channels = max(self.hidden_dim // 2, 48)
         self.bev_stem = nn.Sequential(
-            nn.Conv2d(5, bev_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(8, bev_channels, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(8 if bev_channels % 8 == 0 else 1, bev_channels),
             nn.GELU(),
             nn.Conv2d(bev_channels, bev_channels, kernel_size=3, padding=1, bias=False),
@@ -933,8 +1024,8 @@ class TemporalBEVFusionClassifier(nn.Module):
         )
         self.beam_encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.transformer_layers)
         self.head = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim * 2),
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim * 3),
+            nn.Linear(self.hidden_dim * 3, self.hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(self.hidden_dim, 1),
@@ -945,26 +1036,43 @@ class TemporalBEVFusionClassifier(nn.Module):
         if sensor_count != self.num_sensors:
             raise ValueError(f"Expected {self.num_sensors} sensors, got {sensor_count}")
 
-        local_x, local_y, hit, time_age = _compute_local_beam_endpoints(
+        origin_x, origin_y, endpoint_x, endpoint_y, dir_x, dir_y, hit, time_age = _compute_local_beam_geometry(
             x,
             max_range_cm=self.max_range_cm,
             relative_xy_scale_cm=self.relative_xy_scale_cm,
         )
-        bev = _rasterize_bev_history(local_x, local_y, hit, time_age, self.grid_size, self.grid_extent_cm)
+        bev = _rasterize_bev_evidence(
+            origin_x,
+            origin_y,
+            endpoint_x,
+            endpoint_y,
+            hit,
+            time_age,
+            self.grid_size,
+            self.grid_extent_cm,
+        )
         bev_features = self.bev_stem(bev)
         bev_features = bev_features + self.bev_block(bev_features)
 
-        current_x = local_x[:, -1, :]
-        current_y = local_y[:, -1, :]
-        sampled = _sample_bev_features(bev_features, current_x, current_y, self.grid_extent_cm)
-        sampled_tokens = self.bev_proj(sampled)
+        endpoint_tokens = self.bev_proj(
+            _sample_bev_features(bev_features, endpoint_x[:, -1, :], endpoint_y[:, -1, :], self.grid_extent_cm)
+        )
+        ray_profile = _sample_bev_ray_profile(
+            bev_features,
+            dir_x[:, -1, :],
+            dir_y[:, -1, :],
+            max_range_cm=self.max_range_cm,
+            grid_extent_cm=self.grid_extent_cm,
+        )
+        ray_mean = self.bev_proj(ray_profile.mean(dim=2))
+        ray_max = self.bev_proj(ray_profile.max(dim=2).values)
         global_tokens = self.bev_proj(bev_features.mean(dim=(-2, -1))).unsqueeze(1).expand(-1, sensor_count, -1)
         current_tokens = self.current_mlp(x[:, :, -1, :].permute(0, 2, 1))
         beam_ids = torch.arange(self.num_sensors, device=x.device)
         beam_embed = self.sensor_embedding(beam_ids).unsqueeze(0).expand(batch_size, -1, -1)
-        tokens = sampled_tokens + current_tokens + beam_embed
+        tokens = endpoint_tokens + ray_mean + current_tokens + beam_embed
         encoded = self.beam_encoder(tokens)
-        return self.head(torch.cat([encoded, global_tokens], dim=-1)).squeeze(-1)
+        return self.head(torch.cat([encoded, ray_max, global_tokens], dim=-1)).squeeze(-1)
 
 
 def build_sampler(dataset: RealLidarSequenceDataset) -> WeightedRandomSampler | None:
@@ -1365,850 +1473,131 @@ def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, Dat
 
 
 def build_experiment_suite() -> list[ExperimentConfig]:
-    experiments = [
+    return [
         ExperimentConfig(
-            name="conv_unet_balanced",
-            model_type="conv_unet",
-            hidden_dim=32,
-            dropout=0.10,
-            lr=2e-3,
-            weight_decay=1e-4,
-            pos_weight_scale=1.00,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.60,
-            threshold_sweep_end=0.95,
-            threshold_sweep_step=0.02,
-        ),
-        ExperimentConfig(
-            name="conv_unet_strict",
-            model_type="conv_unet",
-            hidden_dim=32,
-            dropout=0.12,
-            lr=2e-3,
-            weight_decay=2e-4,
-            pos_weight_scale=0.85,
-            threshold_min_recall=0.45,
-            threshold_sweep_start=0.70,
-            threshold_sweep_end=0.98,
-            threshold_sweep_step=0.02,
-        ),
-        ExperimentConfig(
-            name="conv_unet_wide_balanced",
-            model_type="conv_unet",
-            hidden_dim=48,
-            dropout=0.10,
-            lr=1.5e-3,
-            weight_decay=1e-4,
-            pos_weight_scale=1.00,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.70,
-            threshold_sweep_end=0.98,
-            threshold_sweep_step=0.02,
-        ),
-        ExperimentConfig(
-            name="conv_unet_wide_strict",
-            model_type="conv_unet",
-            hidden_dim=48,
-            dropout=0.12,
-            lr=1.5e-3,
-            weight_decay=2e-4,
-            pos_weight_scale=0.75,
-            threshold_min_recall=0.40,
-            threshold_sweep_start=0.80,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-        ),
-        ExperimentConfig(
-            name="beam_gru_mid",
-            model_type="beam_gru",
-            hidden_dim=64,
-            dropout=0.15,
-            lr=1e-3,
-            weight_decay=1e-4,
-            pos_weight_scale=1.00,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.60,
-            threshold_sweep_end=0.95,
-            threshold_sweep_step=0.02,
-        ),
-        ExperimentConfig(
-            name="beam_gru_strict",
-            model_type="beam_gru",
-            hidden_dim=96,
-            dropout=0.18,
-            lr=1e-3,
-            weight_decay=2e-4,
-            pos_weight_scale=0.80,
-            threshold_min_recall=0.45,
-            threshold_sweep_start=0.70,
-            threshold_sweep_end=0.98,
-            threshold_sweep_step=0.02,
-        ),
-        ExperimentConfig(
-            name="beam_transformer_mid",
-            model_type="beam_transformer",
-            hidden_dim=96,
-            dropout=0.15,
-            lr=1e-3,
-            weight_decay=1e-4,
-            pos_weight_scale=1.00,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.60,
-            threshold_sweep_end=0.95,
-            threshold_sweep_step=0.02,
-            temporal_layers=2,
-            transformer_layers=3,
-            attention_heads=4,
-        ),
-        ExperimentConfig(
-            name="beam_transformer_strict",
-            model_type="beam_transformer",
-            hidden_dim=96,
-            dropout=0.18,
-            lr=1e-3,
-            weight_decay=2e-4,
-            pos_weight_scale=0.80,
-            threshold_min_recall=0.45,
-            threshold_sweep_start=0.70,
-            threshold_sweep_end=0.98,
-            threshold_sweep_step=0.02,
-            temporal_layers=2,
-            transformer_layers=3,
-            attention_heads=4,
-        ),
-        ExperimentConfig(
-            name="beam_transformer_tight",
-            model_type="beam_transformer",
-            hidden_dim=96,
-            dropout=0.15,
-            lr=1e-3,
-            weight_decay=1e-4,
-            pos_weight_scale=0.90,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.85,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            temporal_layers=2,
-            transformer_layers=3,
-            attention_heads=4,
-        ),
-        ExperimentConfig(
-            name="beam_transformer_large",
-            model_type="beam_transformer",
-            hidden_dim=128,
-            dropout=0.18,
-            lr=8e-4,
-            weight_decay=2e-4,
-            pos_weight_scale=0.85,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.70,
-            threshold_sweep_end=0.98,
-            threshold_sweep_step=0.02,
-            temporal_layers=2,
-            transformer_layers=4,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="beam_transformer_large_balanced",
-            model_type="beam_transformer",
-            hidden_dim=128,
-            dropout=0.15,
-            lr=8e-4,
-            weight_decay=2e-4,
-            pos_weight_scale=1.00,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.80,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            temporal_layers=2,
-            transformer_layers=4,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="beam_transformer_xl_strict",
+            name="beam_transformer_anchor",
             model_type="beam_transformer",
             hidden_dim=160,
             dropout=0.20,
-            lr=7e-4,
-            weight_decay=3e-4,
-            pos_weight_scale=0.70,
-            threshold_min_recall=0.40,
-            threshold_sweep_start=0.85,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            temporal_layers=2,
-            transformer_layers=4,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="conv_unet_large_balanced",
-            model_type="conv_unet",
-            hidden_dim=64,
-            dropout=0.10,
-            lr=1.2e-3,
-            weight_decay=1e-4,
-            pos_weight_scale=1.00,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.75,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-        ),
-        ExperimentConfig(
-            name="conv_unet_large_strict",
-            model_type="conv_unet",
-            hidden_dim=64,
-            dropout=0.14,
-            lr=1.2e-3,
-            weight_decay=2.5e-4,
-            pos_weight_scale=0.70,
-            threshold_min_recall=0.38,
-            threshold_sweep_start=0.82,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-        ),
-        ExperimentConfig(
-            name="beam_gru_large",
-            model_type="beam_gru",
-            hidden_dim=128,
-            dropout=0.18,
-            lr=8e-4,
-            weight_decay=2e-4,
-            pos_weight_scale=0.85,
-            threshold_min_recall=0.45,
-            threshold_sweep_start=0.75,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-        ),
-        ExperimentConfig(
-            name="conv_transformer_mid",
-            model_type="conv_transformer",
-            hidden_dim=96,
-            dropout=0.15,
-            lr=1e-3,
-            weight_decay=1e-4,
-            pos_weight_scale=1.00,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.70,
-            threshold_sweep_end=0.98,
-            threshold_sweep_step=0.02,
-            transformer_layers=3,
-            attention_heads=4,
-        ),
-        ExperimentConfig(
-            name="conv_transformer_strict",
-            model_type="conv_transformer",
-            hidden_dim=96,
-            dropout=0.18,
-            lr=1e-3,
-            weight_decay=2e-4,
-            pos_weight_scale=0.80,
-            threshold_min_recall=0.45,
-            threshold_sweep_start=0.80,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            transformer_layers=3,
-            attention_heads=4,
-        ),
-        ExperimentConfig(
-            name="conv_transformer_large",
-            model_type="conv_transformer",
-            hidden_dim=128,
-            dropout=0.18,
-            lr=8e-4,
-            weight_decay=2e-4,
-            pos_weight_scale=0.85,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.80,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            transformer_layers=4,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="conv_transformer_large_strict",
-            model_type="conv_transformer",
-            hidden_dim=128,
-            dropout=0.20,
-            lr=8e-4,
-            weight_decay=3e-4,
-            pos_weight_scale=0.70,
-            threshold_min_recall=0.40,
-            threshold_sweep_start=0.85,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            transformer_layers=4,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="beam_transformer_xl_balanced",
-            model_type="beam_transformer",
-            hidden_dim=160,
-            dropout=0.18,
-            lr=7e-4,
-            weight_decay=2e-4,
-            pos_weight_scale=1.00,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.80,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            temporal_layers=2,
-            transformer_layers=4,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="beam_transformer_xxl_strict",
-            model_type="beam_transformer",
-            hidden_dim=192,
-            dropout=0.22,
             lr=6e-4,
-            weight_decay=4e-4,
-            pos_weight_scale=0.65,
-            threshold_min_recall=0.35,
-            threshold_sweep_start=0.88,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            temporal_layers=2,
-            transformer_layers=5,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="beam_transformer_large_strict",
-            model_type="beam_transformer",
-            hidden_dim=128,
-            dropout=0.20,
-            lr=8e-4,
             weight_decay=3e-4,
-            pos_weight_scale=0.70,
-            threshold_min_recall=0.40,
-            threshold_sweep_start=0.75,
-            threshold_sweep_end=0.99,
-            threshold_sweep_step=0.01,
-            temporal_layers=2,
-            transformer_layers=4,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="conv_unet_focal_balanced",
-            model_type="conv_unet",
-            hidden_dim=32,
-            dropout=0.10,
-            lr=1.5e-3,
-            weight_decay=1.5e-4,
-            pos_weight_scale=0.90,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.70,
-            threshold_sweep_end=0.98,
-            threshold_sweep_step=0.02,
-            loss_type="focal",
-            focal_gamma=1.5,
-        ),
-        ExperimentConfig(
-            name="conv_unet_focal_strict",
-            model_type="conv_unet",
-            hidden_dim=48,
-            dropout=0.12,
-            lr=1.2e-3,
-            weight_decay=2e-4,
-            pos_weight_scale=0.75,
-            threshold_min_recall=0.42,
-            threshold_sweep_start=0.82,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            loss_type="focal",
-            focal_gamma=2.0,
-        ),
-        ExperimentConfig(
-            name="conv_unet_smooth_balanced",
-            model_type="conv_unet",
-            hidden_dim=48,
-            dropout=0.10,
-            lr=1.5e-3,
-            weight_decay=1e-4,
-            pos_weight_scale=0.95,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.72,
-            threshold_sweep_end=0.98,
-            threshold_sweep_step=0.02,
-            label_smoothing=0.03,
-        ),
-        ExperimentConfig(
-            name="conv_unet_large_focal",
-            model_type="conv_unet",
-            hidden_dim=64,
-            dropout=0.14,
-            lr=1.0e-3,
-            weight_decay=2.5e-4,
-            pos_weight_scale=0.70,
-            threshold_min_recall=0.40,
-            threshold_sweep_start=0.84,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            loss_type="focal",
-            focal_gamma=2.0,
-        ),
-        ExperimentConfig(
-            name="beam_gru_focal_mid",
-            model_type="beam_gru",
-            hidden_dim=96,
-            dropout=0.18,
-            lr=9e-4,
-            weight_decay=2e-4,
             pos_weight_scale=0.85,
-            threshold_min_recall=0.45,
-            threshold_sweep_start=0.75,
-            threshold_sweep_end=0.99,
-            threshold_sweep_step=0.01,
-            loss_type="focal",
-            focal_gamma=1.5,
-        ),
-        ExperimentConfig(
-            name="beam_gru_large_strict",
-            model_type="beam_gru",
-            hidden_dim=160,
-            dropout=0.22,
-            lr=7e-4,
-            weight_decay=3e-4,
-            pos_weight_scale=0.70,
-            threshold_min_recall=0.38,
-            threshold_sweep_start=0.84,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            loss_type="focal",
-            focal_gamma=2.0,
-        ),
-        ExperimentConfig(
-            name="beam_transformer_focal_mid",
-            model_type="beam_transformer",
-            hidden_dim=96,
-            dropout=0.16,
-            lr=9e-4,
-            weight_decay=1.5e-4,
-            pos_weight_scale=0.90,
             threshold_min_recall=0.50,
-            threshold_sweep_start=0.78,
-            threshold_sweep_end=0.99,
-            threshold_sweep_step=0.01,
-            loss_type="focal",
-            focal_gamma=1.5,
-            temporal_layers=2,
-            transformer_layers=3,
-            attention_heads=4,
-        ),
-        ExperimentConfig(
-            name="beam_transformer_focal_strict",
-            model_type="beam_transformer",
-            hidden_dim=128,
-            dropout=0.20,
-            lr=8e-4,
-            weight_decay=2.5e-4,
-            pos_weight_scale=0.75,
-            threshold_min_recall=0.42,
-            threshold_sweep_start=0.86,
+            threshold_sweep_start=0.95,
             threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            loss_type="focal",
-            focal_gamma=2.0,
-            temporal_layers=2,
-            transformer_layers=4,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="beam_transformer_smooth_balanced",
-            model_type="beam_transformer",
-            hidden_dim=128,
-            dropout=0.16,
-            lr=8e-4,
-            weight_decay=2e-4,
-            pos_weight_scale=0.95,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.80,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            label_smoothing=0.03,
-            temporal_layers=2,
-            transformer_layers=4,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="beam_transformer_deep_balanced",
-            model_type="beam_transformer",
-            hidden_dim=160,
-            dropout=0.18,
-            lr=7e-4,
-            weight_decay=2e-4,
-            pos_weight_scale=0.95,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.82,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
+            threshold_sweep_step=0.005,
             temporal_layers=3,
             transformer_layers=5,
             attention_heads=8,
         ),
         ExperimentConfig(
-            name="beam_transformer_deep_strict",
+            name="beam_transformer_recall_anchor",
             model_type="beam_transformer",
-            hidden_dim=192,
-            dropout=0.22,
-            lr=6e-4,
-            weight_decay=4e-4,
-            pos_weight_scale=0.65,
-            threshold_min_recall=0.35,
-            threshold_sweep_start=0.90,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.005,
-            loss_type="focal",
-            focal_gamma=2.0,
+            hidden_dim=160,
+            dropout=0.18,
+            lr=7e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.65,
+            threshold_sweep_start=0.70,
+            threshold_sweep_end=0.95,
+            threshold_sweep_step=0.02,
             temporal_layers=3,
             transformer_layers=5,
             attention_heads=8,
         ),
         ExperimentConfig(
-            name="beam_transformer_large_ultratight",
-            model_type="beam_transformer",
-            hidden_dim=128,
-            dropout=0.18,
-            lr=7.5e-4,
-            weight_decay=2.5e-4,
-            pos_weight_scale=0.78,
-            threshold_min_recall=0.45,
-            threshold_sweep_start=0.94,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.005,
-            temporal_layers=2,
-            transformer_layers=4,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="beam_transformer_large_smooth_tight",
-            model_type="beam_transformer",
+            name="bev_unet_occ_balanced",
+            model_type="bev_unet",
             hidden_dim=128,
             dropout=0.16,
-            lr=7.5e-4,
+            lr=7e-4,
             weight_decay=2e-4,
-            pos_weight_scale=0.90,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.92,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.005,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.55,
+            threshold_sweep_start=0.70,
+            threshold_sweep_end=0.96,
+            threshold_sweep_step=0.02,
             label_smoothing=0.02,
-            temporal_layers=2,
-            transformer_layers=4,
-            attention_heads=8,
         ),
         ExperimentConfig(
-            name="beam_transformer_large_focal_tight",
-            model_type="beam_transformer",
-            hidden_dim=128,
-            dropout=0.18,
-            lr=7e-4,
-            weight_decay=2.5e-4,
-            pos_weight_scale=0.78,
-            threshold_min_recall=0.45,
-            threshold_sweep_start=0.94,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.005,
-            loss_type="focal",
-            focal_gamma=1.5,
-            temporal_layers=2,
-            transformer_layers=4,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="beam_transformer_xl_balanced_tight",
-            model_type="beam_transformer",
+            name="bev_unet_occ_recall",
+            model_type="bev_unet",
             hidden_dim=160,
             dropout=0.18,
-            lr=6.5e-4,
-            weight_decay=2e-4,
-            pos_weight_scale=0.90,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.94,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.005,
-            temporal_layers=2,
-            transformer_layers=4,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="beam_transformer_xl_smooth_tight",
-            model_type="beam_transformer",
-            hidden_dim=160,
-            dropout=0.18,
-            lr=6.5e-4,
-            weight_decay=2.5e-4,
-            pos_weight_scale=0.82,
-            threshold_min_recall=0.45,
-            threshold_sweep_start=0.95,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.005,
-            label_smoothing=0.02,
-            temporal_layers=2,
-            transformer_layers=4,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="beam_transformer_xl_focal_tight",
-            model_type="beam_transformer",
-            hidden_dim=160,
-            dropout=0.20,
-            lr=6.5e-4,
-            weight_decay=3e-4,
-            pos_weight_scale=0.70,
-            threshold_min_recall=0.42,
-            threshold_sweep_start=0.95,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.005,
-            loss_type="focal",
-            focal_gamma=1.5,
-            temporal_layers=2,
-            transformer_layers=4,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="beam_transformer_deep_balanced_tight",
-            model_type="beam_transformer",
-            hidden_dim=160,
-            dropout=0.20,
             lr=6e-4,
-            weight_decay=3e-4,
-            pos_weight_scale=0.85,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.95,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.005,
-            temporal_layers=3,
-            transformer_layers=5,
+            weight_decay=2.5e-4,
+            pos_weight_scale=1.10,
+            threshold_min_recall=0.65,
+            threshold_sweep_start=0.60,
+            threshold_sweep_end=0.90,
+            threshold_sweep_step=0.02,
+            label_smoothing=0.02,
+        ),
+        ExperimentConfig(
+            name="bev_fusion_occ_balanced",
+            model_type="bev_fusion",
+            hidden_dim=160,
+            dropout=0.18,
+            lr=6.5e-4,
+            weight_decay=2.5e-4,
+            pos_weight_scale=0.95,
+            threshold_min_recall=0.55,
+            threshold_sweep_start=0.80,
+            threshold_sweep_end=0.98,
+            threshold_sweep_step=0.01,
+            transformer_layers=4,
             attention_heads=8,
         ),
         ExperimentConfig(
-            name="beam_transformer_deep_focal_tight",
-            model_type="beam_transformer",
+            name="bev_fusion_occ_recall",
+            model_type="bev_fusion",
+            hidden_dim=160,
+            dropout=0.18,
+            lr=6e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=1.10,
+            threshold_min_recall=0.65,
+            threshold_sweep_start=0.65,
+            threshold_sweep_end=0.92,
+            threshold_sweep_step=0.02,
+            transformer_layers=4,
+            attention_heads=8,
+            label_smoothing=0.02,
+        ),
+        ExperimentConfig(
+            name="bev_fusion_occ_deep",
+            model_type="bev_fusion",
             hidden_dim=192,
-            dropout=0.22,
+            dropout=0.20,
             lr=5.5e-4,
-            weight_decay=4e-4,
-            pos_weight_scale=0.65,
-            threshold_min_recall=0.40,
-            threshold_sweep_start=0.96,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.005,
-            loss_type="focal",
-            focal_gamma=1.5,
-            temporal_layers=3,
-            transformer_layers=5,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="conv_transformer_focal_mid",
-            model_type="conv_transformer",
-            hidden_dim=96,
-            dropout=0.16,
-            lr=9e-4,
-            weight_decay=1.5e-4,
-            pos_weight_scale=0.90,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.78,
-            threshold_sweep_end=0.99,
-            threshold_sweep_step=0.01,
-            loss_type="focal",
-            focal_gamma=1.5,
-            transformer_layers=3,
-            attention_heads=4,
-        ),
-        ExperimentConfig(
-            name="conv_transformer_focal_strict",
-            model_type="conv_transformer",
-            hidden_dim=128,
-            dropout=0.20,
-            lr=8e-4,
-            weight_decay=2.5e-4,
-            pos_weight_scale=0.75,
-            threshold_min_recall=0.42,
-            threshold_sweep_start=0.86,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            loss_type="focal",
-            focal_gamma=2.0,
-            transformer_layers=4,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="conv_transformer_smooth_balanced",
-            model_type="conv_transformer",
-            hidden_dim=128,
-            dropout=0.16,
-            lr=8e-4,
-            weight_decay=2e-4,
-            pos_weight_scale=0.95,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.80,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            label_smoothing=0.03,
-            transformer_layers=4,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="conv_transformer_xl_balanced",
-            model_type="conv_transformer",
-            hidden_dim=160,
-            dropout=0.18,
-            lr=7e-4,
-            weight_decay=2e-4,
-            pos_weight_scale=0.95,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.82,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            transformer_layers=5,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="conv_transformer_xl_strict",
-            model_type="conv_transformer",
-            hidden_dim=192,
-            dropout=0.22,
-            lr=6e-4,
-            weight_decay=4e-4,
-            pos_weight_scale=0.65,
-            threshold_min_recall=0.35,
-            threshold_sweep_start=0.90,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.005,
-            loss_type="focal",
-            focal_gamma=2.0,
-            transformer_layers=5,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="conv_transformer_xl_smooth",
-            model_type="conv_transformer",
-            hidden_dim=160,
-            dropout=0.18,
-            lr=7e-4,
             weight_decay=3e-4,
-            pos_weight_scale=0.85,
-            threshold_min_recall=0.45,
-            threshold_sweep_start=0.84,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            label_smoothing=0.04,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.60,
+            threshold_sweep_start=0.72,
+            threshold_sweep_end=0.96,
+            threshold_sweep_step=0.02,
             transformer_layers=5,
             attention_heads=8,
         ),
         ExperimentConfig(
-            name="bev_unet_balanced",
-            model_type="bev_unet",
-            hidden_dim=96,
-            dropout=0.15,
-            lr=8e-4,
-            weight_decay=2e-4,
-            pos_weight_scale=0.95,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.80,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            label_smoothing=0.02,
-        ),
-        ExperimentConfig(
-            name="bev_unet_strict",
-            model_type="bev_unet",
-            hidden_dim=128,
-            dropout=0.18,
-            lr=7e-4,
-            weight_decay=3e-4,
-            pos_weight_scale=0.75,
-            threshold_min_recall=0.42,
-            threshold_sweep_start=0.90,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.005,
-            loss_type="focal",
-            focal_gamma=1.5,
-        ),
-        ExperimentConfig(
-            name="bev_fusion_balanced",
-            model_type="bev_fusion",
-            hidden_dim=128,
-            dropout=0.16,
-            lr=7.5e-4,
-            weight_decay=2e-4,
-            pos_weight_scale=0.95,
-            threshold_min_recall=0.50,
-            threshold_sweep_start=0.88,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            transformer_layers=3,
-            attention_heads=4,
-        ),
-        ExperimentConfig(
-            name="bev_fusion_strict",
-            model_type="bev_fusion",
-            hidden_dim=160,
-            dropout=0.20,
-            lr=6.5e-4,
-            weight_decay=3e-4,
-            pos_weight_scale=0.75,
-            threshold_min_recall=0.42,
-            threshold_sweep_start=0.94,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.005,
-            loss_type="focal",
-            focal_gamma=1.5,
-            transformer_layers=4,
-            attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="bev_fusion_smooth_tight",
+            name="bev_fusion_occ_focal_light",
             model_type="bev_fusion",
             hidden_dim=160,
             dropout=0.18,
             lr=6.5e-4,
             weight_decay=2.5e-4,
-            pos_weight_scale=0.85,
-            threshold_min_recall=0.45,
-            threshold_sweep_start=0.94,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.005,
-            label_smoothing=0.02,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.60,
+            threshold_sweep_start=0.72,
+            threshold_sweep_end=0.96,
+            threshold_sweep_step=0.02,
             transformer_layers=4,
             attention_heads=8,
-        ),
-        ExperimentConfig(
-            name="conv_unet_xl_strict",
-            model_type="conv_unet",
-            hidden_dim=80,
-            dropout=0.16,
-            lr=1.0e-3,
-            weight_decay=3e-4,
-            pos_weight_scale=0.65,
-            threshold_min_recall=0.35,
-            threshold_sweep_start=0.88,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
             loss_type="focal",
-            focal_gamma=2.0,
-        ),
-        ExperimentConfig(
-            name="conv_unet_xl_smooth",
-            model_type="conv_unet",
-            hidden_dim=80,
-            dropout=0.14,
-            lr=1.0e-3,
-            weight_decay=2.5e-4,
-            pos_weight_scale=0.85,
-            threshold_min_recall=0.45,
-            threshold_sweep_start=0.82,
-            threshold_sweep_end=0.995,
-            threshold_sweep_step=0.01,
-            label_smoothing=0.04,
+            focal_gamma=1.0,
         ),
     ]
-    resume_from = "beam_transformer_xl_smooth_tight"
-    for idx, exp in enumerate(experiments):
-        if exp.name == resume_from:
-            return experiments[idx:]
-    return experiments
 
 
 def parse_args() -> argparse.Namespace:
