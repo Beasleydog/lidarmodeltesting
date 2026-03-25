@@ -1517,7 +1517,7 @@ def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, Dat
     return train_loader, val_loader, meta, train_sequences[0].sensor_names, train_ds.input_channels
 
 
-def build_experiment_suite() -> list[ExperimentConfig]:
+def build_full_experiment_suite() -> list[ExperimentConfig]:
     return [
         ExperimentConfig(
             name="bev_fusion_occ_balanced",
@@ -1731,6 +1731,141 @@ def build_experiment_suite() -> list[ExperimentConfig]:
     ]
 
 
+def build_quick_experiment_suite() -> list[ExperimentConfig]:
+    return [
+        ExperimentConfig(
+            name="quick_beam_gru_baseline",
+            model_type="beam_gru",
+            hidden_dim=96,
+            dropout=0.12,
+            lr=9e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.55,
+            threshold_sweep_start=0.60,
+            threshold_sweep_end=0.90,
+            threshold_sweep_step=0.05,
+        ),
+        ExperimentConfig(
+            name="quick_beam_transformer_small",
+            model_type="beam_transformer",
+            hidden_dim=96,
+            dropout=0.12,
+            lr=8e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.55,
+            threshold_sweep_start=0.60,
+            threshold_sweep_end=0.90,
+            threshold_sweep_step=0.05,
+            temporal_layers=1,
+            transformer_layers=2,
+            attention_heads=4,
+        ),
+        ExperimentConfig(
+            name="quick_conv_transformer_small",
+            model_type="conv_transformer",
+            hidden_dim=96,
+            dropout=0.12,
+            lr=8e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.55,
+            threshold_sweep_start=0.60,
+            threshold_sweep_end=0.90,
+            threshold_sweep_step=0.05,
+            transformer_layers=2,
+            attention_heads=4,
+        ),
+        ExperimentConfig(
+            name="quick_bev_unet_small",
+            model_type="bev_unet",
+            hidden_dim=96,
+            dropout=0.12,
+            lr=8e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.55,
+            threshold_sweep_start=0.60,
+            threshold_sweep_end=0.90,
+            threshold_sweep_step=0.05,
+        ),
+        ExperimentConfig(
+            name="quick_bev_fusion_small",
+            model_type="bev_fusion",
+            hidden_dim=96,
+            dropout=0.12,
+            lr=8e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.55,
+            threshold_sweep_start=0.60,
+            threshold_sweep_end=0.90,
+            threshold_sweep_step=0.05,
+            transformer_layers=2,
+            attention_heads=4,
+        ),
+        ExperimentConfig(
+            name="quick_bev_fusion_recall",
+            model_type="bev_fusion",
+            hidden_dim=96,
+            dropout=0.14,
+            lr=7e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.15,
+            threshold_min_recall=0.65,
+            threshold_sweep_start=0.50,
+            threshold_sweep_end=0.85,
+            threshold_sweep_step=0.05,
+            transformer_layers=2,
+            attention_heads=4,
+            label_smoothing=0.02,
+        ),
+        ExperimentConfig(
+            name="quick_bev_fusion_aux",
+            model_type="bev_fusion",
+            hidden_dim=96,
+            dropout=0.12,
+            lr=8e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.55,
+            threshold_sweep_start=0.60,
+            threshold_sweep_end=0.90,
+            threshold_sweep_step=0.05,
+            transformer_layers=2,
+            attention_heads=4,
+            aux_hit_loss_weight=0.25,
+        ),
+        ExperimentConfig(
+            name="quick_bev_fusion_focal",
+            model_type="bev_fusion",
+            hidden_dim=96,
+            dropout=0.12,
+            lr=8e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.60,
+            threshold_sweep_start=0.55,
+            threshold_sweep_end=0.85,
+            threshold_sweep_step=0.05,
+            loss_type="focal",
+            focal_gamma=1.5,
+            transformer_layers=2,
+            attention_heads=4,
+        ),
+    ]
+
+
+def build_experiment_suite(profile: str) -> list[ExperimentConfig]:
+    normalized = str(profile).strip().lower()
+    if normalized == "quick":
+        return build_quick_experiment_suite()
+    if normalized == "full":
+        return build_full_experiment_suite()
+    raise ValueError(f"Unknown suite profile {profile!r}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a real cleanlog beam classifier on the last N lidar frames plus the current frame."
@@ -1773,6 +1908,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every-batches", type=int, default=20)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--balance-positive-windows", action="store_true")
+    parser.add_argument("--suite-profile", choices=("quick", "full"), default="full")
     parser.add_argument("--suite-epochs", type=int, default=20)
     parser.add_argument("--suite-early-stop-patience", type=int, default=7)
     return parser.parse_args()
@@ -2105,10 +2241,10 @@ def main() -> None:
                 f"z_offset=[{-args.z_offset_max_cm:.1f},{args.z_offset_max_cm:.1f}]cm"
             )
             log("Running experiment suite with compact output; per-batch logs are suppressed.")
-            experiments = build_experiment_suite()
+            experiments = build_experiment_suite(args.suite_profile)
             log(
                 "Suite config: "
-                f"experiments={len(experiments)} suite_epochs={args.suite_epochs} "
+                f"profile={args.suite_profile} experiments={len(experiments)} suite_epochs={args.suite_epochs} "
                 f"early_stop_patience={args.suite_early_stop_patience}"
             )
 
