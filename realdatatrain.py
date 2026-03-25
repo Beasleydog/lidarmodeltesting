@@ -1857,10 +1857,160 @@ def build_quick_experiment_suite() -> list[ExperimentConfig]:
     ]
 
 
+def build_focused_experiment_suite() -> list[ExperimentConfig]:
+    return [
+        ExperimentConfig(
+            name="focused_beam_transformer_h128",
+            model_type="beam_transformer",
+            hidden_dim=128,
+            dropout=0.12,
+            lr=7e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.58,
+            threshold_sweep_start=0.70,
+            threshold_sweep_end=0.88,
+            threshold_sweep_step=0.03,
+            temporal_layers=1,
+            transformer_layers=3,
+            attention_heads=4,
+        ),
+        ExperimentConfig(
+            name="focused_conv_transformer_h128",
+            model_type="conv_transformer",
+            hidden_dim=128,
+            dropout=0.12,
+            lr=7e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.60,
+            threshold_sweep_start=0.76,
+            threshold_sweep_end=0.94,
+            threshold_sweep_step=0.03,
+            transformer_layers=3,
+            attention_heads=4,
+        ),
+        ExperimentConfig(
+            name="focused_bev_fusion_small_h96",
+            model_type="bev_fusion",
+            hidden_dim=96,
+            dropout=0.12,
+            lr=8e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.58,
+            threshold_sweep_start=0.72,
+            threshold_sweep_end=0.90,
+            threshold_sweep_step=0.03,
+            transformer_layers=2,
+            attention_heads=4,
+        ),
+        ExperimentConfig(
+            name="focused_bev_fusion_recall_h96",
+            model_type="bev_fusion",
+            hidden_dim=96,
+            dropout=0.14,
+            lr=7e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.15,
+            threshold_min_recall=0.64,
+            threshold_sweep_start=0.62,
+            threshold_sweep_end=0.82,
+            threshold_sweep_step=0.03,
+            transformer_layers=2,
+            attention_heads=4,
+            label_smoothing=0.02,
+        ),
+        ExperimentConfig(
+            name="focused_bev_fusion_small_h128",
+            model_type="bev_fusion",
+            hidden_dim=128,
+            dropout=0.12,
+            lr=7e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.58,
+            threshold_sweep_start=0.72,
+            threshold_sweep_end=0.90,
+            threshold_sweep_step=0.03,
+            transformer_layers=3,
+            attention_heads=4,
+        ),
+        ExperimentConfig(
+            name="focused_bev_fusion_recall_h128",
+            model_type="bev_fusion",
+            hidden_dim=128,
+            dropout=0.14,
+            lr=6.5e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=1.12,
+            threshold_min_recall=0.64,
+            threshold_sweep_start=0.60,
+            threshold_sweep_end=0.80,
+            threshold_sweep_step=0.03,
+            transformer_layers=3,
+            attention_heads=4,
+            label_smoothing=0.02,
+        ),
+        ExperimentConfig(
+            name="focused_bev_fusion_recall_aux_h128",
+            model_type="bev_fusion",
+            hidden_dim=128,
+            dropout=0.14,
+            lr=6.5e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=1.12,
+            threshold_min_recall=0.64,
+            threshold_sweep_start=0.60,
+            threshold_sweep_end=0.80,
+            threshold_sweep_step=0.03,
+            transformer_layers=3,
+            attention_heads=4,
+            label_smoothing=0.02,
+            aux_hit_loss_weight=0.15,
+        ),
+        ExperimentConfig(
+            name="focused_bev_fusion_precision_h128",
+            model_type="bev_fusion",
+            hidden_dim=128,
+            dropout=0.10,
+            lr=6.5e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=1.05,
+            threshold_min_recall=0.58,
+            threshold_sweep_start=0.74,
+            threshold_sweep_end=0.92,
+            threshold_sweep_step=0.03,
+            transformer_layers=3,
+            attention_heads=4,
+            label_smoothing=0.01,
+        ),
+        ExperimentConfig(
+            name="focused_bev_fusion_focal_h128",
+            model_type="bev_fusion",
+            hidden_dim=128,
+            dropout=0.12,
+            lr=6.5e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=1.05,
+            threshold_min_recall=0.62,
+            threshold_sweep_start=0.64,
+            threshold_sweep_end=0.84,
+            threshold_sweep_step=0.03,
+            loss_type="focal",
+            focal_gamma=1.25,
+            transformer_layers=3,
+            attention_heads=4,
+        ),
+    ]
+
+
 def build_experiment_suite(profile: str) -> list[ExperimentConfig]:
     normalized = str(profile).strip().lower()
     if normalized == "quick":
         return build_quick_experiment_suite()
+    if normalized == "focused":
+        return build_focused_experiment_suite()
     if normalized == "full":
         return build_full_experiment_suite()
     raise ValueError(f"Unknown suite profile {profile!r}")
@@ -1908,7 +2058,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every-batches", type=int, default=20)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--balance-positive-windows", action="store_true")
-    parser.add_argument("--suite-profile", choices=("quick", "full"), default="full")
+    parser.add_argument("--suite-profile", choices=("quick", "focused", "full"), default="full")
     parser.add_argument("--suite-epochs", type=int, default=20)
     parser.add_argument("--suite-early-stop-patience", type=int, default=7)
     return parser.parse_args()
