@@ -2541,6 +2541,27 @@ def build_arch_experiment_suite() -> list[ExperimentConfig]:
     ]
 
 
+def build_gpuprobe_experiment_suite() -> list[ExperimentConfig]:
+    return [
+        ExperimentConfig(
+            name="gpuprobe_bev_fusion_h128",
+            model_type="bev_fusion",
+            hidden_dim=128,
+            dropout=0.10,
+            lr=6.2e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=1.04,
+            threshold_min_recall=0.58,
+            threshold_sweep_start=0.80,
+            threshold_sweep_end=0.92,
+            threshold_sweep_step=0.02,
+            transformer_layers=3,
+            attention_heads=4,
+            label_smoothing=0.01,
+        ),
+    ]
+
+
 def build_experiment_suite(profile: str) -> list[ExperimentConfig]:
     normalized = str(profile).strip().lower()
     if normalized == "quick":
@@ -2553,6 +2574,8 @@ def build_experiment_suite(profile: str) -> list[ExperimentConfig]:
         return build_finalist_experiment_suite()
     if normalized == "arch":
         return build_arch_experiment_suite()
+    if normalized == "gpuprobe":
+        return build_gpuprobe_experiment_suite()
     if normalized == "full":
         return build_full_experiment_suite()
     raise ValueError(f"Unknown suite profile {profile!r}")
@@ -2602,7 +2625,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--balance-positive-windows", action="store_true")
     parser.add_argument(
         "--suite-profile",
-        choices=("quick", "focused", "refine", "finalist", "arch", "full"),
+        choices=("quick", "focused", "refine", "finalist", "arch", "gpuprobe", "full"),
         default="full",
     )
     parser.add_argument("--suite-epochs", type=int, default=20)
@@ -2754,6 +2777,8 @@ def run_experiment(
                 "train_precision",
                 "train_recall",
                 "train_f1",
+                "train_time_s",
+                "train_windows_per_s",
                 "val_loss",
                 "val_acc",
                 "val_precision",
@@ -2823,6 +2848,8 @@ def run_experiment(
                     train_metrics["precision"],
                     train_metrics["recall"],
                     train_metrics["f1"],
+                    train_metrics["time_s"],
+                    float(meta.train_windows) / max(float(train_metrics["time_s"]), 1e-9),
                     val_metrics["loss"],
                     val_metrics["accuracy"],
                     val_metrics["precision"],
@@ -2834,6 +2861,15 @@ def run_experiment(
                 ]
             )
             metrics_fh.flush()
+            log(
+                f"epoch {epoch:02d}/{args.suite_epochs:02d} {exp.name} "
+                f"train_time_s={float(train_metrics['time_s']):.2f} "
+                f"train_windows_per_s={float(meta.train_windows) / max(float(train_metrics['time_s']), 1e-9):.1f} "
+                f"val_prec={float(val_metrics['precision']):.4f} "
+                f"val_f1={float(val_metrics['f1']):.4f} "
+                f"val_recall={float(val_metrics['recall']):.4f} "
+                f"thr={float(val_metrics['threshold']):.2f}"
+            )
 
             improved = False
             if float(val_metrics["precision"]) > (float(best["val_precision"]) + float(args.early_stop_min_delta)):
@@ -2915,6 +2951,8 @@ def run_experiment(
         "best_val_precision": float(best["val_precision"]),
         "best_val_f1": float(best["val_f1"]),
         "best_metrics": best["metrics"],
+        "best_train_time_s": float(train_metrics["time_s"]),
+        "best_train_windows_per_s": float(meta.train_windows) / max(float(train_metrics["time_s"]), 1e-9),
         "checkpoint": str(ckpt_path),
         "metrics_csv": str(metrics_path),
         "val_report": str(val_report_path),
@@ -3124,6 +3162,7 @@ def main() -> None:
                 f"f1={float(best_precision['best_val_f1']):.4f} "
                 f"recall={float(best_precision['best_metrics']['recall']):.4f} "
                 f"fpr={float(best_precision['best_metrics']['false_positive_rate']):.4f} "
+                f"train_windows_per_s={float(best_precision['best_train_windows_per_s']):.1f} "
                 f"threshold={float(best_precision['best_metrics']['threshold']):.2f} "
                 f"loss={best_precision['loss_type']} gamma={best_precision['focal_gamma']:.2f} "
                 f"smooth={best_precision['label_smoothing']:.3f} "
@@ -3136,6 +3175,7 @@ def main() -> None:
                 f"f1={float(best_f1['best_val_f1']):.4f} "
                 f"recall={float(best_f1['best_metrics']['recall']):.4f} "
                 f"fpr={float(best_f1['best_metrics']['false_positive_rate']):.4f} "
+                f"train_windows_per_s={float(best_f1['best_train_windows_per_s']):.1f} "
                 f"threshold={float(best_f1['best_metrics']['threshold']):.2f} "
                 f"loss={best_f1['loss_type']} gamma={best_f1['focal_gamma']:.2f} "
                 f"smooth={best_f1['label_smoothing']:.3f} "
@@ -3151,6 +3191,7 @@ def main() -> None:
                     f"recall={float(metrics['recall']):.4f} "
                     f"spec={float(metrics['specificity']):.4f} "
                     f"fpr={float(metrics['false_positive_rate']):.4f} "
+                    f"twps={float(result['best_train_windows_per_s']):.1f} "
                     f"thr={float(metrics['threshold']):.2f} "
                     f"cfg=modeltype:{result['model_type']},hidden:{result['hidden_dim']},dropout:{result['dropout']},"
                     f"lr:{result['lr']},wd:{result['weight_decay']},pws:{result['pos_weight_scale']},"
