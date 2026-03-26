@@ -1106,6 +1106,314 @@ class TemporalBEVFusionClassifier(nn.Module):
         return {"logits": logits, "aux_hit_logits": aux_logits}
 
 
+class TemporalSetLatentClassifier(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        num_sensors: int,
+        hidden_dim: int = 128,
+        dropout: float = 0.15,
+        temporal_layers: int = 1,
+        attention_heads: int = 4,
+        latent_tokens: int = 8,
+    ):
+        super().__init__()
+        self.model_type = "real_cleanlog_temporal_set_latent"
+        self.in_channels = int(in_channels)
+        self.num_sensors = int(num_sensors)
+        self.hidden_dim = int(hidden_dim)
+        self.temporal_layers = int(max(temporal_layers, 1))
+        self.attention_heads = int(max(attention_heads, 1))
+        self.latent_tokens = int(max(latent_tokens, 4))
+        if self.hidden_dim % self.attention_heads != 0:
+            raise ValueError("hidden_dim must be divisible by attention_heads")
+
+        sensor_geom = MODEL_SENSOR_YAW_PITCH_DEG[: self.num_sensors].astype(np.float32)
+        sensor_geom_rad = np.deg2rad(sensor_geom)
+        sensor_geom_feats = np.concatenate(
+            [
+                np.sin(sensor_geom_rad[:, :1]),
+                np.cos(sensor_geom_rad[:, :1]),
+                np.sin(sensor_geom_rad[:, 1:2]),
+                np.cos(sensor_geom_rad[:, 1:2]),
+            ],
+            axis=1,
+        ).astype(np.float32)
+        self.register_buffer("sensor_geom_feats", torch.from_numpy(sensor_geom_feats), persistent=False)
+        self.register_buffer("sensor_ids", torch.arange(self.num_sensors, dtype=torch.long), persistent=False)
+
+        temporal_hidden = max(self.hidden_dim // 2, 24)
+        self.temporal_input = nn.Sequential(
+            nn.Linear(self.in_channels, temporal_hidden),
+            nn.LayerNorm(temporal_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.temporal_gru = nn.GRU(
+            input_size=temporal_hidden,
+            hidden_size=temporal_hidden,
+            num_layers=self.temporal_layers,
+            batch_first=True,
+            dropout=dropout if self.temporal_layers > 1 else 0.0,
+            bidirectional=True,
+        )
+        self.current_mlp = nn.Sequential(
+            nn.Linear(self.in_channels, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.sensor_embedding = nn.Embedding(self.num_sensors, self.hidden_dim)
+        self.sensor_geom_mlp = nn.Sequential(
+            nn.Linear(4, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        self.pre_norm = nn.LayerNorm(self.hidden_dim)
+        self.latents = nn.Parameter(torch.randn(1, self.latent_tokens, self.hidden_dim) * 0.02)
+        self.latent_attend = nn.MultiheadAttention(
+            self.hidden_dim,
+            num_heads=self.attention_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.latent_ffn = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim * 4, self.hidden_dim),
+        )
+        self.decode_attend = nn.MultiheadAttention(
+            self.hidden_dim,
+            num_heads=self.attention_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim * 3),
+            nn.Linear(self.hidden_dim * 3, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, channels, time_steps, sensor_count = x.shape
+        if sensor_count != self.num_sensors:
+            raise ValueError(f"Expected {self.num_sensors} sensors, got {sensor_count}")
+
+        beam_sequences = x.permute(0, 3, 2, 1).reshape(batch_size * sensor_count, time_steps, channels)
+        temporal_inputs = self.temporal_input(beam_sequences)
+        temporal_outputs, _ = self.temporal_gru(temporal_inputs)
+        temporal_tokens = temporal_outputs[:, -1, :].reshape(batch_size, sensor_count, self.hidden_dim)
+
+        current_tokens = self.current_mlp(x[:, :, -1, :].permute(0, 2, 1))
+        beam_ids = self.sensor_ids.to(device=x.device)
+        beam_embed = self.sensor_embedding(beam_ids).unsqueeze(0).expand(batch_size, -1, -1)
+        geom_embed = self.sensor_geom_mlp(self.sensor_geom_feats.to(device=x.device)).unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+
+        beam_tokens = self.pre_norm(temporal_tokens + current_tokens + beam_embed + geom_embed)
+        latents = self.latents.expand(batch_size, -1, -1)
+        latent_ctx, _ = self.latent_attend(latents, beam_tokens, beam_tokens, need_weights=False)
+        latents = latents + latent_ctx
+        latents = latents + self.latent_ffn(latents)
+        decoded, _ = self.decode_attend(beam_tokens, latents, latents, need_weights=False)
+        global_latent = latents.mean(dim=1, keepdim=True).expand(-1, sensor_count, -1)
+        fused = torch.cat([decoded, temporal_tokens, global_latent], dim=-1)
+        return self.head(fused).squeeze(-1)
+
+
+class TemporalPolarDilatedClassifier(nn.Module):
+    def __init__(self, in_channels: int, num_sensors: int, hidden_dim: int = 96, dropout: float = 0.12):
+        super().__init__()
+        self.model_type = "real_cleanlog_temporal_polar_dilated"
+        self.in_channels = int(in_channels)
+        self.num_sensors = int(num_sensors)
+        self.hidden_dim = int(hidden_dim)
+        groups = 8 if self.hidden_dim % 8 == 0 else 1
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(self.in_channels, self.hidden_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(groups, self.hidden_dim),
+            nn.GELU(),
+        )
+        self.temporal_block1 = nn.Sequential(
+            nn.Conv2d(
+                self.hidden_dim,
+                self.hidden_dim,
+                kernel_size=(3, 1),
+                padding=(1, 0),
+                groups=self.hidden_dim,
+                bias=False,
+            ),
+            nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(groups, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout2d(dropout),
+        )
+        self.temporal_block2 = nn.Sequential(
+            nn.Conv2d(
+                self.hidden_dim,
+                self.hidden_dim,
+                kernel_size=(3, 1),
+                padding=(2, 0),
+                dilation=(2, 1),
+                groups=self.hidden_dim,
+                bias=False,
+            ),
+            nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(groups, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout2d(dropout),
+        )
+        self.beam_block = nn.Sequential(
+            nn.Conv2d(
+                self.hidden_dim,
+                self.hidden_dim,
+                kernel_size=(1, 5),
+                padding=(0, 2),
+                groups=self.hidden_dim,
+                bias=False,
+            ),
+            nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(groups, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout2d(dropout),
+        )
+        self.head = nn.Sequential(
+            nn.Conv1d(self.hidden_dim * 2, self.hidden_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(groups, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(self.hidden_dim, 1, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, _, _, sensor_count = x.shape
+        if sensor_count != self.num_sensors:
+            raise ValueError(f"Expected {self.num_sensors} sensors, got {sensor_count}")
+
+        features = self.stem(x)
+        features = features + self.temporal_block1(features)
+        features = features + self.temporal_block2(features)
+        features = features + self.beam_block(features)
+        current = features[:, :, -1, :]
+        temporal_summary = features.mean(dim=2)
+        fused = torch.cat([current, temporal_summary], dim=1)
+        return self.head(fused).squeeze(1)
+
+
+class TemporalBEVOccupancyClassifier(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        num_sensors: int,
+        hidden_dim: int = 128,
+        dropout: float = 0.15,
+        max_range_cm: float = DEFAULT_LIDAR_MAX_RANGE_CM,
+        relative_xy_scale_cm: float = 5000.0,
+        grid_size: int = 64,
+    ):
+        super().__init__()
+        self.model_type = "real_cleanlog_temporal_bev_occupancy"
+        self.in_channels = int(in_channels)
+        self.num_sensors = int(num_sensors)
+        self.hidden_dim = int(hidden_dim)
+        self.max_range_cm = float(max_range_cm)
+        self.relative_xy_scale_cm = float(relative_xy_scale_cm)
+        self.grid_size = int(grid_size)
+        self.grid_extent_cm = float(max(self.max_range_cm * 0.9, 6000.0))
+
+        bev_channels = max(self.hidden_dim // 2, 48)
+        groups = 8 if bev_channels % 8 == 0 else 1
+        self.bev_encoder = nn.Sequential(
+            nn.Conv2d(8, bev_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(groups, bev_channels),
+            nn.GELU(),
+            nn.Conv2d(bev_channels, bev_channels, kernel_size=3, padding=2, dilation=2, bias=False),
+            nn.GroupNorm(groups, bev_channels),
+            nn.GELU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(bev_channels, bev_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(groups, bev_channels),
+            nn.GELU(),
+        )
+        self.occupancy_head = nn.Conv2d(bev_channels, 2, kernel_size=1)
+        self.sample_proj = nn.Sequential(
+            nn.Linear(6, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+        )
+        self.current_mlp = nn.Sequential(
+            nn.Linear(self.in_channels, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.sensor_embedding = nn.Embedding(self.num_sensors, self.hidden_dim)
+        self.head = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim * 3),
+            nn.Linear(self.hidden_dim * 3, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, _, _, sensor_count = x.shape
+        if sensor_count != self.num_sensors:
+            raise ValueError(f"Expected {self.num_sensors} sensors, got {sensor_count}")
+
+        origin_x, origin_y, endpoint_x, endpoint_y, dir_x, dir_y, hit, time_age = _compute_local_beam_geometry(
+            x,
+            max_range_cm=self.max_range_cm,
+            relative_xy_scale_cm=self.relative_xy_scale_cm,
+        )
+        bev = _rasterize_bev_evidence(
+            origin_x,
+            origin_y,
+            endpoint_x,
+            endpoint_y,
+            hit,
+            time_age,
+            self.grid_size,
+            self.grid_extent_cm,
+        )
+        bev_features = self.bev_encoder(bev)
+        occupancy_maps = torch.sigmoid(self.occupancy_head(bev_features))
+        endpoint_occ = _sample_bev_features(occupancy_maps, endpoint_x[:, -1, :], endpoint_y[:, -1, :], self.grid_extent_cm)
+        ray_profile = _sample_bev_ray_profile(
+            occupancy_maps,
+            dir_x[:, -1, :],
+            dir_y[:, -1, :],
+            max_range_cm=self.max_range_cm,
+            grid_extent_cm=self.grid_extent_cm,
+            num_samples=12,
+        )
+        ray_mean = ray_profile.mean(dim=2)
+        ray_max = ray_profile.max(dim=2).values
+        sampled = self.sample_proj(torch.cat([endpoint_occ, ray_mean, ray_max], dim=-1))
+        current_tokens = self.current_mlp(x[:, :, -1, :].permute(0, 2, 1))
+        beam_ids = torch.arange(self.num_sensors, device=x.device)
+        beam_embed = self.sensor_embedding(beam_ids).unsqueeze(0).expand(batch_size, -1, -1)
+        global_tokens = self.sample_proj(
+            torch.cat(
+                [
+                    occupancy_maps.mean(dim=(-2, -1)).unsqueeze(1).expand(-1, sensor_count, -1),
+                    occupancy_maps.amax(dim=(-2, -1)).unsqueeze(1).expand(-1, sensor_count, -1),
+                    occupancy_maps.mean(dim=(-2, -1)).unsqueeze(1).expand(-1, sensor_count, -1),
+                ],
+                dim=-1,
+            )
+        )
+        fused = torch.cat([sampled, current_tokens + beam_embed, global_tokens], dim=-1)
+        return self.head(fused).squeeze(-1)
+
+
 def build_sampler(dataset: RealLidarSequenceDataset) -> WeightedRandomSampler | None:
     sample_has_obstacle = dataset.current_has_obstacle.astype(np.float32)
     pos = float(sample_has_obstacle.sum())
@@ -2143,6 +2451,96 @@ def build_finalist_experiment_suite() -> list[ExperimentConfig]:
     ]
 
 
+def build_arch_experiment_suite() -> list[ExperimentConfig]:
+    return [
+        ExperimentConfig(
+            name="arch_set_latent_h96",
+            model_type="set_latent",
+            hidden_dim=96,
+            dropout=0.12,
+            lr=8e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.58,
+            threshold_sweep_start=0.58,
+            threshold_sweep_end=0.88,
+            threshold_sweep_step=0.04,
+            temporal_layers=1,
+            attention_heads=4,
+        ),
+        ExperimentConfig(
+            name="arch_set_latent_h128",
+            model_type="set_latent",
+            hidden_dim=128,
+            dropout=0.14,
+            lr=7e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.08,
+            threshold_min_recall=0.62,
+            threshold_sweep_start=0.56,
+            threshold_sweep_end=0.84,
+            threshold_sweep_step=0.04,
+            temporal_layers=2,
+            attention_heads=4,
+            label_smoothing=0.02,
+        ),
+        ExperimentConfig(
+            name="arch_polar_dilated_h96",
+            model_type="polar_dilated",
+            hidden_dim=96,
+            dropout=0.10,
+            lr=9e-4,
+            weight_decay=1.2e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.58,
+            threshold_sweep_start=0.56,
+            threshold_sweep_end=0.88,
+            threshold_sweep_step=0.04,
+        ),
+        ExperimentConfig(
+            name="arch_polar_dilated_h128",
+            model_type="polar_dilated",
+            hidden_dim=128,
+            dropout=0.12,
+            lr=8e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.06,
+            threshold_min_recall=0.60,
+            threshold_sweep_start=0.52,
+            threshold_sweep_end=0.84,
+            threshold_sweep_step=0.04,
+            label_smoothing=0.02,
+        ),
+        ExperimentConfig(
+            name="arch_bev_occupancy_h96",
+            model_type="bev_occupancy",
+            hidden_dim=96,
+            dropout=0.12,
+            lr=8e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.05,
+            threshold_min_recall=0.60,
+            threshold_sweep_start=0.56,
+            threshold_sweep_end=0.84,
+            threshold_sweep_step=0.04,
+        ),
+        ExperimentConfig(
+            name="arch_bev_occupancy_h128",
+            model_type="bev_occupancy",
+            hidden_dim=128,
+            dropout=0.14,
+            lr=7e-4,
+            weight_decay=1.8e-4,
+            pos_weight_scale=1.12,
+            threshold_min_recall=0.64,
+            threshold_sweep_start=0.50,
+            threshold_sweep_end=0.80,
+            threshold_sweep_step=0.04,
+            label_smoothing=0.02,
+        ),
+    ]
+
+
 def build_experiment_suite(profile: str) -> list[ExperimentConfig]:
     normalized = str(profile).strip().lower()
     if normalized == "quick":
@@ -2153,6 +2551,8 @@ def build_experiment_suite(profile: str) -> list[ExperimentConfig]:
         return build_refine_experiment_suite()
     if normalized == "finalist":
         return build_finalist_experiment_suite()
+    if normalized == "arch":
+        return build_arch_experiment_suite()
     if normalized == "full":
         return build_full_experiment_suite()
     raise ValueError(f"Unknown suite profile {profile!r}")
@@ -2202,7 +2602,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--balance-positive-windows", action="store_true")
     parser.add_argument(
         "--suite-profile",
-        choices=("quick", "focused", "refine", "finalist", "full"),
+        choices=("quick", "focused", "refine", "finalist", "arch", "full"),
         default="full",
     )
     parser.add_argument("--suite-epochs", type=int, default=20)
@@ -2266,6 +2666,31 @@ def _build_model_for_experiment(
             dropout=exp.dropout,
             transformer_layers=exp.transformer_layers,
             attention_heads=exp.attention_heads,
+            max_range_cm=args.max_range_cm,
+            relative_xy_scale_cm=args.relative_xy_scale_cm,
+        )
+    if exp.model_type == "set_latent":
+        return TemporalSetLatentClassifier(
+            in_channels=input_channels,
+            num_sensors=num_sensors,
+            hidden_dim=exp.hidden_dim,
+            dropout=exp.dropout,
+            temporal_layers=exp.temporal_layers,
+            attention_heads=exp.attention_heads,
+        )
+    if exp.model_type == "polar_dilated":
+        return TemporalPolarDilatedClassifier(
+            in_channels=input_channels,
+            num_sensors=num_sensors,
+            hidden_dim=exp.hidden_dim,
+            dropout=exp.dropout,
+        )
+    if exp.model_type == "bev_occupancy":
+        return TemporalBEVOccupancyClassifier(
+            in_channels=input_channels,
+            num_sensors=num_sensors,
+            hidden_dim=exp.hidden_dim,
+            dropout=exp.dropout,
             max_range_cm=args.max_range_cm,
             relative_xy_scale_cm=args.relative_xy_scale_cm,
         )
