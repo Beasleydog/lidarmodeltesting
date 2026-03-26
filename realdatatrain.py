@@ -1106,6 +1106,178 @@ class TemporalBEVFusionClassifier(nn.Module):
         return {"logits": logits, "aux_hit_logits": aux_logits}
 
 
+class TemporalBEVFusionTemporalClassifier(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        num_sensors: int,
+        hidden_dim: int = 128,
+        dropout: float = 0.16,
+        transformer_layers: int = 3,
+        attention_heads: int = 4,
+        temporal_layers: int = 1,
+        max_range_cm: float = DEFAULT_LIDAR_MAX_RANGE_CM,
+        relative_xy_scale_cm: float = 5000.0,
+        grid_size: int = 64,
+    ):
+        super().__init__()
+        self.model_type = "real_cleanlog_temporal_bev_fusion_temporal"
+        self.in_channels = int(in_channels)
+        self.num_sensors = int(num_sensors)
+        self.hidden_dim = int(hidden_dim)
+        self.transformer_layers = int(max(transformer_layers, 1))
+        self.attention_heads = int(max(attention_heads, 1))
+        self.temporal_layers = int(max(temporal_layers, 1))
+        if self.hidden_dim % self.attention_heads != 0:
+            raise ValueError("hidden_dim must be divisible by attention_heads")
+        self.max_range_cm = float(max_range_cm)
+        self.relative_xy_scale_cm = float(relative_xy_scale_cm)
+        self.grid_size = int(grid_size)
+        self.grid_extent_cm = float(max(self.max_range_cm * 0.9, 6000.0))
+
+        sensor_geom = MODEL_SENSOR_YAW_PITCH_DEG[: self.num_sensors].astype(np.float32)
+        sensor_geom_rad = np.deg2rad(sensor_geom)
+        sensor_geom_feats = np.concatenate(
+            [
+                np.sin(sensor_geom_rad[:, :1]),
+                np.cos(sensor_geom_rad[:, :1]),
+                np.sin(sensor_geom_rad[:, 1:2]),
+                np.cos(sensor_geom_rad[:, 1:2]),
+            ],
+            axis=1,
+        ).astype(np.float32)
+        self.register_buffer("sensor_geom_feats", torch.from_numpy(sensor_geom_feats), persistent=False)
+        self.register_buffer("sensor_ids", torch.arange(self.num_sensors, dtype=torch.long), persistent=False)
+
+        bev_channels = max(self.hidden_dim // 2, 48)
+        groups = 8 if bev_channels % 8 == 0 else 1
+        self.bev_stem = nn.Sequential(
+            nn.Conv2d(8, bev_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(groups, bev_channels),
+            nn.GELU(),
+            nn.Conv2d(bev_channels, bev_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(groups, bev_channels),
+            nn.GELU(),
+        )
+        self.bev_dilated = nn.Sequential(
+            nn.Conv2d(bev_channels, bev_channels, kernel_size=3, padding=2, dilation=2, bias=False),
+            nn.GroupNorm(groups, bev_channels),
+            nn.GELU(),
+            nn.Dropout2d(dropout),
+        )
+        self.bev_pool = nn.Sequential(
+            nn.AvgPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(bev_channels, bev_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(groups, bev_channels),
+            nn.GELU(),
+        )
+        self.bev_proj = nn.Sequential(
+            nn.Linear(bev_channels, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+        )
+        temporal_hidden = max(self.hidden_dim // 2, 24)
+        self.temporal_input = nn.Sequential(
+            nn.Linear(self.in_channels, temporal_hidden),
+            nn.LayerNorm(temporal_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.temporal_gru = nn.GRU(
+            input_size=temporal_hidden,
+            hidden_size=temporal_hidden,
+            num_layers=self.temporal_layers,
+            batch_first=True,
+            dropout=dropout if self.temporal_layers > 1 else 0.0,
+            bidirectional=True,
+        )
+        self.current_mlp = nn.Sequential(
+            nn.Linear(self.in_channels, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.sensor_embedding = nn.Embedding(self.num_sensors, self.hidden_dim)
+        self.sensor_geom_mlp = nn.Sequential(
+            nn.Linear(4, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=self.attention_heads,
+            dim_feedforward=self.hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.beam_encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.transformer_layers)
+        self.head = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim * 4),
+            nn.Linear(self.hidden_dim * 4, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, channels, time_steps, sensor_count = x.shape
+        if sensor_count != self.num_sensors:
+            raise ValueError(f"Expected {self.num_sensors} sensors, got {sensor_count}")
+
+        origin_x, origin_y, endpoint_x, endpoint_y, dir_x, dir_y, hit, time_age = _compute_local_beam_geometry(
+            x,
+            max_range_cm=self.max_range_cm,
+            relative_xy_scale_cm=self.relative_xy_scale_cm,
+        )
+        bev = _rasterize_bev_evidence(
+            origin_x,
+            origin_y,
+            endpoint_x,
+            endpoint_y,
+            hit,
+            time_age,
+            self.grid_size,
+            self.grid_extent_cm,
+        )
+        bev_features = self.bev_stem(bev)
+        pooled = self.bev_pool(bev_features)
+        pooled = F.interpolate(pooled, size=bev_features.shape[-2:], mode="bilinear", align_corners=False)
+        bev_features = bev_features + self.bev_dilated(bev_features) + pooled
+
+        beam_sequences = x.permute(0, 3, 2, 1).reshape(batch_size * sensor_count, time_steps, channels)
+        temporal_inputs = self.temporal_input(beam_sequences)
+        temporal_outputs, _ = self.temporal_gru(temporal_inputs)
+        temporal_tokens = temporal_outputs[:, -1, :].reshape(batch_size, sensor_count, self.hidden_dim)
+
+        endpoint_tokens = self.bev_proj(
+            _sample_bev_features(bev_features, endpoint_x[:, -1, :], endpoint_y[:, -1, :], self.grid_extent_cm)
+        )
+        ray_profile = _sample_bev_ray_profile(
+            bev_features,
+            dir_x[:, -1, :],
+            dir_y[:, -1, :],
+            max_range_cm=self.max_range_cm,
+            grid_extent_cm=self.grid_extent_cm,
+            num_samples=12,
+        )
+        ray_mean = self.bev_proj(ray_profile.mean(dim=2))
+        ray_max = self.bev_proj(ray_profile.max(dim=2).values)
+        current_tokens = self.current_mlp(x[:, :, -1, :].permute(0, 2, 1))
+        global_tokens = self.bev_proj(bev_features.mean(dim=(-2, -1))).unsqueeze(1).expand(-1, sensor_count, -1)
+        beam_embed = self.sensor_embedding(self.sensor_ids.to(device=x.device)).unsqueeze(0).expand(batch_size, -1, -1)
+        geom_embed = self.sensor_geom_mlp(self.sensor_geom_feats.to(device=x.device)).unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+
+        tokens = endpoint_tokens + ray_mean + current_tokens + temporal_tokens + beam_embed + geom_embed
+        encoded = self.beam_encoder(tokens)
+        fused = torch.cat([encoded, temporal_tokens, ray_max, global_tokens], dim=-1)
+        return self.head(fused).squeeze(-1)
+
+
 class TemporalSetLatentClassifier(nn.Module):
     def __init__(
         self,
@@ -2562,6 +2734,99 @@ def build_gpuprobe_experiment_suite() -> list[ExperimentConfig]:
     ]
 
 
+def build_nextprobe_experiment_suite() -> list[ExperimentConfig]:
+    return [
+        ExperimentConfig(
+            name="nextprobe_bev_fusion_temporal_h96",
+            model_type="bev_fusion_temporal",
+            hidden_dim=96,
+            dropout=0.14,
+            lr=6.8e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.10,
+            threshold_min_recall=0.62,
+            threshold_sweep_start=0.64,
+            threshold_sweep_end=0.80,
+            threshold_sweep_step=0.02,
+            temporal_layers=1,
+            transformer_layers=2,
+            attention_heads=4,
+            label_smoothing=0.02,
+        ),
+    ]
+
+
+def build_next_experiment_suite() -> list[ExperimentConfig]:
+    return [
+        ExperimentConfig(
+            name="next_baseline_bev_fusion_recall_h96",
+            model_type="bev_fusion",
+            hidden_dim=96,
+            dropout=0.14,
+            lr=7e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.15,
+            threshold_min_recall=0.64,
+            threshold_sweep_start=0.64,
+            threshold_sweep_end=0.78,
+            threshold_sweep_step=0.02,
+            transformer_layers=2,
+            attention_heads=4,
+            label_smoothing=0.02,
+        ),
+        ExperimentConfig(
+            name="next_bev_fusion_temporal_recall_h96",
+            model_type="bev_fusion_temporal",
+            hidden_dim=96,
+            dropout=0.14,
+            lr=6.8e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.10,
+            threshold_min_recall=0.64,
+            threshold_sweep_start=0.62,
+            threshold_sweep_end=0.78,
+            threshold_sweep_step=0.02,
+            temporal_layers=1,
+            transformer_layers=2,
+            attention_heads=4,
+            label_smoothing=0.02,
+        ),
+        ExperimentConfig(
+            name="next_bev_fusion_temporal_precision_h96",
+            model_type="bev_fusion_temporal",
+            hidden_dim=96,
+            dropout=0.12,
+            lr=7.2e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.00,
+            threshold_min_recall=0.58,
+            threshold_sweep_start=0.74,
+            threshold_sweep_end=0.90,
+            threshold_sweep_step=0.02,
+            temporal_layers=1,
+            transformer_layers=2,
+            attention_heads=4,
+        ),
+        ExperimentConfig(
+            name="next_bev_fusion_temporal_recall_h128",
+            model_type="bev_fusion_temporal",
+            hidden_dim=128,
+            dropout=0.14,
+            lr=6.2e-4,
+            weight_decay=2e-4,
+            pos_weight_scale=1.08,
+            threshold_min_recall=0.64,
+            threshold_sweep_start=0.60,
+            threshold_sweep_end=0.76,
+            threshold_sweep_step=0.02,
+            temporal_layers=1,
+            transformer_layers=3,
+            attention_heads=4,
+            label_smoothing=0.02,
+        ),
+    ]
+
+
 def build_experiment_suite(profile: str) -> list[ExperimentConfig]:
     normalized = str(profile).strip().lower()
     if normalized == "quick":
@@ -2576,6 +2841,10 @@ def build_experiment_suite(profile: str) -> list[ExperimentConfig]:
         return build_arch_experiment_suite()
     if normalized == "gpuprobe":
         return build_gpuprobe_experiment_suite()
+    if normalized == "nextprobe":
+        return build_nextprobe_experiment_suite()
+    if normalized == "next":
+        return build_next_experiment_suite()
     if normalized == "full":
         return build_full_experiment_suite()
     raise ValueError(f"Unknown suite profile {profile!r}")
@@ -2625,7 +2894,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--balance-positive-windows", action="store_true")
     parser.add_argument(
         "--suite-profile",
-        choices=("quick", "focused", "refine", "finalist", "arch", "gpuprobe", "full"),
+        choices=("quick", "focused", "refine", "finalist", "arch", "gpuprobe", "nextprobe", "next", "full"),
         default="full",
     )
     parser.add_argument("--suite-epochs", type=int, default=20)
@@ -2689,6 +2958,18 @@ def _build_model_for_experiment(
             dropout=exp.dropout,
             transformer_layers=exp.transformer_layers,
             attention_heads=exp.attention_heads,
+            max_range_cm=args.max_range_cm,
+            relative_xy_scale_cm=args.relative_xy_scale_cm,
+        )
+    if exp.model_type == "bev_fusion_temporal":
+        return TemporalBEVFusionTemporalClassifier(
+            in_channels=input_channels,
+            num_sensors=num_sensors,
+            hidden_dim=exp.hidden_dim,
+            dropout=exp.dropout,
+            transformer_layers=exp.transformer_layers,
+            attention_heads=exp.attention_heads,
+            temporal_layers=exp.temporal_layers,
             max_range_cm=args.max_range_cm,
             relative_xy_scale_cm=args.relative_xy_scale_cm,
         )
