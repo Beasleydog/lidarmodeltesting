@@ -2827,6 +2827,75 @@ def build_next_experiment_suite() -> list[ExperimentConfig]:
     ]
 
 
+def build_size_experiment_suite() -> list[ExperimentConfig]:
+    return [
+        ExperimentConfig(
+            name="size_bev_fusion_recall_h64",
+            model_type="bev_fusion",
+            hidden_dim=64,
+            dropout=0.14,
+            lr=8.0e-4,
+            weight_decay=1.2e-4,
+            pos_weight_scale=1.15,
+            threshold_min_recall=0.64,
+            threshold_sweep_start=0.62,
+            threshold_sweep_end=0.78,
+            threshold_sweep_step=0.02,
+            transformer_layers=2,
+            attention_heads=4,
+            label_smoothing=0.02,
+        ),
+        ExperimentConfig(
+            name="size_bev_fusion_recall_h96",
+            model_type="bev_fusion",
+            hidden_dim=96,
+            dropout=0.14,
+            lr=7.0e-4,
+            weight_decay=1.5e-4,
+            pos_weight_scale=1.15,
+            threshold_min_recall=0.64,
+            threshold_sweep_start=0.62,
+            threshold_sweep_end=0.78,
+            threshold_sweep_step=0.02,
+            transformer_layers=2,
+            attention_heads=4,
+            label_smoothing=0.02,
+        ),
+        ExperimentConfig(
+            name="size_bev_fusion_recall_h128",
+            model_type="bev_fusion",
+            hidden_dim=128,
+            dropout=0.14,
+            lr=6.2e-4,
+            weight_decay=2.0e-4,
+            pos_weight_scale=1.10,
+            threshold_min_recall=0.64,
+            threshold_sweep_start=0.60,
+            threshold_sweep_end=0.76,
+            threshold_sweep_step=0.02,
+            transformer_layers=3,
+            attention_heads=4,
+            label_smoothing=0.02,
+        ),
+        ExperimentConfig(
+            name="size_bev_fusion_recall_h160",
+            model_type="bev_fusion",
+            hidden_dim=160,
+            dropout=0.16,
+            lr=5.6e-4,
+            weight_decay=2.4e-4,
+            pos_weight_scale=1.08,
+            threshold_min_recall=0.64,
+            threshold_sweep_start=0.58,
+            threshold_sweep_end=0.74,
+            threshold_sweep_step=0.02,
+            transformer_layers=4,
+            attention_heads=8,
+            label_smoothing=0.02,
+        ),
+    ]
+
+
 def build_experiment_suite(profile: str) -> list[ExperimentConfig]:
     normalized = str(profile).strip().lower()
     if normalized == "quick":
@@ -2845,6 +2914,8 @@ def build_experiment_suite(profile: str) -> list[ExperimentConfig]:
         return build_nextprobe_experiment_suite()
     if normalized == "next":
         return build_next_experiment_suite()
+    if normalized == "size":
+        return build_size_experiment_suite()
     if normalized == "full":
         return build_full_experiment_suite()
     raise ValueError(f"Unknown suite profile {profile!r}")
@@ -2894,7 +2965,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--balance-positive-windows", action="store_true")
     parser.add_argument(
         "--suite-profile",
-        choices=("quick", "focused", "refine", "finalist", "arch", "gpuprobe", "nextprobe", "next", "full"),
+        choices=("quick", "focused", "refine", "finalist", "arch", "gpuprobe", "nextprobe", "next", "size", "full"),
         default="full",
     )
     parser.add_argument("--suite-epochs", type=int, default=20)
